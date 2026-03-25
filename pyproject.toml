@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fcw"
+version = "0.1.0"
+description = "FirecREST workflow CLI for HPC job orchestration"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "CSCS", email = "help@cscs.ch" }
+]
+keywords = ["firecrest", "hpc", "slurm", "workflow", "cli", "fcw"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Clustering",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "pyfirecrest>=3.0.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+fuse = [
+    "pyfuse3>=3.3.0",
+    "trio>=0.22.0",
+    "cachetools>=5.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+fcw = "fcw.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/eth-cscs/fcw"
+Documentation = "https://fcw.readthedocs.io"
+Repository = "https://github.com/eth-cscs/fcw"
+Issues = "https://github.com/eth-cscs/fcw/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fcw"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "firecrest.*",
+    "pyfuse3.*",
+    "trio.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
