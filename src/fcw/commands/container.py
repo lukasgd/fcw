@@ -295,6 +295,10 @@ if [ ! -f $HOME/.config/containers/storage.conf ]; then
 driver = "overlay"
 runroot = "/dev/shm/$USER/runroot"
 graphroot = "/dev/shm/$USER/root"
+
+# TODO: revert once subuid/subgid is configured for service accounts on lys
+[storage.options.overlay]
+ignore_chown_errors = "true"
 EOF
 fi
 
@@ -441,6 +445,10 @@ if [ ! -f $HOME/.config/containers/storage.conf ]; then
 driver = "overlay"
 runroot = "/dev/shm/$USER/runroot"
 graphroot = "/dev/shm/$USER/root"
+
+# TODO: revert once subuid/subgid is configured for service accounts on lys
+[storage.options.overlay]
+ignore_chown_errors = "true"
 EOF
 fi
 
@@ -632,6 +640,10 @@ if [ ! -f $HOME/.config/containers/storage.conf ]; then
 driver = "overlay"
 runroot = "/dev/shm/$USER/runroot"
 graphroot = "/dev/shm/$USER/root"
+
+# TODO: revert once subuid/subgid is configured for service accounts on lys
+[storage.options.overlay]
+ignore_chown_errors = "true"
 EOF
 fi
 
@@ -752,6 +764,10 @@ if [ ! -f $HOME/.config/containers/storage.conf ]; then
 driver = "overlay"
 runroot = "/dev/shm/$USER/runroot"
 graphroot = "/dev/shm/$USER/root"
+
+# TODO: revert once subuid/subgid is configured for service accounts on lys
+[storage.options.overlay]
+ignore_chown_errors = "true"
 EOF
 fi
 
@@ -1109,6 +1125,10 @@ if [ ! -f $HOME/.config/containers/storage.conf ]; then
 driver = "overlay"
 runroot = "/dev/shm/$USER/runroot"
 graphroot = "/dev/shm/$USER/root"
+
+# TODO: revert once subuid/subgid is configured for service accounts on lys
+[storage.options.overlay]
+ignore_chown_errors = "true"
 EOF
 fi
 
@@ -1189,6 +1209,10 @@ if [ ! -f $HOME/.config/containers/storage.conf ]; then
 driver = "overlay"
 runroot = "/dev/shm/$USER/runroot"
 graphroot = "/dev/shm/$USER/root"
+
+# TODO: revert once subuid/subgid is configured for service accounts on lys
+[storage.options.overlay]
+ignore_chown_errors = "true"
 EOF
 fi
 

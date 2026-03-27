@@ -244,24 +244,28 @@ def submit_job(
     ),
     wait: bool = typer.Option(False, "--wait", "-w", help="Wait for job completion"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print job ID"),
+    remote_script: bool = typer.Option(
+        False, "--remote-script",
+        help="Upload script to remote before submitting (workaround for slurmrestd/pyxis segfault)"
+    ),
 ):
     """Submit a job with optional SBATCH overrides.
-    
+
     SBATCH options placed BEFORE the ``--`` separator override directives in the script.
     This allows runtime customization without editing the script file.
-    
+
     Examples:
         # Simple submission (script path or config job name)
         fcw job submit train.sh
         fcw job submit train  # uses jobs.train.script from fcw.yaml
-        
+
         # Override SBATCH options
         fcw job submit --time 24:00:00 --nodes 4 -- train.sh
-        
+
         # Chain jobs with dependency
         JOB1=$(fcw job submit preprocess.sh)
         fcw job submit --dependency afterok:$JOB1 -- train.sh
-        
+
         # Set environment variables
         fcw job submit train --set CONFIG=exp1.yaml --set EPOCHS=100
     """
@@ -314,26 +318,46 @@ def submit_job(
     
     # Submit job
     client = get_client()
-    
+    working_dir = config.workdir.remote
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(script_content)
         modified_script_path = f.name
-    
+
     try:
-        working_dir = config.workdir.remote
-        
-        result = client.submit(
-            system_name=system,
-            account=account,
-            working_dir=working_dir,
-            script_local_path=modified_script_path,
-        )
-        
+        # TODO: remove --remote-script workaround when slurmrestd inline script
+        # + pyxis segfault is fixed (inline scripts don't initialize the pyxis
+        # SPANK plugin properly, causing srun --environment to segfault)
+        if remote_script:
+            remote_scripts_dir = f"{working_dir}/.fcw/scripts"
+            remote_filename = f"{job_name}.sh"
+            client.mkdir(system_name=system, path=remote_scripts_dir, create_parents=True)
+            client.upload(
+                system_name=system,
+                local_file=modified_script_path,
+                directory=remote_scripts_dir,
+                filename=remote_filename,
+                account=account,
+            )
+            result = client.submit(
+                system_name=system,
+                account=account,
+                working_dir=working_dir,
+                script_remote_path=f"{remote_scripts_dir}/{remote_filename}",
+            )
+        else:
+            result = client.submit(
+                system_name=system,
+                account=account,
+                working_dir=working_dir,
+                script_local_path=modified_script_path,
+            )
+
         job_id = result.get("jobId") or result.get("jobid") or result.get("job_id")
-        
+
         # Print job ID to stdout for scripting
         print(job_id)
-        
+
         # Print details to stderr (unless quiet)
         if not quiet:
             console.print(f"[green]Submitted job {job_id}[/green]", highlight=False)
@@ -342,7 +366,7 @@ def submit_job(
                 console.print(f"[dim]SBATCH overrides: {override_str}[/dim]")
     finally:
         os.unlink(modified_script_path)
-    
+
     if wait:
         console.print(f"[dim]Waiting for job {job_id}...[/dim]")
         client.wait_for_job(system_name=system, job_id=job_id)
@@ -355,19 +379,23 @@ def run_command(
     args: List[str] = typer.Argument(None, help="[SBATCH_OPTS]... -- <command>"),
     time: str = typer.Option("00:30:00", "--time", "-t", help="Default time limit"),
     nodes: int = typer.Option(1, "--nodes", "-N", help="Default number of nodes"),
+    remote_script: bool = typer.Option(
+        False, "--remote-script",
+        help="Upload script to remote before submitting (workaround for slurmrestd/pyxis segfault)"
+    ),
 ):
     """Run an ad-hoc command as a SLURM job.
-    
+
     Similar to ``srun``, but submits as a batch job via FirecREST.
     SBATCH options before ``--`` override the defaults.
-    
+
     Examples:
         # Simple command
         fcw job run 'echo "Hello from $(hostname)"'
-        
+
         # With SBATCH overrides
         fcw job run --time 01:00:00 --nodes 2 -- 'nvidia-smi'
-        
+
         # With dependency
         fcw job run --dependency afterok:12345 -- 'python analyze.py'
     """
@@ -413,13 +441,33 @@ def run_command(
         script_path = f.name
     
     try:
-        result = client.submit(
-            system_name=system,
-            account=account,
-            working_dir=working_dir,
-            script_local_path=script_path,
-        )
-        
+        # TODO: remove --remote-script workaround when slurmrestd inline script
+        # + pyxis segfault is fixed
+        if remote_script:
+            remote_scripts_dir = f"{working_dir}/.fcw/scripts"
+            remote_filename = "fcw-run.sh"
+            client.mkdir(system_name=system, path=remote_scripts_dir, create_parents=True)
+            client.upload(
+                system_name=system,
+                local_file=script_path,
+                directory=remote_scripts_dir,
+                filename=remote_filename,
+                account=account,
+            )
+            result = client.submit(
+                system_name=system,
+                account=account,
+                working_dir=working_dir,
+                script_remote_path=f"{remote_scripts_dir}/{remote_filename}",
+            )
+        else:
+            result = client.submit(
+                system_name=system,
+                account=account,
+                working_dir=working_dir,
+                script_local_path=script_path,
+            )
+
         job_id = result.get("jobId") or result.get("jobid") or result.get("job_id")
         print(job_id)
         console.print(f"[green]Submitted job {job_id}[/green]")
