@@ -438,13 +438,17 @@ def job_status(
     client = get_client()
     
     try:
-        info = client.job_info(system_name=system, job_id=job_id)
-        
+        jobs = client.job_info(system_name=system, jobid=job_id)
+        if not jobs:
+            console.print(f"[yellow]No info found for job {job_id}[/yellow]")
+            raise typer.Exit(1)
+
+        job = jobs[0]
         table = Table(title=f"Job {job_id}")
         table.add_column("Field")
         table.add_column("Value")
-        
-        for key, value in info.items():
+
+        for key, value in job.items():
             table.add_row(str(key), str(value))
         
         console.print(table)
@@ -473,8 +477,16 @@ def job_logs(
     
     # Get job metadata to find output file
     try:
-        metadata = client.job_metadata(system_name=system, job_id=job_id)
-        stdout_path = metadata.get("stdout") or metadata.get("StdOut")
+        metadata_list = client.job_metadata(system_name=system, jobid=job_id)
+        if not metadata_list:
+            console.print(f"[red]No metadata found for job {job_id}[/red]")
+            raise typer.Exit(1)
+        metadata = metadata_list[0]
+        stdout_path = (
+            metadata.get("standardOutput")
+            or metadata.get("stdout")
+            or metadata.get("StdOut")
+        )
         
         if not stdout_path:
             console.print("[red]Could not determine stdout path from job metadata[/red]")
@@ -513,10 +525,12 @@ def job_logs(
                 result = await async_client.tail(
                     system_name=system,
                     path=stdout_path,
-                    lines=lines if tail else 1000,
+                    num_lines=lines if tail else 1000,
                 )
                 
-                output = result if isinstance(result, str) else result.get("output", "")
+                output = result if isinstance(result, str) else (
+                    result.get("content") or result.get("output") or ""
+                )
                 output_lines = output.split("\n")
                 
                 if follow:
@@ -574,7 +588,7 @@ def cancel_jobs(
     
     for job_id in job_ids:
         try:
-            client.cancel_job(system_name=system, job_id=job_id)
+            client.cancel_job(system_name=system, jobid=job_id)
             console.print(f"[green]Cancelled job {job_id}[/green]")
         except Exception as e:
             console.print(f"[red]Failed to cancel {job_id}: {e}[/red]")

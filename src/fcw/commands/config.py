@@ -76,10 +76,8 @@ def show(
         table = Table(show_header=True)
         table.add_column("Name")
         table.add_column("Script")
-        table.add_column("After")
         for name, job_config in config.jobs.items():
-            after = ", ".join(job_config.after) if job_config.after else "-"
-            table.add_row(name, job_config.script, after)
+            table.add_row(name, job_config.script)
         console.print(table)
 
 
@@ -128,12 +126,6 @@ def validate(
             warnings.append(f"Optional not set: {var}")
     
     # Try to connect
-    import debugpy
-    debugpy.listen(5678)
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    debugpy.breakpoint()
-    
     if not any("FIRECREST" in e for e in errors):
         try:
             client = get_client()

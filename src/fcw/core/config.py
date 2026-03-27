@@ -98,6 +98,17 @@ class FcwConfig:
         base = self.workdir.remote if remote else self.workdir.local
         return os.path.join(base, path)
     
+    def resolve_container_image(self, cont: ContainerConfig) -> str:
+        """Resolve full remote sqsh path: remote_path dir + tag-derived filename."""
+        remote_dir = cont.remote_path or "images/"
+        sqsh_name = cont.tag.replace(":", "+").replace("/", "+") + ".sqsh"
+        return self.resolve_path(os.path.join(remote_dir, sqsh_name), remote=True)
+
+    def resolve_container_images_dir(self, cont: ContainerConfig) -> str:
+        """Resolve the remote directory containing container images."""
+        remote_dir = cont.remote_path or "images/"
+        return self.resolve_path(remote_dir, remote=True)
+
     def get_directory_type(self, path: str) -> DirectoryType:
         """Get the type of a directory, defaulting to bidirectional."""
         # Normalize path for lookup

@@ -141,7 +141,7 @@ For multi-stage Dockerfiles (download + build-offline pattern):
 
 ```bash
 # Build download stage locally (fetches dependencies, requires network)
-fcw container build --stage download -t myapp:download .
+fcw container build --stage download -f env/Dockerfile.prod-multistage --build-arg BASE_IMAGE=ubuntu:24.04 -t myapp:download .
 
 # Push download image to remote
 fcw container push myapp:download

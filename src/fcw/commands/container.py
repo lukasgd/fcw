@@ -182,7 +182,7 @@ def push_image(
     else:
         # Export image to tar
         runtime = _detect_container_runtime()
-        remote_filename = image.replace(":", "-").replace("/", "-") + ".tar"
+        remote_filename = image.replace(":", "+").replace("/", "+") + ".tar"
         tar_path = os.path.join(tempfile.gettempdir(), remote_filename)
         cleanup_tar = True
 
@@ -242,7 +242,7 @@ def _resolve_remote_tar(image_or_path: str, config) -> str:
     if image_or_path.endswith(".tar") or "/" in image_or_path:
         return config.resolve_path(image_or_path, remote=True)
     # Image tag -> images/<tag-as-filename>.tar
-    tar_name = image_or_path.replace(":", "-").replace("/", "-") + ".tar"
+    tar_name = image_or_path.replace(":", "+").replace("/", "+") + ".tar"
     return config.resolve_path(f"images/{tar_name}", remote=True)
 
 
@@ -279,19 +279,27 @@ def import_image(
 
 set -e
 
-# Configure podman storage if needed
+# Wait for systemd user session to settle before podman
+while pgrep -U $(id -u) systemd ; do sleep 0.2 ; done
+
+# Clean up previous podman state
+podman system reset -f
+rm -Rf /dev/shm/$USER/*
+rm -Rf /tmp/xdg-run-$(id -u)*
+
+# Configure podman storage on local filesystem if not already present
 mkdir -p $HOME/.config/containers
 if [ ! -f $HOME/.config/containers/storage.conf ]; then
     cat > $HOME/.config/containers/storage.conf << 'EOF'
 [storage]
 driver = "overlay"
-runroot = "/tmp/$USER/containers/runroot"
-graphroot = "/tmp/$USER/containers/storage"
+runroot = "/dev/shm/$USER/runroot"
+graphroot = "/dev/shm/$USER/root"
 EOF
 fi
 
-export XDG_RUNTIME_DIR=/tmp/$USER/containers/run
-mkdir -p $XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR="$(mktemp -d -p "${{TMPDIR:-/tmp}}" xdg-run-$UID.XXXXXX)"
+chmod 700 "$XDG_RUNTIME_DIR"
 
 # Load image
 echo "Loading image from {remote_tar}..."
@@ -372,9 +380,16 @@ def build_remote(
     staging_dir = config.resolve_path(".fcw/build-remote", remote=True)
     remote_dockerfile = f"{staging_dir}/Dockerfile"
 
+    # Resolve images directory from config if available
+    images_dir = config.resolve_path("images/", remote=True)
+    for _name, cont_config in config.containers.items():
+        if cont_config.tag == tag or cont_config.tag == image:
+            images_dir = config.resolve_container_images_dir(cont_config)
+            break
+
     if enroot:
         output_path = output or config.resolve_path(
-            f"images/{tag.replace(':', '-')}.sqsh", remote=True
+            f"images/{tag.replace(':', '+')}.sqsh", remote=True
         )
 
     # Step 1: Upload Dockerfile
@@ -415,19 +430,35 @@ def build_remote(
 
 set -euxo pipefail
 
-# Configure podman storage
+export HOME="${{HOME:-/users/$USER}}"
+export CONTAINER_IMAGES_DIR={images_dir}
+
+# Configure podman storage on local filesystem if not already present
 mkdir -p $HOME/.config/containers
 if [ ! -f $HOME/.config/containers/storage.conf ]; then
     cat > $HOME/.config/containers/storage.conf << 'EOF'
 [storage]
 driver = "overlay"
-runroot = "/tmp/$USER/containers/runroot"
-graphroot = "/tmp/$USER/containers/storage"
+runroot = "/dev/shm/$USER/runroot"
+graphroot = "/dev/shm/$USER/root"
 EOF
 fi
 
-export XDG_RUNTIME_DIR=/tmp/$USER/containers/run
-mkdir -p $XDG_RUNTIME_DIR
+# Set up XDG_RUNTIME_DIR before any podman commands
+export XDG_RUNTIME_DIR="$(mktemp -d -p "${{TMPDIR:-/tmp}}" xdg-run-$UID.XXXXXX)"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# Wait for systemd user session to settle before podman
+while pgrep -U $(id -u) systemd ; do sleep 0.2 ; done
+
+# Clean up previous podman state (non-fatal if no prior state exists)
+podman system reset -f || true
+rm -Rf /dev/shm/$USER/*
+rm -Rf /tmp/xdg-run-$(id -u)*
+
+# Re-create XDG_RUNTIME_DIR after cleanup
+export XDG_RUNTIME_DIR="$(mktemp -d -p "${{TMPDIR:-/tmp}}" xdg-run-$UID.XXXXXX)"
+chmod 700 "$XDG_RUNTIME_DIR"
 
 # Load base image from tar
 if ! podman image exists {image} 2>/dev/null; then
@@ -440,10 +471,14 @@ if ! podman image exists {image} 2>/dev/null; then
     fi
 fi
 
+# Get the image ID for reliable reference in FROM directives
+IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{image} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {image})
+echo "Resolved image ID: $IMAGE_ID"
+
 echo "=== Building {tag} ==="
 cd {staging_dir}
 podman build \\
-{target_line}    --build-arg DOWNLOAD_IMAGE={image} \\
+{target_line}    --build-arg DOWNLOAD_IMAGE=$IMAGE_ID \\
 {extra_build_args_line}    -t {tag} \\
     -f Dockerfile .
 
@@ -509,16 +544,16 @@ def deploy_image(
         cont_config = config.containers[name]
         dockerfile = cont_config.file
         image_tag = cont_config.tag
-        remote_path = cont_config.remote_path
+        remote_path = config.resolve_container_image(cont_config)
+        images_dir = config.resolve_container_images_dir(cont_config)
     elif tag:
         dockerfile = "Dockerfile"
         image_tag = tag
-        remote_path = f"images/{tag.replace(':', '-')}.sqsh"
+        remote_path = config.resolve_path(f"images/{tag.replace(':', '+')}.sqsh", remote=True)
+        images_dir = config.resolve_path("images/", remote=True)
     else:
         console.print("[red]Specify container name from config or --tag[/red]")
         raise typer.Exit(1)
-    
-    remote_path = config.resolve_path(remote_path, remote=True)
     
     # 1. Build locally
     console.print("[bold]Step 1: Building image locally...[/bold]")
@@ -588,18 +623,23 @@ def deploy_image(
 
 set -e
 
+export CONTAINER_IMAGES_DIR={images_dir}
+
 mkdir -p $HOME/.config/containers
 if [ ! -f $HOME/.config/containers/storage.conf ]; then
     cat > $HOME/.config/containers/storage.conf << 'EOF'
 [storage]
 driver = "overlay"
-runroot = "/tmp/$USER/containers/runroot"
-graphroot = "/tmp/$USER/containers/storage"
+runroot = "/dev/shm/$USER/runroot"
+graphroot = "/dev/shm/$USER/root"
 EOF
 fi
 
 export XDG_RUNTIME_DIR=/tmp/$USER/containers/run
 mkdir -p $XDG_RUNTIME_DIR
+
+# Wait for systemd user session to settle before podman
+while pgrep -U $(id -u) systemd ; do sleep 0.2 ; done
 
 echo "Loading image from {remote_tar}..."
 podman load -i {remote_tar}
@@ -694,19 +734,29 @@ def extract_from_image(
 
 set -euxo pipefail
 
-# Configure podman storage
+export HOME="${{HOME:-/users/$USER}}"
+
+# Wait for systemd user session to settle before podman
+while pgrep -U $(id -u) systemd ; do sleep 0.2 ; done
+
+# Clean up previous podman state
+podman system reset -f
+rm -Rf /dev/shm/$USER/*
+rm -Rf /tmp/xdg-run-$(id -u)*
+
+# Configure podman storage on local filesystem if not already present
 mkdir -p $HOME/.config/containers
 if [ ! -f $HOME/.config/containers/storage.conf ]; then
     cat > $HOME/.config/containers/storage.conf << 'EOF'
 [storage]
 driver = "overlay"
-runroot = "/tmp/$USER/containers/runroot"
-graphroot = "/tmp/$USER/containers/storage"
+runroot = "/dev/shm/$USER/runroot"
+graphroot = "/dev/shm/$USER/root"
 EOF
 fi
 
-export XDG_RUNTIME_DIR=/tmp/$USER/containers/run
-mkdir -p $XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR="$(mktemp -d -p "${{TMPDIR:-/tmp}}" xdg-run-$UID.XXXXXX)"
+chmod 700 "$XDG_RUNTIME_DIR"
 
 # Load image from tar if not already available
 if ! podman image exists {image} 2>/dev/null; then
@@ -1030,7 +1080,7 @@ def update_image(
     if rebuild:
         # Full rebuild: patch + build-offline
         if enroot:
-            output_path = output or config.resolve_path(f"images/{final_tag.replace(':', '-')}.sqsh", remote=True)
+            output_path = output or config.resolve_path(f"images/{final_tag.replace(':', '+')}.sqsh", remote=True)
 
         script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-update
@@ -1041,19 +1091,29 @@ def update_image(
 
 set -euxo pipefail
 
-# Configure podman storage
+export HOME="${{HOME:-/users/$USER}}"
+
+# Wait for systemd user session to settle before podman
+while pgrep -U $(id -u) systemd ; do sleep 0.2 ; done
+
+# Clean up previous podman state
+podman system reset -f
+rm -Rf /dev/shm/$USER/*
+rm -Rf /tmp/xdg-run-$(id -u)*
+
+# Configure podman storage on local filesystem if not already present
 mkdir -p $HOME/.config/containers
 if [ ! -f $HOME/.config/containers/storage.conf ]; then
     cat > $HOME/.config/containers/storage.conf << 'EOF'
 [storage]
 driver = "overlay"
-runroot = "/tmp/$USER/containers/runroot"
-graphroot = "/tmp/$USER/containers/storage"
+runroot = "/dev/shm/$USER/runroot"
+graphroot = "/dev/shm/$USER/root"
 EOF
 fi
 
-export XDG_RUNTIME_DIR=/tmp/$USER/containers/run
-mkdir -p $XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR="$(mktemp -d -p "${{TMPDIR:-/tmp}}" xdg-run-$UID.XXXXXX)"
+chmod 700 "$XDG_RUNTIME_DIR"
 
 # Load image from tar if not already available
 if ! podman image exists {image} 2>/dev/null; then
@@ -1111,19 +1171,29 @@ ls -lh {output_path}
 
 set -euxo pipefail
 
-# Configure podman storage
+export HOME="${{HOME:-/users/$USER}}"
+
+# Wait for systemd user session to settle before podman
+while pgrep -U $(id -u) systemd ; do sleep 0.2 ; done
+
+# Clean up previous podman state
+podman system reset -f
+rm -Rf /dev/shm/$USER/*
+rm -Rf /tmp/xdg-run-$(id -u)*
+
+# Configure podman storage on local filesystem if not already present
 mkdir -p $HOME/.config/containers
 if [ ! -f $HOME/.config/containers/storage.conf ]; then
     cat > $HOME/.config/containers/storage.conf << 'EOF'
 [storage]
 driver = "overlay"
-runroot = "/tmp/$USER/containers/runroot"
-graphroot = "/tmp/$USER/containers/storage"
+runroot = "/dev/shm/$USER/runroot"
+graphroot = "/dev/shm/$USER/root"
 EOF
 fi
 
-export XDG_RUNTIME_DIR=/tmp/$USER/containers/run
-mkdir -p $XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR="$(mktemp -d -p "${{TMPDIR:-/tmp}}" xdg-run-$UID.XXXXXX)"
+chmod 700 "$XDG_RUNTIME_DIR"
 
 # Load image from tar if not already available
 if ! podman image exists {image} 2>/dev/null; then
@@ -1153,7 +1223,7 @@ echo "Committed patched image: {patched_tag}"
 podman images | grep {patched_tag.split(':')[0]}
 """
         if enroot:
-            output_path = output or config.resolve_path(f"images/{patched_tag.replace(':', '-')}.sqsh", remote=True)
+            output_path = output or config.resolve_path(f"images/{patched_tag.replace(':', '+')}.sqsh", remote=True)
             script += f"""
 echo "=== Exporting to enroot ==="
 mkdir -p $(dirname {output_path})
