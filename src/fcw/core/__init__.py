@@ -1,16 +1,80 @@
 """Core modules."""
 
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
+from rich.console import Console
+
+from fcw.core.client import (
+    extract_job_id,
+    get_account,
+    get_async_client,
+    get_client,
+    get_system,
+)
 from fcw.core.config import (
-    FcwConfig,
-    DirectoryType,
-    DirectoryConfig,
     ContainerConfig,
+    DirectoryConfig,
+    DirectoryType,
+    FcwConfig,
     JobConfig,
     WorkdirConfig,
-    load_config,
     generate_default_config,
+    load_config,
 )
-from fcw.core.client import get_client, get_async_client, get_system, get_account
+
+if TYPE_CHECKING:
+    import typer
+
+
+# SLURM job states that indicate failure.
+SLURM_FAILED_STATES = frozenset({
+    "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL",
+    "OUT_OF_MEMORY", "BOOT_FAIL", "DEADLINE", "PREEMPTED",
+})
+
+
+def get_console() -> Console:
+    """Get a Rich console for stderr output."""
+    return Console()
+
+
+def get_global_sbatch_options() -> dict[str, str]:
+    """Get global SBATCH options from environment variables.
+
+    Currently supports:
+        FIRECREST_RESERVATION -> --reservation
+    """
+    opts: dict[str, str] = {}
+    reservation = os.environ.get("FIRECREST_RESERVATION")
+    if reservation:
+        opts["reservation"] = reservation
+    return opts
+
+
+def format_sbatch_lines(options: dict[str, str]) -> str:
+    """Format SBATCH options dict as #SBATCH directive lines.
+
+    Returns a string of #SBATCH lines (with trailing newline per line),
+    or empty string if no options.
+    """
+    return "".join(f"#SBATCH --{k}={v}\n" for k, v in options.items())
+
+
+def resolve_context(ctx: "typer.Context") -> tuple[FcwConfig, str, str]:
+    """Extract config, system, and account from a Typer context.
+
+    Returns:
+        Tuple of (config, system, account).
+    """
+    obj = ctx.obj or {}
+    config = load_config(obj.get("config_file"))
+    system = get_system(obj.get("system"))
+    account = get_account(obj.get("account"))
+    return config, system, account
+
 
 __all__ = [
     "FcwConfig",
@@ -25,4 +89,10 @@ __all__ = [
     "get_async_client",
     "get_system",
     "get_account",
+    "extract_job_id",
+    "resolve_context",
+    "SLURM_FAILED_STATES",
+    "get_console",
+    "get_global_sbatch_options",
+    "format_sbatch_lines",
 ]

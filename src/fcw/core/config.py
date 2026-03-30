@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -100,14 +101,14 @@ class FcwConfig:
     
     def resolve_container_image(self, cont: ContainerConfig) -> str:
         """Resolve full remote sqsh path: remote_path dir + tag-derived filename."""
-        remote_dir = cont.remote_path or "images/"
+        remote_dir = cont.remote_path or "ce-images/"
         sqsh_name = cont.tag.replace(":", "+").replace("/", "+") + ".sqsh"
-        return self.resolve_path(os.path.join(remote_dir, sqsh_name), remote=True)
+        return os.path.normpath(self.resolve_path(os.path.join(remote_dir, sqsh_name), remote=True))
 
     def resolve_container_images_dir(self, cont: ContainerConfig) -> str:
         """Resolve the remote directory containing container images."""
-        remote_dir = cont.remote_path or "images/"
-        return self.resolve_path(remote_dir, remote=True)
+        remote_dir = cont.remote_path or "ce-images/"
+        return os.path.normpath(self.resolve_path(remote_dir, remote=True))
 
     def get_directory_type(self, path: str) -> DirectoryType:
         """Get the type of a directory, defaulting to bidirectional."""
@@ -227,7 +228,13 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
     
     # Process values (expand env vars and refs)
     data = process_value(raw_data, raw_data)
-    
+
+    # Warn on unknown top-level keys
+    known_keys = {"project", "workdir", "directories", "containers", "jobs"}
+    unknown = set(data.keys()) - known_keys
+    if unknown:
+        warnings.warn(f"Unknown keys in {config_path}: {', '.join(sorted(unknown))}")
+
     # Build config object
     config = FcwConfig(
         project=data.get("project", "default"),
@@ -280,11 +287,11 @@ def generate_default_config() -> str:
     """Generate a default fcw.yaml template."""
     return '''\
 # fcw configuration file
-project: my-hpc-app
+project: my-fcw-app
 
 # Workdir mapping - all paths are relative to this
 workdir:
-  remote: /scratch/${USER}/my-project
+  remote: ${FIRECREST_SCRATCH}/my-fcw-app
   local: .
 
 # Directory declarations with data flow type
@@ -294,19 +301,19 @@ directories:
     type: in
   data/processed:
     type: out
-  outputs:
+  data/outputs:
     type: out
   code:
     type: both
-  images:
+  ce-images:
     type: in
 
 # Container definitions
 containers:
   app:
     file: ./env/Dockerfile
-    tag: myapp:latest
-    remote_path: images/myapp.sqsh
+    tag: my-fcw-app:latest
+    remote_path: ce-images/my-fcw-app+latest.sqsh
 
 # Job definitions with environment
 jobs:
@@ -322,11 +329,11 @@ jobs:
     nodes: 1
     env:
       DATA_DIR: data/processed
-      OUTPUT_DIR: outputs
+      OUTPUT_DIR: data/outputs
       # CONFIG: provided via --set at submit time
 
   evaluate:
     script: slurm/evaluate.sh
     env:
-      MODEL_DIR: outputs
+      MODEL_DIR: data/outputs
 '''

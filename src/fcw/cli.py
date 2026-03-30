@@ -10,6 +10,7 @@ app = typer.Typer(
     name="fcw",
     help="FirecREST workflow CLI for HPC job orchestration.",
     no_args_is_help=True,
+    epilog="Get started: fcw config init && fcw config validate",
 )
 
 # Register command groups

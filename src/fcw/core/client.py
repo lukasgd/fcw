@@ -59,14 +59,17 @@ def get_client() -> "Firecrest":
 
 def get_async_client() -> "AsyncFirecrest":
     """Get an asynchronous FirecREST v2 client.
-    
+
     Note: A new client is created each time since async clients
     should be used within a single async context.
     """
-    return firecrest.v2.AsyncFirecrest(
+    client = firecrest.v2.AsyncFirecrest(
         firecrest_url=_get_firecrest_url(),
         authorization=_get_auth(),
     )
+    # Increase timeout for large uploads (container images)
+    client.timeout = 300
+    return client
 
 
 def get_system(system: str | None = None) -> str:
@@ -88,6 +91,14 @@ def get_system(system: str | None = None) -> str:
             "Use --system option or set FIRECREST_SYSTEM environment variable."
         )
     return system
+
+
+def extract_job_id(result: dict) -> str:
+    """Extract job ID from a FirecREST submit response.
+
+    The API returns the ID under different keys depending on version.
+    """
+    return result.get("jobId") or result.get("jobid") or result.get("job_id") or ""
 
 
 def get_account(account: str | None = None) -> str:

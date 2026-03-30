@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import sys
 import tarfile
 import tempfile
 import time
@@ -14,18 +13,24 @@ from pathlib import Path
 from typing import List, Optional
 
 import typer
-from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 import firecrest
 
-from fcw.core import load_config, DirectoryType, get_async_client, get_system, get_account
+from fcw.core import load_config, DirectoryType, get_async_client, get_system, get_account, resolve_context, get_console
 
 app = typer.Typer(no_args_is_help=True)
-console = Console()
+_console = get_console
 
 # Sync state directory
 SYNC_STATE_DIR = ".fcw/sync"
+
+
+def _spinner(message: str):
+    """Create a progress spinner with a message."""
+    p = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=_console())
+    p.add_task(message, total=None)
+    return p
 
 
 def _get_sync_marker_path(local_dir: str, direction: str) -> Path:
@@ -366,18 +371,14 @@ def upload(
     force: bool = typer.Option(False, "--force", "-f", help="Override directory type restrictions"),
 ):
     """Upload local files/directories to remote storage."""
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    account = get_account(ctx.obj.get("account") if ctx.obj else None)
-    
+    config, system, account = resolve_context(ctx)
+
     # Validate directory types
     for path in paths:
         rel_path = os.path.relpath(path, config.workdir.local)
         if not config.can_upload(rel_path) and not force:
             dir_type = config.get_directory_type(rel_path)
-            console.print(
+            _console().print(
                 f"[red]Error:[/red] '{rel_path}' is declared as '{dir_type.value}' (download-only).\n"
                 "Use --force to override or change type in fcw.yaml."
             )
@@ -392,39 +393,24 @@ def upload(
                 remote_path = config.resolve_path(rel_path, remote=True)
                 
                 if incremental and os.path.isdir(local_path):
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn("[progress.description]{task.description}"),
-                        console=console,
-                    ) as progress:
-                        progress.add_task(f"Syncing {local_path}...", total=None)
+                    with _spinner(f"Syncing {local_path}..."):
                         count = await _upload_incremental(
                             client, system, account, local_path, remote_path
                         )
                     if count > 0:
-                        console.print(f"[green]Uploaded {count} files to {remote_path}[/green]")
+                        _console().print(f"[green]Uploaded {count} files to {remote_path}[/green]")
                     else:
-                        console.print(f"[dim]No changes in {local_path}[/dim]")
+                        _console().print(f"[dim]No changes in {local_path}[/dim]")
                 elif os.path.isdir(local_path):
                     # Directory upload via tar
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn("[progress.description]{task.description}"),
-                        console=console,
-                    ) as progress:
-                        progress.add_task(f"Uploading {local_path}...", total=None)
+                    with _spinner(f"Uploading {local_path}..."):
                         await _upload_directory(
                             client, system, account, local_path, remote_path
                         )
-                    console.print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
+                    _console().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
                 else:
                     # Direct file upload
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn("[progress.description]{task.description}"),
-                        console=console,
-                    ) as progress:
-                        progress.add_task(f"Uploading {local_path}...", total=None)
+                    with _spinner(f"Uploading {local_path}..."):
                         await client.upload(
                             system_name=system,
                             local_file=local_path,
@@ -433,12 +419,12 @@ def upload(
                             account=account,
                             blocking=True,
                         )
-                    console.print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
+                    _console().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
             
             if not watch:
                 break
             
-            console.print(f"[dim]Waiting {interval}s...[/dim]")
+            _console().print(f"[dim]Waiting {interval}s...[/dim]")
             await asyncio.sleep(interval)
     
     asyncio.run(do_upload())
@@ -454,17 +440,13 @@ def download(
     force: bool = typer.Option(False, "--force", "-f", help="Override directory type restrictions"),
 ):
     """Download remote files/directories to local storage."""
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    account = get_account(ctx.obj.get("account") if ctx.obj else None)
-    
+    config, system, account = resolve_context(ctx)
+
     # Validate directory types
     for path in paths:
         if not config.can_download(path) and not force:
             dir_type = config.get_directory_type(path)
-            console.print(
+            _console().print(
                 f"[red]Error:[/red] '{path}' is declared as '{dir_type.value}' (upload-only).\n"
                 "Use --force to override or change type in fcw.yaml."
             )
@@ -479,19 +461,14 @@ def download(
                 local_path = config.resolve_path(rel_path, remote=False)
                 
                 if incremental:
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn("[progress.description]{task.description}"),
-                        console=console,
-                    ) as progress:
-                        progress.add_task(f"Syncing {rel_path}...", total=None)
+                    with _spinner(f"Syncing {rel_path}..."):
                         count = await _download_incremental(
                             client, system, account, remote_path, local_path
                         )
                     if count > 0:
-                        console.print(f"[green]Downloaded {count} files from {remote_path}[/green]")
+                        _console().print(f"[green]Downloaded {count} files from {remote_path}[/green]")
                     else:
-                        console.print(f"[dim]No changes in {rel_path}[/dim]")
+                        _console().print(f"[dim]No changes in {rel_path}[/dim]")
                 else:
                     # Check if remote path is a directory
                     is_dir = False
@@ -507,27 +484,17 @@ def download(
 
                     if is_dir:
                         # Directory download via compress
-                        with Progress(
-                            SpinnerColumn(),
-                            TextColumn("[progress.description]{task.description}"),
-                            console=console,
-                        ) as progress:
-                            progress.add_task(f"Downloading {rel_path}...", total=None)
+                        with _spinner(f"Downloading {rel_path}..."):
                             await _download_directory(
                                 client, system, account, remote_path, local_path
                             )
-                        console.print(
+                        _console().print(
                             f"[green]Downloaded {remote_path} to {local_path}[/green]"
                         )
                     else:
                         # Direct file download
                         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-                        with Progress(
-                            SpinnerColumn(),
-                            TextColumn("[progress.description]{task.description}"),
-                            console=console,
-                        ) as progress:
-                            progress.add_task(f"Downloading {rel_path}...", total=None)
+                        with _spinner(f"Downloading {rel_path}..."):
                             await client.download(
                                 system_name=system,
                                 source_path=remote_path,
@@ -535,14 +502,14 @@ def download(
                                 account=account,
                                 blocking=True,
                             )
-                        console.print(
+                        _console().print(
                             f"[green]Downloaded {remote_path} to {local_path}[/green]"
                         )
             
             if not watch:
                 break
             
-            console.print(f"[dim]Waiting {interval}s...[/dim]")
+            _console().print(f"[dim]Waiting {interval}s...[/dim]")
             await asyncio.sleep(interval)
     
     asyncio.run(do_download())
@@ -555,11 +522,9 @@ def list_files(
     recursive: bool = typer.Option(False, "-R", "--recursive", help="List recursively"),
 ):
     """List remote directory contents."""
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    
+    config = load_config((ctx.obj or {}).get("config_file"))
+    system = get_system((ctx.obj or {}).get("system"))
+
     remote_path = config.resolve_path(path, remote=True)
     
     client = get_async_client()
@@ -578,9 +543,9 @@ def list_files(
             size = entry.get("size") if isinstance(entry, dict) else getattr(entry, "size", 0)
             
             if entry_type == "d":
-                console.print(f"[blue]{name}/[/blue]")
+                _console().print(f"[blue]{name}/[/blue]")
             else:
-                console.print(f"{name}  ({size} bytes)")
+                _console().print(f"{name}  ({size} bytes)")
     
     asyncio.run(do_list())
 
@@ -592,12 +557,8 @@ def rm(
     force: bool = typer.Option(False, "--force", "-f", help="Don't prompt for confirmation"),
 ):
     """Remove remote files or directories."""
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    account = get_account(ctx.obj.get("account") if ctx.obj else None)
-    
+    config, system, account = resolve_context(ctx)
+
     if not force:
         paths_str = ", ".join(paths)
         if not typer.confirm(f"Remove {paths_str}?"):
@@ -614,7 +575,7 @@ def rm(
                 account=account,
                 blocking=True,
             )
-            console.print(f"[green]Removed {remote_path}[/green]")
+            _console().print(f"[green]Removed {remote_path}[/green]")
     
     asyncio.run(do_rm())
 
@@ -624,9 +585,8 @@ def status(
     ctx: typer.Context,
 ):
     """Show last sync times for configured directories."""
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
+    config = load_config((ctx.obj or {}).get("config_file"))
+
     from rich.table import Table
     
     table = Table(title="Sync Status")
@@ -646,4 +606,4 @@ def status(
         
         table.add_row(path, dir_config.type.value, push_str, pull_str)
     
-    console.print(table)
+    _console().print(table)

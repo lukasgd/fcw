@@ -1,0 +1,57 @@
+# fcw configuration file
+project: test-fcw
+
+# Workdir mapping - all paths are relative to this
+workdir:
+  remote: ${FIRECREST_SCRATCH}/fcw-basic-${FCW_BASIC_RUN_ID}
+  local: .
+
+# Directory declarations with data flow type
+# type: in (upload only), out (download only), both (bidirectional)
+directories:
+  data/raw:
+    type: in
+  data/processed:
+    type: out
+  outputs:
+    type: out
+  code:
+    type: both
+  ce-images:
+    type: in
+
+# Container definitions
+containers:
+  app:
+    file: ./env/Dockerfile.app
+    tag: ubuntu-fcw-basic:24.04
+    remote_path: ./ce-images/
+  aux:
+    file: ./env/Dockerfile.aux
+    tag: fcw-aux:latest
+    remote_path: ./ce-images/
+
+# Job definitions with environment
+jobs:
+  preprocess:
+    script: slurm/preprocess.sh
+    env:
+      DATA_IN: data/raw
+      DATA_OUT: data/processed
+      CE_IMAGES_DIR: ce-images
+
+  train:
+    script: slurm/train.sh
+    time: "12:00:00"
+    nodes: 1
+    env:
+      DATA_DIR: data/processed
+      OUTPUT_DIR: outputs
+      CE_IMAGES_DIR: ce-images
+      # CONFIG: provided via --set at submit time
+
+  evaluate:
+    script: slurm/evaluate.sh
+    env:
+      MODEL_DIR: outputs
+      CE_IMAGES_DIR: ce-images

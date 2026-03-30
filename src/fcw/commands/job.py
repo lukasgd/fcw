@@ -27,20 +27,30 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import sys
 import tempfile
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import typer
-from rich.console import Console
 from rich.table import Table
 
 import firecrest
 
-from fcw.core import load_config, get_async_client, get_client, get_system, get_account
+from fcw.core import (
+    load_config,
+    get_async_client,
+    get_client,
+    get_system,
+    get_account,
+    extract_job_id,
+    resolve_context,
+    get_console,
+    get_global_sbatch_options,
+    SLURM_FAILED_STATES,
+)
 
 app = typer.Typer(no_args_is_help=True)
-console = Console()
+_console = get_console
 
 
 # -----------------------------------------------------------------------------
@@ -173,9 +183,12 @@ def _resolve_job_env(config, job_config, overrides: dict[str, str]) -> dict[str,
             value = config.resolve_path(value, remote=True)
         env[key] = value
     
-    # Apply overrides
-    env.update(overrides)
-    
+    # Apply overrides (resolve relative paths the same way as config values)
+    for key, value in overrides.items():
+        if not value.startswith("/") and not value.startswith("$"):
+            value = config.resolve_path(value, remote=True)
+        env[key] = value
+
     return env
 
 
@@ -242,12 +255,13 @@ def submit_job(
         None, "--set", "-e",
         help="Override env var: KEY=VALUE"
     ),
-    wait: bool = typer.Option(False, "--wait", "-w", help="Wait for job completion"),
+    wait: bool = typer.Option(False, "--wait/--no-wait", "-w", help="Wait for job completion"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print job ID"),
     remote_script: bool = typer.Option(
         False, "--remote-script",
         help="Upload script to remote before submitting (workaround for slurmrestd/pyxis segfault)"
     ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show modified script without submitting"),
 ):
     """Submit a job with optional SBATCH overrides.
 
@@ -269,32 +283,38 @@ def submit_job(
         # Set environment variables
         fcw job submit train --set CONFIG=exp1.yaml --set EPOCHS=100
     """
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    account = get_account(ctx.obj.get("account") if ctx.obj else None)
-    
+    config, system, account = resolve_context(ctx)
+
     # Parse SBATCH options and remaining arguments
     sbatch_overrides, remaining = _parse_sbatch_args(args or [])
-    
+
+    # Warn if SBATCH-style flags appear after the script name (missing -- separator)
+    if not sbatch_overrides and any(a.startswith("--") for a in remaining[1:]):
+        _console().print(
+            "[yellow]Warning: SBATCH-style options found after the script name. "
+            "Did you forget the -- separator?[/yellow]"
+        )
+
+    # Apply global SBATCH options (env vars), then CLI overrides on top
+    sbatch_overrides = {**get_global_sbatch_options(), **sbatch_overrides}
+
     if not remaining:
-        console.print("[red]Error: No script or job name provided[/red]")
-        console.print("[dim]Usage: fcw job submit [SBATCH_OPTS]... -- <script|job_name> [--set KEY=VALUE]...[/dim]")
+        _console().print("[red]Error: No script or job name provided[/red]")
+        _console().print("[dim]Usage: fcw job submit [SBATCH_OPTS]... -- <script|job_name> [--set KEY=VALUE]...[/dim]")
         raise typer.Exit(1)
-    
+
     job_name = remaining[0]
-    
+
     # Parse --set overrides
     overrides = {}
     if set_vars:
         for s in set_vars:
             if "=" not in s:
-                console.print(f"[red]Invalid --set format: {s} (expected KEY=VALUE)[/red]")
+                _console().print(f"[red]Invalid --set format: {s} (expected KEY=VALUE)[/red]")
                 raise typer.Exit(1)
             k, v = s.split("=", 1)
             overrides[k] = v
-    
+
     # Determine if job_name is a config job or a script path
     if job_name in config.jobs:
         job_config = config.jobs[job_name]
@@ -309,13 +329,18 @@ def submit_job(
     
     # Read and modify script
     if not os.path.exists(script_path):
-        console.print(f"[red]Script not found: {script_path}[/red]")
+        _console().print(f"[red]Script not found: {script_path}[/red]")
         raise typer.Exit(1)
     
-    script_content = open(script_path).read()
+    script_content = Path(script_path).read_text()
     script_content = _apply_sbatch_overrides(script_content, sbatch_overrides)
     script_content = _inject_env_vars(script_content, env_vars)
-    
+
+    if dry_run:
+        _console().print(f"[bold]Modified script ({script_path}):[/bold]")
+        _console().print(script_content)
+        return
+
     # Submit job
     client = get_client()
     working_dir = config.workdir.remote
@@ -353,24 +378,31 @@ def submit_job(
                 script_local_path=modified_script_path,
             )
 
-        job_id = result.get("jobId") or result.get("jobid") or result.get("job_id")
+        job_id = extract_job_id(result)
 
         # Print job ID to stdout for scripting
         print(job_id)
 
         # Print details to stderr (unless quiet)
         if not quiet:
-            console.print(f"[green]Submitted job {job_id}[/green]", highlight=False)
+            _console().print(f"[green]Submitted job {job_id}[/green]", highlight=False)
             if sbatch_overrides:
                 override_str = ", ".join(f"{k}={v}" for k, v in sbatch_overrides.items())
-                console.print(f"[dim]SBATCH overrides: {override_str}[/dim]")
+                _console().print(f"[dim]SBATCH overrides: {override_str}[/dim]")
     finally:
         os.unlink(modified_script_path)
 
     if wait:
-        console.print(f"[dim]Waiting for job {job_id}...[/dim]")
-        client.wait_for_job(system_name=system, job_id=job_id)
-        console.print(f"[green]Job {job_id} completed[/green]")
+        _console().print(f"[dim]Waiting for job {job_id}...[/dim]")
+        job_info = client.wait_for_job(system_name=system, job_id=job_id)
+        state = job_info[0]["status"]["state"]
+        if isinstance(state, list):
+            state = ",".join(state)
+        if any(fs in state for fs in SLURM_FAILED_STATES):
+            _console().print(f"[red]Job {job_id} finished with state: {state}[/red]")
+            _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
+            raise typer.Exit(1)
+        _console().print(f"[green]Job {job_id} completed ({state})[/green]")
 
 
 @app.command("run", context_settings={"allow_interspersed_args": False})
@@ -399,18 +431,14 @@ def run_command(
         # With dependency
         fcw job run --dependency afterok:12345 -- 'python analyze.py'
     """
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    account = get_account(ctx.obj.get("account") if ctx.obj else None)
-    
+    config, system, account = resolve_context(ctx)
+
     # Parse SBATCH options and remaining arguments
     sbatch_overrides, remaining = _parse_sbatch_args(args or [])
-    
+
     if not remaining:
-        console.print("[red]Error: No command provided[/red]")
-        console.print("[dim]Usage: fcw job run [SBATCH_OPTS]... -- <command>[/dim]")
+        _console().print("[red]Error: No command provided[/red]")
+        _console().print("[dim]Usage: fcw job run [SBATCH_OPTS]... -- <command>[/dim]")
         raise typer.Exit(1)
     
     command = " ".join(remaining)
@@ -422,7 +450,7 @@ def run_command(
         "nodes": str(nodes),
         "output": "fcw-run-%j.out",
     }
-    sbatch_final = {**sbatch_defaults, **sbatch_overrides}
+    sbatch_final = {**sbatch_defaults, **get_global_sbatch_options(), **sbatch_overrides}
     
     # Build script
     sbatch_lines = "\n".join(f"#SBATCH --{k}={v}" for k, v in sbatch_final.items())
@@ -468,9 +496,9 @@ def run_command(
                 script_local_path=script_path,
             )
 
-        job_id = result.get("jobId") or result.get("jobid") or result.get("job_id")
+        job_id = extract_job_id(result)
         print(job_id)
-        console.print(f"[green]Submitted job {job_id}[/green]")
+        _console().print(f"[green]Submitted job {job_id}[/green]")
     finally:
         os.unlink(script_path)
 
@@ -481,14 +509,14 @@ def job_status(
     job_id: str = typer.Argument(..., help="Job ID"),
 ):
     """Get status of a job."""
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    
+    system = get_system((ctx.obj or {}).get("system"))
+
     client = get_client()
     
     try:
         jobs = client.job_info(system_name=system, jobid=job_id)
         if not jobs:
-            console.print(f"[yellow]No info found for job {job_id}[/yellow]")
+            _console().print(f"[yellow]No info found for job {job_id}[/yellow]")
             raise typer.Exit(1)
 
         job = jobs[0]
@@ -499,9 +527,9 @@ def job_status(
         for key, value in job.items():
             table.add_row(str(key), str(value))
         
-        console.print(table)
+        _console().print(table)
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        _console().print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1)
 
 
@@ -509,25 +537,21 @@ def job_status(
 def job_logs(
     ctx: typer.Context,
     job_id: str = typer.Argument(..., help="Job ID"),
-    tail: bool = typer.Option(False, "--tail", "-t", help="Show last lines only"),
+    tail: bool = typer.Option(False, "--tail", help="Show last lines only"),
     follow: bool = typer.Option(False, "--follow", "-f", help="Follow output (poll)"),
     download: bool = typer.Option(False, "--download", "-d", help="Download log file"),
     lines: int = typer.Option(50, "--lines", "-n", help="Number of lines for --tail"),
 ):
     """View job stdout/stderr logs."""
-    config_file = ctx.obj.get("config_file") if ctx.obj else None
-    config = load_config(config_file)
-    
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    account = get_account(ctx.obj.get("account") if ctx.obj else None)
-    
+    config, system, account = resolve_context(ctx)
+
     client = get_client()
     
     # Get job metadata to find output file
     try:
         metadata_list = client.job_metadata(system_name=system, jobid=job_id)
         if not metadata_list:
-            console.print(f"[red]No metadata found for job {job_id}[/red]")
+            _console().print(f"[red]No metadata found for job {job_id}[/red]")
             raise typer.Exit(1)
         metadata = metadata_list[0]
         stdout_path = (
@@ -537,14 +561,14 @@ def job_logs(
         )
         
         if not stdout_path:
-            console.print("[red]Could not determine stdout path from job metadata[/red]")
+            _console().print("[red]Could not determine stdout path from job metadata[/red]")
             raise typer.Exit(1)
         
         # Resolve %j to job_id if present
         stdout_path = stdout_path.replace("%j", job_id)
         
     except Exception as e:
-        console.print(f"[red]Error getting job metadata: {e}[/red]")
+        _console().print(f"[red]Error getting job metadata: {e}[/red]")
         raise typer.Exit(1)
     
     if download:
@@ -561,7 +585,7 @@ def job_logs(
             )
         
         asyncio.run(do_download())
-        console.print(f"[green]Downloaded to {local_path}[/green]")
+        _console().print(f"[green]Downloaded to {local_path}[/green]")
         return
     
     async def do_tail():
@@ -597,7 +621,7 @@ def job_logs(
                 if follow:
                     await asyncio.sleep(2)
                     continue
-                console.print(f"[red]Error: {e}[/red]")
+                _console().print(f"[red]Error: {e}[/red]")
                 break
     
     asyncio.run(do_tail())
@@ -610,17 +634,26 @@ def wait_for_jobs(
     timeout: Optional[int] = typer.Option(None, "--timeout", help="Timeout in seconds"),
 ):
     """Wait for one or more jobs to complete."""
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    
+    system = get_system((ctx.obj or {}).get("system"))
+
     client = get_client()
     
     for job_id in job_ids:
-        console.print(f"[dim]Waiting for job {job_id}...[/dim]")
+        _console().print(f"[dim]Waiting for job {job_id}...[/dim]")
         try:
-            client.wait_for_job(system_name=system, job_id=job_id)
-            console.print(f"[green]Job {job_id} completed[/green]")
+            job_info = client.wait_for_job(system_name=system, job_id=job_id)
+            state = job_info[0]["status"]["state"]
+            if isinstance(state, list):
+                state = ",".join(state)
+            if any(fs in state for fs in SLURM_FAILED_STATES):
+                _console().print(f"[red]Job {job_id} finished with state: {state}[/red]")
+                _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
+                raise typer.Exit(1)
+            _console().print(f"[green]Job {job_id} completed ({state})[/green]")
+        except typer.Exit:
+            raise
         except Exception as e:
-            console.print(f"[red]Job {job_id} failed: {e}[/red]")
+            _console().print(f"[red]Job {job_id} failed: {e}[/red]")
             raise typer.Exit(1)
 
 
@@ -630,16 +663,16 @@ def cancel_jobs(
     job_ids: List[str] = typer.Argument(..., help="Job IDs to cancel"),
 ):
     """Cancel one or more jobs."""
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    
+    system = get_system((ctx.obj or {}).get("system"))
+
     client = get_client()
     
     for job_id in job_ids:
         try:
             client.cancel_job(system_name=system, jobid=job_id)
-            console.print(f"[green]Cancelled job {job_id}[/green]")
+            _console().print(f"[green]Cancelled job {job_id}[/green]")
         except Exception as e:
-            console.print(f"[red]Failed to cancel {job_id}: {e}[/red]")
+            _console().print(f"[red]Failed to cancel {job_id}: {e}[/red]")
 
 
 @app.command("list")
@@ -648,32 +681,42 @@ def list_jobs(
     state: Optional[str] = typer.Option(None, "--state", "-s", help="Filter by state"),
 ):
     """List jobs on the cluster."""
-    system = get_system(ctx.obj.get("system") if ctx.obj else None)
-    
+    system = get_system((ctx.obj or {}).get("system"))
+
     client = get_client()
     
     try:
-        jobs = client.job_list(system_name=system)
-        
+        jobs = client.job_info(system_name=system)
+
         table = Table(title="Jobs")
         table.add_column("Job ID")
         table.add_column("Name")
         table.add_column("State")
         table.add_column("Time")
-        
+
         for job in jobs:
-            job_state = job.get("state", "")
+            # State may be in status.state (list or string)
+            status = job.get("status", {})
+            job_state = status.get("state", "") if isinstance(status, dict) else job.get("state", "")
+            if isinstance(job_state, list):
+                job_state = ",".join(job_state)
+            job_state = str(job_state)
+
             if state and state.lower() not in job_state.lower():
                 continue
-            
+
+            # Time limit may be nested under limits
+            limits = job.get("limits", {})
+            time_str = limits.get("time", "") if isinstance(limits, dict) else job.get("time", "")
+
             table.add_row(
-                str(job.get("jobId", job.get("job_id", ""))),
-                job.get("name", ""),
+                str(extract_job_id(job)),
+                str(job.get("name", "")),
                 job_state,
-                job.get("time", ""),
+                str(time_str),
             )
-        
-        console.print(table)
+
+        _console().print(table)
     except Exception as e:
-        console.print(f"[red]Error: {e}[/red]")
+        _console().print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1)

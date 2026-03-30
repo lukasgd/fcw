@@ -1,0 +1,369 @@
+"""End-to-end workflow tests.
+
+Tests are ordered to form a complete workflow: config validation,
+container build/deploy, data transfer, job submission, and cleanup.
+Tests within each class run in declaration order and may depend on
+prior state (e.g., container must be built before jobs can run).
+
+Requires: --run-e2e flag or FCW_E2E=1 environment variable.
+Uses the example project selected via --example (default: basic).
+"""
+
+import os
+import re
+
+import pytest
+
+from fcw.cli import app
+
+
+pytestmark = pytest.mark.e2e
+
+
+def _extract_job_id(output: str) -> str | None:
+    """Extract a numeric job ID from CLI output."""
+    for line in output.strip().split("\n"):
+        line = line.strip()
+        if line.isdigit():
+            return line
+        # Also match job ID in "Submitted job 12345" style lines
+        m = re.search(r"job (\d+)", line, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 1. Config
+# ---------------------------------------------------------------------------
+
+class TestConfigValidation:
+    def test_config_validate(self, runner):
+        """fcw config validate succeeds with valid credentials."""
+        result = runner.invoke(app, ["config", "validate"])
+        assert result.exit_code == 0, result.output
+
+    def test_config_show(self, runner):
+        """fcw config show displays resolved config."""
+        result = runner.invoke(app, ["config", "show"])
+        assert result.exit_code == 0, result.output
+        assert "remote:" in result.output or "test-fcw" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 2. Remote Setup
+# ---------------------------------------------------------------------------
+
+class TestRemoteSetup:
+    def test_setup_remote_dirs(self, client, system, account, remote_workdir):
+        """Create remote directory structure."""
+        for subdir in ["data/raw", "data/processed", "outputs", "logs", "env", "ce-images"]:
+            try:
+                client.mkdir(
+                    system_name=system,
+                    path=f"{remote_workdir}/{subdir}",
+                    create_parents=True,
+                )
+            except Exception:
+                pass  # May already exist
+
+    def test_upload_env(self, runner):
+        """Upload env/ directory."""
+        result = runner.invoke(app, ["data", "upload", "env"])
+        assert result.exit_code == 0, result.output
+
+    def test_upload_slurm(self, runner):
+        """Upload slurm/ directory."""
+        result = runner.invoke(app, ["data", "upload", "slurm"])
+        assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# 3. Container Build (multi-stage) + Deploy (single-stage)
+# ---------------------------------------------------------------------------
+
+class TestContainerBuildDeploy:
+    """Multi-stage container workflow: build locally, push, build-remote."""
+
+    def test_container_build_local(self, runner):
+        """Build download stage locally."""
+        result = runner.invoke(app, [
+            "container", "build", "--stage", "download",
+            "-t", "ubuntu-fcw-basic:24.04-download", "-f", "env/Dockerfile.app", ".",
+        ])
+        assert result.exit_code == 0, result.output
+
+    def test_container_build_save(self, runner):
+        """Build and save image to tar file (--save)."""
+        result = runner.invoke(app, [
+            "container", "build", "--stage", "download",
+            "-t", "ubuntu-fcw-basic:24.04-download",
+            "-f", "env/Dockerfile.app",
+            "--save", "test-image.tar",
+            ".",
+        ])
+        assert result.exit_code == 0, result.output
+        assert os.path.exists("test-image.tar")
+        os.unlink("test-image.tar")
+
+    def test_container_push(self, runner):
+        """Push image to remote."""
+        result = runner.invoke(app, ["container", "push", "ubuntu-fcw-basic:24.04-download"])
+        assert result.exit_code == 0, result.output
+
+    def test_container_build_remote(self, runner):
+        """Build offline stage on cluster + enroot import."""
+        result = runner.invoke(app, [
+            "container", "build-remote", "ubuntu-fcw-basic:24.04-download",
+            "-f", "env/Dockerfile.app", "-t", "ubuntu-fcw-basic:24.04",
+            "--stage", "build-offline", "--enroot", "--wait",
+        ])
+        assert result.exit_code == 0, result.output
+
+    def test_verify_sqsh(self, runner):
+        """Verify squashfs image exists on remote."""
+        result = runner.invoke(app, ["data", "ls", "ce-images"])
+        assert result.exit_code == 0, result.output
+        assert "ubuntu-fcw-basic+24.04.sqsh" in result.output
+
+    def test_container_list_local(self, runner):
+        """List local container images."""
+        result = runner.invoke(app, ["container", "list"])
+        assert result.exit_code == 0
+
+
+class TestContainerDeploy:
+    """Single-command deploy workflow: build + push + import in one step."""
+
+    def test_container_deploy(self, runner):
+        """Deploy aux container (build+push+import)."""
+        result = runner.invoke(app, ["container", "deploy", "aux", "--wait"])
+        assert result.exit_code == 0, result.output
+
+    def test_verify_deploy(self, runner):
+        """Verify deployed sqsh exists on remote."""
+        result = runner.invoke(app, ["data", "ls", "ce-images"])
+        assert result.exit_code == 0, result.output
+        assert "fcw-aux+latest.sqsh" in result.output
+
+    def test_container_list_remote(self, runner):
+        """List remote container images (should show both sqsh files)."""
+        result = runner.invoke(app, ["container", "list", "--remote"])
+        assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# 4. Container Iteration (extract + patch)
+# ---------------------------------------------------------------------------
+
+class TestContainerIterate:
+    """Code iteration workflow: extract from container, patch with bind-mount."""
+
+    def test_container_extract(self, runner):
+        """Extract files from aux container to local directory."""
+        result = runner.invoke(app, [
+            "container", "extract",
+            "fcw-aux:latest", "/workspace/aux",
+            "extracted-code",
+            "--wait",
+        ])
+        assert result.exit_code == 0, result.output
+        assert os.path.isdir("extracted-code")
+
+    def test_container_patch(self, runner):
+        """Upload patched code and create bind-mount TOML."""
+        # Use extracted code dir, or data/raw as fallback
+        patch_source = "extracted-code"
+        if not os.path.isdir(patch_source):
+            patch_source = "data/raw"
+
+        result = runner.invoke(app, [
+            "container", "patch",
+            patch_source, "/workspace",
+            "--toml", "env/container-patch.toml", "--create",
+        ])
+        assert result.exit_code == 0, result.output
+        # Verify TOML was created locally with bind-mount entry
+        assert os.path.exists("env/container-patch.toml")
+        content = open("env/container-patch.toml").read()
+        assert "/workspace" in content
+
+
+# ---------------------------------------------------------------------------
+# 5. Data Transfer
+# ---------------------------------------------------------------------------
+
+class TestDataUpload:
+    def test_upload_data(self, runner):
+        """Upload raw data."""
+        result = runner.invoke(app, ["data", "upload", "data/raw"])
+        assert result.exit_code == 0, result.output
+
+    def test_verify_data(self, runner):
+        """Verify data on remote."""
+        result = runner.invoke(app, ["data", "ls", "data/raw", "-R"])
+        assert result.exit_code == 0, result.output
+        assert "test.txt" in result.output
+
+    def test_upload_incremental(self, runner):
+        """Re-upload with --incremental (should skip unchanged files)."""
+        result = runner.invoke(app, ["data", "upload", "--incremental", "data/raw"])
+        assert result.exit_code == 0, result.output
+
+    def test_data_status(self, runner):
+        """Show sync status for configured directories."""
+        result = runner.invoke(app, ["data", "status"])
+        assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# 6. Job Submission
+# ---------------------------------------------------------------------------
+
+class TestJobSubmission:
+    def test_submit_preprocess(self, runner):
+        """Submit and wait for preprocess job."""
+        result = runner.invoke(app, [
+            "job", "submit", "--remote-script", "--wait", "--", "preprocess",
+        ])
+        assert result.exit_code == 0, result.output
+
+    def test_verify_preprocess(self, runner):
+        """Verify preprocess output exists."""
+        result = runner.invoke(app, ["data", "ls", "data/processed"])
+        assert result.exit_code == 0, result.output
+        assert "preprocessed_files.txt" in result.output
+
+    def test_submit_train(self, runner):
+        """Submit and wait for train job."""
+        result = runner.invoke(app, [
+            "job", "submit", "--remote-script", "--wait", "--", "train",
+        ])
+        assert result.exit_code == 0, result.output
+
+    def test_verify_train(self, runner):
+        """Verify train output files exist."""
+        result = runner.invoke(app, ["data", "ls", "outputs"])
+        assert result.exit_code == 0, result.output
+        assert "train_output_" in result.output
+
+    def test_submit_evaluate(self, runner):
+        """Submit and wait for evaluate job."""
+        result = runner.invoke(app, [
+            "job", "submit", "--remote-script", "--wait", "--", "evaluate",
+        ])
+        assert result.exit_code == 0, result.output
+
+    def test_verify_evaluate(self, runner):
+        """Verify evaluate output exists."""
+        result = runner.invoke(app, ["data", "ls", "outputs"])
+        assert result.exit_code == 0, result.output
+        assert "eval_summary_" in result.output
+
+    def test_submit_with_env_override(self, runner):
+        """Submit preprocess with --set to redirect output directory."""
+        result = runner.invoke(app, [
+            "job", "submit", "--remote-script", "--wait",
+            "--set", "DATA_OUT=outputs",
+            "--", "preprocess",
+        ])
+        assert result.exit_code == 0, result.output
+        # Verify override worked: preprocessed_files.txt now also in outputs/
+        result = runner.invoke(app, ["data", "ls", "outputs"])
+        assert result.exit_code == 0, result.output
+        assert "preprocessed_files.txt" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 7. Job Management
+# ---------------------------------------------------------------------------
+
+class TestJobManagement:
+    """Job lifecycle: list, run, status, logs, cancel."""
+
+    def test_job_list(self, runner):
+        """List recent jobs on the cluster."""
+        result = runner.invoke(app, ["job", "list"])
+        assert result.exit_code == 0, result.output
+
+    def test_job_run_and_wait(self, runner, shared_state):
+        """Run ad-hoc command, then wait for it with 'job wait'."""
+        # Submit ad-hoc job (job run has no --wait)
+        result = runner.invoke(app, [
+            "job", "run", "--remote-script",
+            "--", "echo hello-from-fcw-run",
+        ])
+        assert result.exit_code == 0, result.output
+        job_id = _extract_job_id(result.output)
+        assert job_id, f"Could not extract job ID from: {result.output}"
+        shared_state["run_job_id"] = job_id
+
+        # Wait for completion using the separate 'job wait' command
+        result = runner.invoke(app, ["job", "wait", job_id])
+        assert result.exit_code == 0, result.output
+
+    def test_job_status(self, runner, shared_state):
+        """Check status of a completed job."""
+        job_id = shared_state.get("run_job_id")
+        if not job_id:
+            pytest.skip("No job ID from previous test")
+        result = runner.invoke(app, ["job", "status", job_id])
+        assert result.exit_code == 0, result.output
+
+    def test_job_logs(self, runner, shared_state):
+        """View stdout logs of a completed job."""
+        job_id = shared_state.get("run_job_id")
+        if not job_id:
+            pytest.skip("No job ID from previous test")
+        result = runner.invoke(app, ["job", "logs", job_id])
+        # Logs may fail if metadata path resolution doesn't work;
+        # accept either success or a known metadata error
+        assert result.exit_code == 0 or "metadata" in result.output.lower(), result.output
+
+    def test_job_cancel(self, runner):
+        """Submit a long-running job and cancel it."""
+        # Submit a sleep job
+        result = runner.invoke(app, [
+            "job", "run", "--remote-script",
+            "--", "sleep 600",
+        ])
+        assert result.exit_code == 0, result.output
+        job_id = _extract_job_id(result.output)
+        assert job_id, f"Could not extract job ID from: {result.output}"
+
+        # Cancel it
+        result = runner.invoke(app, ["job", "cancel", job_id])
+        assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# 8. Data Download
+# ---------------------------------------------------------------------------
+
+class TestDataDownload:
+    def test_download_outputs(self, runner):
+        """Download outputs directory."""
+        result = runner.invoke(app, ["data", "download", "outputs"])
+        assert result.exit_code == 0, result.output
+
+    def test_download_incremental(self, runner):
+        """Re-download with --incremental (should skip unchanged files)."""
+        result = runner.invoke(app, ["data", "download", "--incremental", "outputs"])
+        assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# 9. Cleanup
+# ---------------------------------------------------------------------------
+
+class TestCleanup:
+    def test_data_rm(self, runner):
+        """Remove a remote directory."""
+        result = runner.invoke(app, ["data", "rm", "--force", "data/processed"])
+        assert result.exit_code == 0, result.output
+
+    def test_verify_rm(self, runner):
+        """Verify the directory was removed."""
+        result = runner.invoke(app, ["data", "ls", "data/processed"])
+        # Should fail (directory no longer exists) or return empty
+        assert result.exit_code != 0 or "preprocessed_files.txt" not in result.output

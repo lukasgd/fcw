@@ -1,0 +1,19 @@
+ARG BASE_IMAGE=python:3.12-slim
+ARG DOWNLOAD_IMAGE=download
+
+FROM ${BASE_IMAGE} AS download
+
+WORKDIR /workspace/aux
+
+COPY data/raw/test.txt /workspace/aux/test.txt
+
+
+FROM ${DOWNLOAD_IMAGE} AS download-copy
+
+FROM ${BASE_IMAGE} AS build-offline
+
+COPY --from=download-copy /workspace/aux /workspace/aux
+
+WORKDIR /workspace/aux
+
+RUN cat test.txt

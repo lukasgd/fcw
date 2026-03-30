@@ -4,10 +4,10 @@ A command-line tool for orchestrating HPC workflows via [FirecREST](https://gith
 
 ## Features
 
-- **Data Transfer**: Upload/download with directory type enforcement (`in`/`out`/`both`)
+- **Container Management**: Build, deploy, and iterate on container images (fast iteration with mirrored, bind-mounted patches and image rebuild when stable)
+- **Data Transfer**: Directory mirroring with continuous upload/download using type enforcement (`in`/`out`/`both`)
 - **Job Management**: Submit jobs from TOML with SBATCH overrides via `--` separator
-- **Container Management**: Build, deploy, and iterate on container images (fast iteration with bind-mounts and image rebuild when stable)
-- **FUSE Mount**: Mount remote storage as local filesystem (optional)
+- **FUSE Mount**: Mount remote storage as local filesystem over FirecREST (optional, untested)
 
 ## Installation
 
@@ -20,15 +20,16 @@ pip install fcw[fuse]
 
 ## Quick Start
 
+
 1. Set up FirecREST credentials:
 
 ```bash
-export FIRECREST_URL="https://api.cscs.ch/firecrest/v2"
-export FIRECREST_CLIENT_ID="your-client-id"
-export FIRECREST_CLIENT_SECRET="your-client-secret"
+export FIRECREST_URL="https://api.cscs.ch/ml/firecrest/v2"
 export AUTH_TOKEN_URL="https://auth.cscs.ch/auth/realms/firecrest-clients/protocol/openid-connect/token"
 export FIRECREST_SYSTEM="clariden"
-export FIRECREST_ACCOUNT="your-account"
+export FIRECREST_ACCOUNT="<account>"
+export FIRECREST_CLIENT_ID="<client_id>"
+export FIRECREST_CLIENT_SECRET="<client_secret>"
 ```
 
 2. Initialize a project:
@@ -45,13 +46,13 @@ fcw config validate
 Example `fcw.yaml`:
 
 ```yaml
-project: my-hpc-app
+project: my-app
 
 workdir:
   remote: /scratch/${USER}/my-project
   local: .
 
-# Directory types: in (upload only), out (download only), both (bidirectional)
+# Directory types: in/out/both relative to HPC job (upload/download/both)
 directories:
   data/raw:
     type: in
@@ -61,12 +62,14 @@ directories:
     type: out
   code:
     type: both
+  configs:
+    type: in
 
 containers:
   app:
     file: ./env/Dockerfile
-    tag: myapp:latest
-    remote_path: images/myapp.sqsh
+    tag: my-fcw-app:latest
+    remote_path: ce-images/my-fcw-app.sqsh
 
 jobs:
   preprocess:
@@ -82,6 +85,7 @@ jobs:
     env:
       DATA_DIR: data/processed
       OUTPUT_DIR: outputs
+      CONFIG_DIR: configs
 
   evaluate:
     script: slurm/evaluate.sh
@@ -122,7 +126,7 @@ JOB1=$(fcw job submit preprocess.sh)
 fcw job submit --dependency afterok:$JOB1 -- train.sh
 
 # Set environment variables
-fcw job submit train --set CONFIG=exp1.yaml --set EPOCHS=100
+fcw job submit train --set CONFIG=configs/exp1.yaml --set EPOCHS=100
 
 # Ad-hoc command
 fcw job run 'nvidia-smi'
@@ -141,14 +145,14 @@ For multi-stage Dockerfiles (download + build-offline pattern):
 
 ```bash
 # Build download stage locally (fetches dependencies, requires network)
-fcw container build --stage download -f env/Dockerfile.prod-multistage --build-arg BASE_IMAGE=ubuntu:24.04 -t myapp:download .
+fcw container build --stage download -f env/Dockerfile.prod-multistage --build-arg BASE_IMAGE=ubuntu:24.04 -t my-fcw-app:download .
 
 # Push download image to remote
-fcw container push myapp:download
+fcw container push my-fcw-app:download
 
 # Build offline stage on the cluster and import as enroot squashfs
-fcw container build-remote myapp:download \
-    -f env/Dockerfile.prod-multistage -t myapp:latest \
+fcw container build-remote my-fcw-app:download \
+    -f env/Dockerfile.prod-multistage -t my-fcw-app:latest \
     --stage build-offline --build-arg BASE_IMAGE=ubuntu:24.04 \
     --enroot --wait
 ```
@@ -159,7 +163,7 @@ For fast iteration without rebuilding the full container:
 
 ```bash
 # 1. Extract code from container for local editing
-fcw container extract myapp:download /workspace/BrainBERT ./code
+fcw container extract my-fcw-app:download /workspace/BrainBERT ./code
 
 # 2. Edit ./code locally...
 
@@ -168,12 +172,12 @@ fcw container patch ./code /workspace/BrainBERT --toml env/container.toml
 # Then: srun --environment env/container.toml python train.py
 
 # 3b. Bake changes: patch + rebuild (when satisfied with changes)
-fcw container update ./code myapp:download /workspace/BrainBERT \
-    --tag myapp:v2 --rebuild --dockerfile env/Dockerfile.prod-multistage \
+fcw container update ./code my-fcw-app:download /workspace/BrainBERT \
+    --tag my-fcw-app:v2 --rebuild --dockerfile env/Dockerfile.prod-multistage \
     --build-arg BASE_IMAGE=ubuntu:24.04 --enroot --wait
 ```
 
-### FUSE Mount (Optional)
+### FUSE Mount (Optional, Untested)
 
 ```bash
 # Mount remote storage
@@ -192,30 +196,37 @@ fcw mount stop ./local-outputs
 #!/bin/bash
 set -e
 
-# Upload input data
+# Upload input data and experiment configs
 fcw data upload data/raw
+fcw data upload configs
 
 # Build and deploy container (first time)
-fcw container build --stage download -t myapp:download .
-fcw container push myapp:download
-fcw container build-remote myapp:download \
-    -f env/Dockerfile.prod-multistage -t myapp:latest \
+fcw container build --stage download -t my-fcw-app:download .
+fcw container push my-fcw-app:download
+fcw container build-remote my-fcw-app:download \
+    -f env/Dockerfile.prod-multistage -t my-fcw-app:latest \
     --stage build-offline --build-arg BASE_IMAGE=ubuntu:24.04 \
     --enroot --wait
 
 # Run preprocessing
 JOB_PREP=$(fcw job submit --time 01:00:00 -- slurm/preprocess.sh)
 
+# Sync configs continuously in background (picks up edits during the run)
+fcw data upload configs --incremental --watch &
+SYNC_PID=$!
+
 # Run multiple training experiments (all depend on preprocessing)
-JOB_T1=$(fcw job submit --dependency afterok:$JOB_PREP -- train --set CONFIG=exp1.yaml)
-JOB_T2=$(fcw job submit --dependency afterok:$JOB_PREP -- train --set CONFIG=exp2.yaml)
-JOB_T3=$(fcw job submit --dependency afterok:$JOB_PREP -- train --set CONFIG=exp3.yaml)
+JOB_T1=$(fcw job submit --dependency afterok:$JOB_PREP -- train --set CONFIG=configs/exp1.yaml)
+JOB_T2=$(fcw job submit --dependency afterok:$JOB_PREP -- train --set CONFIG=configs/exp2.yaml)
+JOB_T3=$(fcw job submit --dependency afterok:$JOB_PREP -- train --set CONFIG=configs/exp3.yaml)
 
 # Evaluate all (depends on all training jobs)
 fcw job submit --dependency afterok:$JOB_T1:$JOB_T2:$JOB_T3 -- slurm/evaluate.sh
 
 # Monitor outputs
 fcw data download outputs --watch --incremental
+
+kill $SYNC_PID
 ```
 
 ## Example: Code Iteration Workflow
@@ -225,7 +236,7 @@ fcw data download outputs --watch --incremental
 # Fast iteration on code without rebuilding full container
 
 # One-time setup: extract code
-fcw container extract myapp:download /workspace/BrainBERT ./code
+fcw container extract my-fcw-app:download /workspace/BrainBERT ./code
 
 # Edit loop
 while true; do
@@ -240,11 +251,7 @@ while true; do
 done
 
 # When satisfied, bake changes into new image
-fcw container update ./code myapp:download /workspace/BrainBERT \
-    --tag myapp:v2 --rebuild --dockerfile env/Dockerfile.prod-multistage \
+fcw container update ./code my-fcw-app:download /workspace/BrainBERT \
+    --tag my-fcw-app:v2 --rebuild --dockerfile env/Dockerfile.prod-multistage \
     --build-arg BASE_IMAGE=ubuntu:24.04 --enroot --wait
 ```
-
-## License
-
-MIT

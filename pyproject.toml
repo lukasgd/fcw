@@ -85,3 +85,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests requiring FirecREST access (use --run-e2e or FCW_E2E=1)",
+]
