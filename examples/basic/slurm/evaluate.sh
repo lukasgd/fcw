@@ -10,7 +10,7 @@
 
 set -euxo pipefail
 
-srun -ul --environment ./env/container.toml bash -c "
+srun -ul --environment ${FCW_CONTAINER_TOML} bash -c "
     echo 'Evaluating model outputs in ${MODEL_DIR}'
     ls -lh ${MODEL_DIR}/
     wc -l ${MODEL_DIR}/* > ${MODEL_DIR}/eval_summary_\${SLURM_JOB_ID}.txt

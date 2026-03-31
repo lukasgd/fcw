@@ -23,16 +23,13 @@ SAMPLE_CONFIG_YAML = textwrap.dedent("""\
         type: out
       outputs:
         type: out
-      code:
-        type: both
-      images:
-        type: in
 
     containers:
       app:
         file: ./Dockerfile
         tag: my-fcw-app:latest
         remote_path: ./ce-images/
+        toml: ./env/container.toml
       aux:
         file: ./Dockerfile.aux
         tag: fcw-aux:latest
@@ -40,11 +37,13 @@ SAMPLE_CONFIG_YAML = textwrap.dedent("""\
     jobs:
       preprocess:
         script: slurm/preprocess.sh
+        container: app
         env:
           DATA_IN: data/raw
           DATA_OUT: data/processed
       train:
         script: slurm/train.sh
+        container: app
         time: "12:00:00"
         nodes: 1
         env:

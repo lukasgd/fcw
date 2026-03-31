@@ -1,14 +1,16 @@
-"""Tests for SBATCH parsing, env injection, and script manipulation."""
+"""Tests for SBATCH parsing, env injection, script manipulation, and container TOML inlining."""
 
 import pytest
 
 from fcw.commands.job import (
     _apply_sbatch_overrides,
+    _build_container_toml,
+    _inject_container_toml,
     _inject_env_vars,
     _parse_sbatch_args,
     _resolve_job_env,
 )
-from fcw.core.config import JobConfig
+from fcw.core.config import ContainerConfig, FcwConfig, JobConfig, WorkdirConfig
 
 
 SAMPLE_SCRIPT = """\
@@ -133,3 +135,97 @@ class TestResolveJobEnv:
         job_config = sample_config.jobs["preprocess"]
         env = _resolve_job_env(sample_config, job_config, {"DATA_IN": "/custom/path"})
         assert env["DATA_IN"] == "/custom/path"
+
+
+class TestInjectContainerToml:
+    def test_basic_injection(self):
+        toml = 'image = "/scratch/app.sqsh"\nwritable = true\n'
+        result = _inject_container_toml(SAMPLE_SCRIPT, toml)
+        assert 'cat > /dev/shm/fcw-container-${SLURM_JOB_ID}.toml' in result
+        assert 'image = "/scratch/app.sqsh"' in result
+        assert "export FCW_CONTAINER_TOML=" in result
+
+    def test_quoted_heredoc(self):
+        toml = 'mounts = ["${SCRATCH}"]\n'
+        result = _inject_container_toml(SAMPLE_SCRIPT, toml)
+        assert "<< 'FCWEOF'" in result
+        assert "${SCRATCH}" in result
+
+    def test_inserted_after_sbatch(self):
+        toml = 'image = "/scratch/app.sqsh"\n'
+        result = _inject_container_toml(SAMPLE_SCRIPT, toml)
+        lines = result.split("\n")
+        toml_idx = next(i for i, l in enumerate(lines) if "FCW_CONTAINER_TOML" in l)
+        last_sbatch_idx = max(i for i, l in enumerate(lines) if l.strip().startswith("#SBATCH"))
+        assert toml_idx > last_sbatch_idx
+
+    def test_before_env_vars(self):
+        toml = 'image = "/scratch/app.sqsh"\n'
+        script = _inject_container_toml(SAMPLE_SCRIPT, toml)
+        result = _inject_env_vars(script, {"DATA_DIR": "/data"})
+        lines = result.split("\n")
+        toml_idx = next(i for i, l in enumerate(lines) if "FCW_CONTAINER_TOML" in l)
+        export_idx = next(i for i, l in enumerate(lines) if "export DATA_DIR" in l)
+        assert toml_idx < export_idx
+
+    def test_no_sbatch_in_script(self):
+        script = "#!/bin/bash\necho hello\n"
+        toml = 'image = "/scratch/app.sqsh"\n'
+        result = _inject_container_toml(script, toml)
+        assert "FCW_CONTAINER_TOML" in result
+        # Should be after shebang
+        lines = result.split("\n")
+        assert lines[0] == "#!/bin/bash"
+
+
+class TestBuildContainerToml:
+    @pytest.fixture
+    def config_with_toml(self, tmp_path):
+        toml_path = tmp_path / "env" / "container.toml"
+        toml_path.parent.mkdir(parents=True)
+        toml_path.write_text(
+            'image = "placeholder"\n\nmounts = [\n    "${SCRATCH}",\n]\n\n'
+            'workdir = "/workspace"\n\nwritable = true\n'
+        )
+        return FcwConfig(
+            project="test",
+            workdir=WorkdirConfig(remote="/scratch/user/test"),
+            containers={
+                "app": ContainerConfig(
+                    file="./Dockerfile",
+                    tag="my-app:latest",
+                    remote_path="./ce-images/",
+                    toml=str(toml_path),
+                ),
+            },
+        )
+
+    @pytest.fixture
+    def config_without_toml(self):
+        return FcwConfig(
+            project="test",
+            workdir=WorkdirConfig(remote="/scratch/user/test"),
+            containers={
+                "app": ContainerConfig(
+                    file="./Dockerfile",
+                    tag="my-app:latest",
+                    remote_path="./ce-images/",
+                ),
+            },
+        )
+
+    def test_reads_toml_and_overrides_image(self, config_with_toml):
+        result = _build_container_toml(config_with_toml, "app")
+        assert 'image = "/scratch/user/test/ce-images/my-app+latest.sqsh"' in result
+        assert "${SCRATCH}" in result
+        assert "workdir" in result
+
+    def test_generates_minimal_without_toml(self, config_without_toml):
+        result = _build_container_toml(config_without_toml, "app")
+        assert 'image = "/scratch/user/test/ce-images/my-app+latest.sqsh"' in result
+        assert "writable = true" in result
+
+    def test_unknown_container_exits(self, config_without_toml):
+        from click.exceptions import Exit
+        with pytest.raises(Exit):
+            _build_container_toml(config_without_toml, "nonexistent")

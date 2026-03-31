@@ -1,4 +1,5 @@
-image = "${CE_IMAGES_DIR}/ubuntu-fcw-basic+24.04.sqsh"
+# image is auto-resolved by fcw from the container config
+image = ""
 
 mounts = [
     "${SCRATCH}",

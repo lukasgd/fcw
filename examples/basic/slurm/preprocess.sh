@@ -10,6 +10,6 @@
 
 set -euxo pipefail
 
-srun -ul --environment ./env/container.toml bash -c "
+srun -ul --environment ${FCW_CONTAINER_TOML} bash -c "
     cat ${DATA_IN}/* > ${DATA_OUT}/preprocessed_files.txt
 "

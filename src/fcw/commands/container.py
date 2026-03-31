@@ -844,6 +844,8 @@ def extract_from_image(
     q_staging_dir = shlex.quote(staging_dir)
     q_remote_archive = shlex.quote(remote_archive)
 
+    q_download_tag = shlex.quote(download_tag)
+
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-extract
 #SBATCH --time=00:30:00
@@ -854,24 +856,31 @@ set -euxo pipefail
 
 {_podman_setup_block()}
 
-# Load image from tar if not already available
-if ! podman image exists {q_image} 2>/dev/null; then
-    if [ -f {q_remote_tar} ]; then
-        echo "Loading image from {q_remote_tar}..."
-        podman load -i {q_remote_tar}
-    elif [ -f {q_remote_download_tar} ]; then
-        echo "Loading download image from {q_remote_download_tar}..."
-        podman load -i {q_remote_download_tar}
-    else
-        echo "Error: image {q_image} not found and no tar at {q_remote_tar} or {q_remote_download_tar}"
-        exit 1
-    fi
+# Determine which image to use for extraction.
+# Prefer the download stage since extract operates on the download stage,
+# not the final build-offline image.
+EXTRACT_IMAGE=""
+if podman image exists {q_download_tag} 2>/dev/null; then
+    EXTRACT_IMAGE={q_download_tag}
+elif podman image exists {q_image} 2>/dev/null; then
+    EXTRACT_IMAGE={q_image}
+elif [ -f {q_remote_download_tar} ]; then
+    echo "Loading download image from {q_remote_download_tar}..."
+    podman load -i {q_remote_download_tar}
+    EXTRACT_IMAGE={q_download_tag}
+elif [ -f {q_remote_tar} ]; then
+    echo "Loading image from {q_remote_tar}..."
+    podman load -i {q_remote_tar}
+    EXTRACT_IMAGE={q_image}
+else
+    echo "Error: image not found and no tar at {q_remote_download_tar} or {q_remote_tar}"
+    exit 1
 fi
 
-echo "Extracting {q_container_path} from {q_image}..."
+echo "Extracting {q_container_path} from $EXTRACT_IMAGE..."
 
-# Create container (don't run it)
-CID=$(podman create {q_image} /bin/true)
+# Create container from the download stage (don't run it)
+CID=$(podman create "$EXTRACT_IMAGE" /bin/true)
 echo "Created container: $CID"
 
 # Create staging directory

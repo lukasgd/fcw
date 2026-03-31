@@ -47,6 +47,7 @@ from fcw.core import (
     get_console,
     get_global_sbatch_options,
     SLURM_FAILED_STATES,
+    FcwConfig,
 )
 
 app = typer.Typer(no_args_is_help=True)
@@ -141,17 +142,22 @@ def _inject_env_vars(script_content: str, env_vars: dict[str, str]) -> str:
     """
     if not env_vars:
         return script_content
-    
+
     exports = "\n".join(f'export {k}="${{{k}:-{v}}}"' for k, v in env_vars.items())
     lines = script_content.split("\n")
-    
-    # Find the last #SBATCH line
+
+    # Insert after container TOML block if present, otherwise after last #SBATCH
+    insert_idx = -1
     last_sbatch_idx = -1
     for i, line in enumerate(lines):
+        if "export FCW_CONTAINER_TOML=" in line:
+            insert_idx = i + 1
+            break
         if line.strip().startswith("#SBATCH"):
             last_sbatch_idx = i
-    
-    insert_idx = last_sbatch_idx + 1 if last_sbatch_idx >= 0 else (1 if lines[0].startswith("#!") else 0)
+
+    if insert_idx < 0:
+        insert_idx = last_sbatch_idx + 1 if last_sbatch_idx >= 0 else (1 if lines[0].startswith("#!") else 0)
     
     # Add blank line and exports
     lines.insert(insert_idx, "")
@@ -190,6 +196,97 @@ def _resolve_job_env(config, job_config, overrides: dict[str, str]) -> dict[str,
         env[key] = value
 
     return env
+
+
+def _build_container_toml(config: FcwConfig, container_name: str) -> str:
+    """Build resolved container TOML content for injection into a SLURM script.
+
+    If the container config has a ``toml`` path, reads that file and overrides
+    the ``image`` field with the resolved sqsh path.  Otherwise generates a
+    minimal TOML with the resolved image path.
+
+    Args:
+        config: The FcwConfig object.
+        container_name: Name of the container in ``config.containers``.
+
+    Returns:
+        TOML content string with resolved image path.
+
+    Raises:
+        typer.Exit: If the container name is unknown or the TOML file is missing.
+    """
+    if container_name not in config.containers:
+        _console().print(f"[red]Unknown container: {container_name}[/red]")
+        _console().print(
+            f"[dim]Available containers: {', '.join(config.containers)}[/dim]"
+        )
+        raise typer.Exit(1)
+
+    cont = config.containers[container_name]
+    image_path = config.resolve_container_image(cont)
+
+    if cont.toml:
+        toml_path = Path(cont.toml)
+        if not toml_path.exists():
+            _console().print(f"[red]Container TOML not found: {cont.toml}[/red]")
+            raise typer.Exit(1)
+        toml_content = toml_path.read_text()
+        # Override the image field with the resolved absolute path
+        toml_content = re.sub(
+            r'^image\s*=\s*"[^"]*"',
+            f'image = "{image_path}"',
+            toml_content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        return toml_content
+    else:
+        return f'image = "{image_path}"\nwritable = true\n'
+
+
+def _inject_container_toml(script_content: str, toml_content: str) -> str:
+    """Inject container TOML heredoc into a SLURM script.
+
+    Writes the TOML to ``/dev/shm/fcw-container-${SLURM_JOB_ID}.toml`` at
+    runtime and exports ``FCW_CONTAINER_TOML`` pointing to it.
+
+    The heredoc uses a quoted delimiter (``<< 'FCWEOF'``) so that shell
+    variables inside the TOML (e.g. ``${SCRATCH}``) are written literally
+    for pyxis/enroot to expand at runtime.
+
+    Inserted after #SBATCH directives, before any other content.
+
+    Args:
+        script_content: Original script content.
+        toml_content: Resolved TOML content to inline.
+
+    Returns:
+        Modified script with heredoc block inserted.
+    """
+    block = (
+        "\n# Container environment from fcw\n"
+        "cat > /dev/shm/fcw-container-${SLURM_JOB_ID}.toml << 'FCWEOF'\n"
+        f"{toml_content.rstrip()}\n"
+        "FCWEOF\n"
+        "export FCW_CONTAINER_TOML=/dev/shm/fcw-container-${SLURM_JOB_ID}.toml"
+    )
+
+    lines = script_content.split("\n")
+
+    # Find the last #SBATCH line
+    last_sbatch_idx = -1
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#SBATCH"):
+            last_sbatch_idx = i
+
+    insert_idx = (
+        last_sbatch_idx + 1
+        if last_sbatch_idx >= 0
+        else (1 if lines and lines[0].startswith("#!") else 0)
+    )
+
+    lines.insert(insert_idx, block)
+    return "\n".join(lines)
 
 
 def _parse_sbatch_args(args: List[str]) -> tuple[dict[str, str], List[str]]:
@@ -316,24 +413,32 @@ def submit_job(
             overrides[k] = v
 
     # Determine if job_name is a config job or a script path
+    container_name = None
     if job_name in config.jobs:
         job_config = config.jobs[job_name]
         script_path = job_config.script
-        
+        container_name = job_config.container
+
         # Resolve environment variables from config
         env_vars = _resolve_job_env(config, job_config, overrides)
     else:
         # Treat as script path
         script_path = job_name
         env_vars = overrides
-    
+
     # Read and modify script
     if not os.path.exists(script_path):
         _console().print(f"[red]Script not found: {script_path}[/red]")
         raise typer.Exit(1)
-    
+
     script_content = Path(script_path).read_text()
     script_content = _apply_sbatch_overrides(script_content, sbatch_overrides)
+
+    # Inject container TOML before env vars (ordering matters)
+    if container_name:
+        toml_content = _build_container_toml(config, container_name)
+        script_content = _inject_container_toml(script_content, toml_content)
+
     script_content = _inject_env_vars(script_content, env_vars)
 
     if dry_run:

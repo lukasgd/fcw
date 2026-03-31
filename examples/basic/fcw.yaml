@@ -15,10 +15,6 @@ directories:
     type: out
   outputs:
     type: out
-  code:
-    type: both
-  ce-images:
-    type: in
 
 # Container definitions
 containers:
@@ -26,32 +22,35 @@ containers:
     file: ./env/Dockerfile.app
     tag: ubuntu-fcw-basic:24.04
     remote_path: ./ce-images/
+    toml: ./env/container.toml
   aux:
     file: ./env/Dockerfile.aux
     tag: fcw-aux:latest
     remote_path: ./ce-images/
 
 # Job definitions with environment
+# container: references a container from the containers section;
+# at submit time, fcw inlines the TOML and resolves the image path automatically
 jobs:
   preprocess:
     script: slurm/preprocess.sh
+    container: app
     env:
       DATA_IN: data/raw
       DATA_OUT: data/processed
-      CE_IMAGES_DIR: ce-images
 
   train:
     script: slurm/train.sh
+    container: app
     time: "12:00:00"
     nodes: 1
     env:
       DATA_DIR: data/processed
       OUTPUT_DIR: outputs
-      CE_IMAGES_DIR: ce-images
       # CONFIG: provided via --set at submit time
 
   evaluate:
     script: slurm/evaluate.sh
+    container: app
     env:
       MODEL_DIR: outputs
-      CE_IMAGES_DIR: ce-images

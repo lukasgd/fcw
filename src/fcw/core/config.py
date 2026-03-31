@@ -51,6 +51,7 @@ class ContainerConfig:
     tag: str
     remote_path: Optional[str] = None
     stage: Optional[str] = None
+    toml: Optional[str] = None
 
 
 @dataclass
@@ -66,6 +67,7 @@ class JobConfig:
         cpus_per_task: Suggested CPUs per task (informational).
     """
     script: str
+    container: Optional[str] = None
     env: dict[str, str] = field(default_factory=dict)
     time: Optional[str] = None
     nodes: Optional[int] = None
@@ -266,6 +268,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 tag=cont_data.get("tag", ""),
                 remote_path=cont_data.get("remote_path"),
                 stage=cont_data.get("stage"),
+                toml=cont_data.get("toml"),
             )
     
     # Parse jobs
@@ -273,6 +276,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
         for name, job_data in data["jobs"].items():
             config.jobs[name] = JobConfig(
                 script=job_data.get("script", ""),
+                container=job_data.get("container"),
                 env=job_data.get("env", {}),
                 time=job_data.get("time"),
                 nodes=job_data.get("nodes"),
@@ -303,9 +307,7 @@ directories:
     type: out
   data/outputs:
     type: out
-  code:
-    type: both
-  ce-images:
+  config:
     type: in
 
 # Container definitions
@@ -313,27 +315,33 @@ containers:
   app:
     file: ./env/Dockerfile
     tag: my-fcw-app:latest
-    remote_path: ce-images/my-fcw-app+latest.sqsh
+    remote_path: ./ce-images/
+    toml: ./env/container.toml    # optional, user-editable enroot environment
 
 # Job definitions with environment
+# container: references a container name from the containers section;
+# at submit time, fcw inlines the TOML into the script and resolves the image path
 jobs:
   preprocess:
     script: slurm/preprocess.sh
+    container: app
     env:
       DATA_IN: data/raw
       DATA_OUT: data/processed
 
   train:
     script: slurm/train.sh
+    container: app
     time: "12:00:00"
     nodes: 1
     env:
       DATA_DIR: data/processed
       OUTPUT_DIR: data/outputs
-      # CONFIG: provided via --set at submit time
+      CONFIG_DIR: config
 
   evaluate:
     script: slurm/evaluate.sh
+    container: app
     env:
       MODEL_DIR: data/outputs
 '''

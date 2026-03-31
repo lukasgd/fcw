@@ -41,7 +41,6 @@ class TestLoadConfig:
     def test_directory_types_parsed(self, sample_config):
         assert sample_config.directories["data/raw"].type == DirectoryType.IN
         assert sample_config.directories["data/processed"].type == DirectoryType.OUT
-        assert sample_config.directories["code"].type == DirectoryType.BOTH
 
     def test_job_env_parsed(self, sample_config):
         assert sample_config.jobs["preprocess"].env["DATA_IN"] == "data/raw"
@@ -51,6 +50,11 @@ class TestLoadConfig:
     def test_container_parsed(self, sample_config):
         assert sample_config.containers["app"].tag == "my-fcw-app:latest"
         assert sample_config.containers["app"].remote_path == "./ce-images/"
+        assert sample_config.containers["app"].toml == "./env/container.toml"
+
+    def test_job_container_parsed(self, sample_config):
+        assert sample_config.jobs["preprocess"].container == "app"
+        assert sample_config.jobs["train"].container == "app"
 
 
 class TestEnvVarExpansion:
@@ -112,8 +116,8 @@ class TestDirectoryTypeEnforcement:
     def test_cannot_upload_out(self, sample_config):
         assert sample_config.can_upload("data/processed") is False
 
-    def test_can_upload_both(self, sample_config):
-        assert sample_config.can_upload("code") is True
+    def test_can_upload_unknown_defaults_both(self, sample_config):
+        assert sample_config.can_upload("something") is True
 
     def test_can_download_out(self, sample_config):
         assert sample_config.can_download("data/processed") is True
@@ -121,8 +125,8 @@ class TestDirectoryTypeEnforcement:
     def test_cannot_download_in(self, sample_config):
         assert sample_config.can_download("data/raw") is False
 
-    def test_can_download_both(self, sample_config):
-        assert sample_config.can_download("code") is True
+    def test_can_download_unknown_defaults_both(self, sample_config):
+        assert sample_config.can_download("something") is True
 
     def test_prefix_match(self, sample_config):
         assert sample_config.can_upload("data/raw/subdir") is True
@@ -209,6 +213,9 @@ class TestGenerateDefaultConfig:
         assert "workdir" in data
         assert "directories" in data
         assert "jobs" in data
+        # Container TOML inlining fields
+        assert data["containers"]["app"]["toml"] == "./env/container.toml"
+        assert data["jobs"]["train"]["container"] == "app"
 
     def test_roundtrip(self, tmp_path):
         config_str = generate_default_config()

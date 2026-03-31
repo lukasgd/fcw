@@ -9,7 +9,7 @@
 
 set -euxo pipefail
 
-srun -ul --environment ./env/container.toml bash -c "
+srun -ul --environment ${FCW_CONTAINER_TOML} bash -c "
     echo 'Rank \${SLURM_PROCID} on node \${SLURM_NODEID}'
     wc ${DATA_DIR}/* > ${OUTPUT_DIR}/train_output_\${SLURM_JOB_ID}_\${SLURM_PROCID}.txt
 "
