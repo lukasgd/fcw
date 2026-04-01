@@ -6,8 +6,11 @@ from unittest.mock import patch
 import pytest
 
 from fcw.commands.container import (
+    _create_rebuilt_toml,
+    _derive_container_name,
     _detect_container_runtime,
     _find_container_config,
+    _parse_patch_mounts,
     _podman_setup_block,
     _resolve_remote_tar,
 )
@@ -135,3 +138,132 @@ class TestPodmanSetupBlock:
     def test_contains_shm_cleanup(self):
         block = _podman_setup_block()
         assert "/dev/shm/$USER" in block
+
+
+class TestParsePatchMounts:
+    def test_single_patch_mount(self):
+        toml = '''
+image = "/scratch/app.sqsh"
+mounts = [
+    "/scratch/project/.patches/code:/workspace/BrainBERT",
+    "${SCRATCH}",
+]
+'''
+        result = _parse_patch_mounts(toml)
+        assert result == [("/scratch/project/.patches/code", "/workspace/BrainBERT")]
+
+    def test_multiple_patch_mounts(self):
+        toml = '''
+mounts = [
+    "/scratch/.patches/code:/workspace/code",
+    "/scratch/.patches/data:/workspace/data",
+]
+'''
+        result = _parse_patch_mounts(toml)
+        assert len(result) == 2
+        assert result[0] == ("/scratch/.patches/code", "/workspace/code")
+        assert result[1] == ("/scratch/.patches/data", "/workspace/data")
+
+    def test_no_patch_mounts(self):
+        toml = '''
+mounts = [
+    "${SCRATCH}/data:/mnt/data",
+]
+'''
+        result = _parse_patch_mounts(toml)
+        assert result == []
+
+    def test_no_mounts_at_all(self):
+        toml = 'image = "foo.sqsh"\n'
+        result = _parse_patch_mounts(toml)
+        assert result == []
+
+    def test_mixed_mounts(self):
+        toml = '''
+mounts = [
+    "/scratch/.patches/code:/workspace/code",
+    "/data/shared:/mnt/shared",
+]
+'''
+        result = _parse_patch_mounts(toml)
+        assert len(result) == 1
+        assert result[0] == ("/scratch/.patches/code", "/workspace/code")
+
+
+class TestCreateRebuiltToml:
+    def test_removes_patch_mounts(self, tmp_path):
+        original = tmp_path / "container.toml"
+        original.write_text('''\
+image = "/scratch/app.sqsh"
+mounts = [
+    "/scratch/.patches/code:/workspace/code",
+    "${SCRATCH}/data:/mnt/data",
+]
+writable = true
+''')
+        new = tmp_path / "container-v2.toml"
+        _create_rebuilt_toml(str(original), str(new))
+        content = new.read_text()
+        assert ".patches" not in content
+        assert "${SCRATCH}/data:/mnt/data" in content
+        assert "writable = true" in content
+
+    def test_preserves_non_patch_content(self, tmp_path):
+        original = tmp_path / "container.toml"
+        original.write_text('''\
+image = "foo.sqsh"
+mounts = [
+    "${SCRATCH}/data:/data",
+    "/scratch/.patches/code:/workspace",
+]
+workdir = "/workspace"
+writable = true
+''')
+        new = tmp_path / "container-v2.toml"
+        _create_rebuilt_toml(str(original), str(new))
+        content = new.read_text()
+        assert 'workdir = "/workspace"' in content
+        assert "${SCRATCH}/data:/data" in content
+        assert ".patches" not in content
+
+    def test_all_mounts_are_patches(self, tmp_path):
+        original = tmp_path / "container.toml"
+        original.write_text('''\
+image = "foo.sqsh"
+mounts = [
+    "/scratch/.patches/code:/workspace/code",
+    "/scratch/.patches/data:/workspace/data",
+]
+''')
+        new = tmp_path / "container-v2.toml"
+        _create_rebuilt_toml(str(original), str(new))
+        content = new.read_text()
+        assert ".patches" not in content
+        assert "mounts = []" in content
+
+    def test_original_unchanged(self, tmp_path):
+        original_content = '''\
+image = "foo.sqsh"
+mounts = [
+    "/scratch/.patches/code:/workspace",
+]
+'''
+        original = tmp_path / "container.toml"
+        original.write_text(original_content)
+        new = tmp_path / "container-v2.toml"
+        _create_rebuilt_toml(str(original), str(new))
+        assert original.read_text() == original_content
+
+
+class TestDeriveContainerName:
+    def test_simple_version(self):
+        assert _derive_container_name("app", "my-app:v2") == "app-v2"
+
+    def test_dotted_version(self):
+        assert _derive_container_name("app", "my-app:24.04") == "app-24-04"
+
+    def test_no_colon(self):
+        assert _derive_container_name("app", "latest") == "app-latest"
+
+    def test_complex_suffix(self):
+        assert _derive_container_name("web", "img:v1.2-beta") == "web-v1-2-beta"

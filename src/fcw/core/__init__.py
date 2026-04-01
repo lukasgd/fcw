@@ -21,6 +21,7 @@ from fcw.core.config import (
     FcwConfig,
     JobConfig,
     WorkdirConfig,
+    add_container_to_config,
     generate_default_config,
     load_config,
 )
@@ -84,6 +85,7 @@ __all__ = [
     "JobConfig",
     "WorkdirConfig",
     "load_config",
+    "add_container_to_config",
     "generate_default_config",
     "get_client",
     "get_async_client",

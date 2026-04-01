@@ -11,5 +11,7 @@ set -euxo pipefail
 
 srun -ul --environment ${FCW_CONTAINER_TOML} bash -c "
     echo 'Rank \${SLURM_PROCID} on node \${SLURM_NODEID}'
+    echo 'Config: ${CONFIG_DIR}/model.yaml'
+    cat ${CONFIG_DIR}/model.yaml
     wc ${DATA_DIR}/* > ${OUTPUT_DIR}/train_output_\${SLURM_JOB_ID}_\${SLURM_PROCID}.txt
 "

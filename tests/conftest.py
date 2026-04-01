@@ -23,6 +23,8 @@ SAMPLE_CONFIG_YAML = textwrap.dedent("""\
         type: out
       outputs:
         type: out
+      config:
+        type: in
 
     containers:
       app:

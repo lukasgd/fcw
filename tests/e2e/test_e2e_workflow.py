@@ -190,6 +190,68 @@ class TestContainerIterate:
 
 
 # ---------------------------------------------------------------------------
+# 4b. Container Rebuild (bake patches into new image)
+# ---------------------------------------------------------------------------
+
+class TestContainerRebuild:
+    """Rebuild workflow: patch the app container's TOML, then rebuild."""
+
+    def test_patch_app_container(self, runner):
+        """Patch the app container so its TOML has .patches/ mounts for rebuild."""
+        patch_source = "extracted-code"
+        if not os.path.isdir(patch_source):
+            patch_source = "data/raw"
+
+        result = runner.invoke(app, [
+            "container", "patch",
+            patch_source, "/workspace/patched",
+            "--toml", "env/container.toml",
+        ])
+        assert result.exit_code == 0, result.output
+        content = open("env/container.toml").read()
+        assert ".patches/" in content
+
+    def test_container_rebuild_dry_run(self, runner):
+        """Dry run should print the SLURM script without submitting."""
+        result = runner.invoke(app, [
+            "container", "rebuild", "app",
+            "--tag", "ubuntu-fcw-basic:v2",
+            "--dry-run",
+        ])
+        assert result.exit_code == 0, result.output
+        assert "fcw-container-rebuild" in result.output
+        assert "podman" in result.output
+
+    def test_container_rebuild(self, runner):
+        """Full rebuild: bake patches, create new TOML and config entry."""
+        result = runner.invoke(app, [
+            "container", "rebuild", "app",
+            "--tag", "ubuntu-fcw-basic:v2",
+            "--enroot", "--wait",
+        ])
+        assert result.exit_code == 0, result.output
+        # Verify new config entry was added
+        from fcw.core.config import load_config
+        config = load_config("fcw.yaml")
+        assert "app-v2" in config.containers
+        assert config.containers["app-v2"].tag == "ubuntu-fcw-basic:v2"
+
+    def test_restore_app_toml(self, runner):
+        """Remove .patches/ mounts from the original app TOML.
+
+        The rebuild creates a new container entry with a clean TOML, but the
+        original env/container.toml still has the .patches/ bind-mounts.
+        Strip them so subsequent job tests (which use container: app) don't
+        fail trying to mount non-existent patch directories.
+        """
+        from fcw.commands.container import _create_rebuilt_toml
+        toml_path = "env/container.toml"
+        _create_rebuilt_toml(toml_path, toml_path)
+        content = open(toml_path).read()
+        assert ".patches/" not in content
+
+
+# ---------------------------------------------------------------------------
 # 5. Data Transfer
 # ---------------------------------------------------------------------------
 

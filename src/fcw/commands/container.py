@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -147,6 +148,51 @@ def _detect_container_runtime() -> str:
         except (subprocess.CalledProcessError, FileNotFoundError):
             continue
     raise RuntimeError("No container runtime found. Install podman or docker.")
+
+
+def _parse_patch_mounts(toml_content: str) -> list[tuple[str, str]]:
+    """Extract .patches/ bind-mounts from TOML content.
+
+    Returns list of (host_path, container_path) tuples for mount entries
+    where the host side contains ``/.patches/``.
+    """
+    pattern = re.compile(r'"([^"]*/.patches/[^"]*):([^"]*)"')
+    return pattern.findall(toml_content)
+
+
+def _create_rebuilt_toml(original_toml_path: str, new_toml_path: str) -> None:
+    """Copy a container TOML, removing .patches/ bind-mount lines.
+
+    The original file is not modified. The new file has all mount entries
+    containing ``/.patches/`` removed, with trailing-comma cleanup.
+    """
+    content = Path(original_toml_path).read_text()
+    # Remove lines that are .patches/ mount entries
+    lines = content.splitlines(keepends=True)
+    filtered: list[str] = []
+    for line in lines:
+        if re.search(r'"[^"]*/.patches/[^"]*:[^"]*"', line):
+            continue
+        filtered.append(line)
+    # Clean up trailing commas before closing bracket: e.g., '    "x",\n]\n'
+    result = "".join(filtered)
+    result = re.sub(r',(\s*\])', r'\1', result)
+    # Clean up empty mounts array (only whitespace/newlines between brackets)
+    result = re.sub(r'mounts\s*=\s*\[\s*\]', 'mounts = []', result)
+    Path(new_toml_path).write_text(result)
+
+
+def _derive_container_name(original_name: str, new_tag: str) -> str:
+    """Derive a new container config name from the original name and new tag.
+
+    Examples::
+
+        _derive_container_name("app", "my-app:v2")   -> "app-v2"
+        _derive_container_name("app", "my-app:24.04") -> "app-24-04"
+    """
+    tag_suffix = new_tag.split(":")[-1] if ":" in new_tag else new_tag
+    tag_suffix = re.sub(r'[^a-zA-Z0-9]', '-', tag_suffix).strip('-')
+    return f"{original_name}-{tag_suffix}"
 
 
 @app.command("build")
@@ -1008,8 +1054,6 @@ def patch_container(
     bind_mount = f"{remote_patch_dir}:{container_path}"
     if toml:
         toml_path = Path(toml)
-        import re
-
         if not toml_path.exists():
             if create_toml:
                 _console().print(f"[dim]Creating {toml}...[/dim]")
@@ -1239,14 +1283,15 @@ podman cp {q_remote_patch_path}/. "$CID:{container_path}"
 PATCHED_IMAGE="{patched_tag}-base"
 podman commit "$CID" "$PATCHED_IMAGE"
 podman rm "$CID"
-echo "Committed patched image: $PATCHED_IMAGE"
+PATCHED_ID=$(podman image inspect --format '{{{{.Id}}}}' "$PATCHED_IMAGE")
+echo "Committed patched image: $PATCHED_IMAGE (ID: $PATCHED_ID)"
 
 echo "=== Step 2: Rebuilding build-offline stage ==="
 
 # Build build-offline stage from patched download image
 cd {q_staging_dir}
 podman build --target build-offline \\
-    --build-arg DOWNLOAD_IMAGE=$PATCHED_IMAGE \\
+    --build-arg DOWNLOAD_IMAGE=$PATCHED_ID \\
 {extra_build_args_line}    -t {q_final_tag} \\
     -f Dockerfile .
 
@@ -1338,6 +1383,293 @@ ls -lh {q_output_path}
             _console().print(f"[green]Build complete: {final_tag}[/green]")
             if enroot:
                 _console().print(f"[green]Enroot image: {output_path}[/green]")
+    finally:
+        os.unlink(script_path)
+
+
+# -----------------------------------------------------------------------------
+# Rebuild (bake patches into new image)
+# -----------------------------------------------------------------------------
+
+
+@app.command("rebuild")
+def rebuild_container(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Container name from fcw.yaml (e.g., 'app')"),
+    tag: str = typer.Option(..., "--tag", "-t", help="Tag for rebuilt image (e.g., my-app:v2)"),
+    build_arg: Optional[List[str]] = typer.Option(
+        None, "--build-arg", help="Build-time variables (KEY=VALUE)"
+    ),
+    enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output path for enroot squashfs"
+    ),
+    cleanup: bool = typer.Option(
+        True, "--cleanup/--no-cleanup", help="Remove remote .patches/ after rebuild"
+    ),
+    wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for job completion"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print SLURM script without submitting"),
+) -> None:
+    """Bake accumulated patches into a new container image.
+
+    Reads the container's TOML to discover ``.patches/`` bind-mounts added by
+    ``container patch``, then submits a SLURM job that applies all patches to
+    the download-stage image and rebuilds the build-offline stage.
+
+    On success, creates a new container entry in fcw.yaml and a new TOML file
+    with patch mounts removed. The original container entry is preserved.
+
+    Examples::
+
+        # Dry run: inspect the generated SLURM script
+        fcw container rebuild app --tag my-app:v2 --dry-run
+
+        # Full rebuild with enroot export
+        fcw container rebuild app --tag my-app:v2 --enroot --wait
+    """
+    from fcw.core import ContainerConfig, add_container_to_config
+
+    config, system, account = resolve_context(ctx)
+
+    # 1. Look up container config
+    if name not in config.containers:
+        _console().print(f"[red]Unknown container: {name}[/red]")
+        raise typer.Exit(1)
+    cont = config.containers[name]
+
+    if not cont.toml:
+        _console().print(f"[red]Container '{name}' has no TOML file configured[/red]")
+        raise typer.Exit(1)
+    if not cont.file:
+        _console().print(f"[red]Container '{name}' has no Dockerfile configured[/red]")
+        raise typer.Exit(1)
+
+    toml_path = Path(cont.toml)
+    if not toml_path.exists():
+        _console().print(f"[red]TOML file not found: {cont.toml}[/red]")
+        raise typer.Exit(1)
+
+    # 2. Parse patch mounts
+    toml_content = toml_path.read_text()
+    patch_mounts = _parse_patch_mounts(toml_content)
+    if not patch_mounts:
+        _console().print("[yellow]No .patches/ mounts found in TOML — nothing to rebuild[/yellow]")
+        raise typer.Exit(0)
+
+    _console().print(
+        f"[bold]Found {len(patch_mounts)} patch mount(s) to bake into image:[/bold]"
+    )
+    for host_path, container_path in patch_mounts:
+        _console().print(f"  {host_path} → {container_path}")
+
+    # 3. Derive download tag (convention: <tag>-download or <tag>:download)
+    existing_tag = cont.tag
+    if ":" in existing_tag:
+        download_tag = f"{existing_tag}-download"
+    else:
+        download_tag = f"{existing_tag}:download"
+
+    # 4. Resolve paths
+    images_dir = config.resolve_container_images_dir(cont)
+    remote_download_tar = _resolve_remote_tar(download_tag, config)
+    staging_dir = config.resolve_path(".fcw/rebuild", remote=True)
+    dockerfile = cont.file
+
+    # 5. Generate SLURM script
+    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in (build_arg or []))
+    extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
+
+    q_download_tag = shlex.quote(download_tag)
+    q_remote_download_tar = shlex.quote(remote_download_tar)
+    q_tag = shlex.quote(tag)
+    q_staging_dir = shlex.quote(staging_dir)
+    q_images_dir = shlex.quote(images_dir)
+    global_sbatch = format_sbatch_lines(get_global_sbatch_options())
+    setup_block = _podman_setup_block()
+
+    # Build podman cp lines for each patch
+    patch_cp_lines = []
+    for host_path, container_path in patch_mounts:
+        q_host = shlex.quote(host_path)
+        patch_cp_lines.append(f'podman cp {q_host}/. "$CID:{container_path}"')
+    patch_cp_block = "\n".join(patch_cp_lines)
+
+    script = f"""#!/bin/bash -l
+#SBATCH --job-name=fcw-container-rebuild
+#SBATCH --time=01:00:00
+#SBATCH --nodes=1
+#SBATCH --output=fcw-container-rebuild-%j.out
+#SBATCH --error=fcw-container-rebuild-%j.out
+{global_sbatch}set -euxo pipefail
+
+{setup_block}
+export CE_IMAGES_DIR={q_images_dir}
+
+# Load download image from tar
+if ! podman image exists {q_download_tag} 2>/dev/null; then
+    if [ -f {q_remote_download_tar} ]; then
+        echo "Loading image from {q_remote_download_tar}..."
+        podman load -i {q_remote_download_tar}
+    else
+        echo "Error: image {q_download_tag} not found and no tar at {q_remote_download_tar}"
+        exit 1
+    fi
+fi
+
+IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{download_tag} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {download_tag})
+echo "Resolved download image ID: $IMAGE_ID"
+
+echo "=== Baking {len(patch_mounts)} patch(es) into download image ==="
+CID=$(podman create $IMAGE_ID /bin/true)
+{patch_cp_block}
+PATCHED_IMAGE="{download_tag}-patched"
+podman commit "$CID" "$PATCHED_IMAGE"
+podman rm "$CID"
+PATCHED_ID=$(podman image inspect --format '{{{{.Id}}}}' "$PATCHED_IMAGE")
+echo "Committed patched download image: $PATCHED_IMAGE (ID: $PATCHED_ID)"
+
+echo "=== Rebuilding build-offline stage ==="
+cd {q_staging_dir}
+podman build --target build-offline \\
+    --build-arg DOWNLOAD_IMAGE=$PATCHED_ID \\
+{extra_build_args_line}    -t {q_tag} \\
+    -f Dockerfile .
+
+echo "Built image: {q_tag}"
+"""
+    if enroot:
+        output_path = output or os.path.join(
+            images_dir, f"{tag.replace(':', '+')}.sqsh"
+        )
+        q_output_path = shlex.quote(output_path)
+        script += f"""
+echo "=== Exporting to enroot ==="
+mkdir -p $(dirname {q_output_path})
+rm -f {q_output_path}
+enroot import -x mount -o {q_output_path} podman://{tag} || true
+if [ ! -f {q_output_path} ]; then
+    echo "ERROR: enroot import failed - output not found: {q_output_path}"
+    exit 1
+fi
+echo "Exported to: {q_output_path}"
+ls -lh {q_output_path}
+"""
+    script += "\nexit 0\n"
+
+    # 6. Dry run: print and return (no remote operations)
+    if dry_run:
+        new_name = _derive_container_name(name, tag)
+        toml_dir = toml_path.parent
+        new_toml_name = f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml"
+        new_toml_path = toml_dir / new_toml_name
+        _console().print("[bold]Generated SLURM script:[/bold]")
+        _console().print(script)
+        _console().print(f"\n[dim]Would create container entry '{new_name}' in fcw.yaml[/dim]")
+        _console().print(f"[dim]Would create TOML: {new_toml_path}[/dim]")
+        return
+
+    # 7. Upload Dockerfile to staging dir
+    _console().print(f"[bold]Uploading Dockerfile to {staging_dir}...[/bold]")
+
+    async def do_upload() -> None:
+        async_client = get_async_client()
+        try:
+            await async_client.mkdir(
+                system_name=system, path=staging_dir, create_parents=True
+            )
+        except Exception:
+            pass  # May already exist
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=_console()) as p:
+            p.add_task("Uploading Dockerfile...", total=None)
+            await async_client.upload(
+                system_name=system,
+                local_file=dockerfile,
+                directory=staging_dir,
+                filename="Dockerfile",
+                account=account,
+                blocking=True,
+            )
+
+    asyncio.run(do_upload())
+    _console().print("[green]Uploaded Dockerfile[/green]")
+
+    # 8. Submit job
+    client = get_client()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+        f.write(script)
+        script_path = f.name
+
+    try:
+        result = client.submit(
+            system_name=system,
+            account=account,
+            working_dir=config.workdir.remote,
+            script_local_path=script_path,
+        )
+
+        job_id = extract_job_id(result)
+        print(job_id)
+        _console().print(f"[green]Submitted rebuild job: {job_id}[/green]")
+
+        # 9. Post-rebuild flow (only if --wait)
+        if wait:
+            _console().print("[dim]Waiting for rebuild to complete...[/dim]")
+            _wait_and_check(client, system, job_id, "Rebuild job")
+            _console().print(f"[green]Rebuild complete: {tag}[/green]")
+            if enroot:
+                _console().print(f"[green]Enroot image: {output_path}[/green]")
+
+            # Create new TOML (without patch mounts)
+            new_name = _derive_container_name(name, tag)
+            toml_dir = toml_path.parent
+            new_toml_name = (
+                f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml"
+            )
+            new_toml_path = toml_dir / new_toml_name
+            _create_rebuilt_toml(str(toml_path), str(new_toml_path))
+            _console().print(f"[green]Created TOML: {new_toml_path}[/green]")
+
+            # Add new container entry to fcw.yaml
+            new_cont = ContainerConfig(
+                file=cont.file,
+                tag=tag,
+                remote_path=cont.remote_path,
+                stage=cont.stage,
+                toml=str(new_toml_path),
+            )
+            if config._config_path is None:
+                _console().print("[yellow]Warning: no config file path — skipping config update[/yellow]")
+            else:
+                add_container_to_config(config._config_path, new_name, new_cont)
+                _console().print(f"[green]Added container '{new_name}' to fcw.yaml[/green]")
+
+            # Cleanup remote .patches/ dirs
+            if cleanup:
+                _console().print("[dim]Cleaning up remote .patches/ directories...[/dim]")
+
+                async def do_cleanup() -> None:
+                    async_client = get_async_client()
+                    for host_path, _ in patch_mounts:
+                        try:
+                            await async_client.rm(
+                                system_name=system,
+                                path=host_path,
+                                account=account,
+                                blocking=True,
+                            )
+                        except Exception as e:
+                            _console().print(
+                                f"[yellow]Warning: could not remove {host_path}: {e}[/yellow]"
+                            )
+
+                asyncio.run(do_cleanup())
+                _console().print("[green]Remote patches cleaned up[/green]")
+
+            _console().print(
+                "\n[bold]To use the rebuilt container, update your job config:[/bold]"
+            )
+            _console().print(f"  container: {new_name}")
     finally:
         os.unlink(script_path)
 

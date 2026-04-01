@@ -345,3 +345,64 @@ jobs:
     env:
       MODEL_DIR: data/outputs
 '''
+
+
+def add_container_to_config(
+    config_path: Path,
+    name: str,
+    container: ContainerConfig,
+) -> None:
+    """Append a new container entry to fcw.yaml via text insertion.
+
+    Finds the ``containers:`` block and inserts the new entry at the end of it,
+    before the next top-level key.  This avoids PyYAML round-trip serialization
+    and preserves existing comments and formatting.
+
+    Raises:
+        ValueError: If ``containers:`` block is not found or *name* already exists.
+    """
+    lines = config_path.read_text().splitlines(keepends=True)
+
+    # Ensure trailing newline so the last line is always terminated
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    # Find the containers: line
+    containers_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if re.match(r'^containers:\s*$', line.rstrip()):
+            containers_idx = i
+            break
+    if containers_idx is None:
+        raise ValueError("'containers:' block not found in config")
+
+    # Check for duplicate name
+    name_pattern = re.compile(rf'^  {re.escape(name)}:\s*$')
+    for line in lines[containers_idx + 1:]:
+        if name_pattern.match(line.rstrip()):
+            raise ValueError(f"Container '{name}' already exists in config")
+        # Stop at next top-level key
+        if line.strip() and not line[0].isspace() and not line.startswith('#'):
+            break
+
+    # Find insertion point: end of containers block (before next top-level key)
+    insert_idx = len(lines)
+    for i in range(containers_idx + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[0].isspace() and not line.startswith('#'):
+            insert_idx = i
+            break
+
+    # Build the YAML snippet
+    snippet = f"  {name}:\n"
+    snippet += f"    file: {container.file}\n"
+    snippet += f"    tag: {container.tag}\n"
+    if container.remote_path is not None:
+        snippet += f"    remote_path: {container.remote_path}\n"
+    if container.stage is not None:
+        snippet += f"    stage: {container.stage}\n"
+    if container.toml is not None:
+        snippet += f"    toml: {container.toml}\n"
+
+    lines.insert(insert_idx, snippet)
+    config_path.write_text("".join(lines))

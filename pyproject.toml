@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "fcw"
 version = "0.1.0"
-description = "FirecREST workflow CLI for HPC job orchestration"
+description = "FirecREST Container Workflows - a CLI for remote HPC job orchestration"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

@@ -15,6 +15,8 @@ directories:
     type: out
   outputs:
     type: out
+  config:
+    type: in
 
 # Container definitions
 containers:
@@ -47,7 +49,7 @@ jobs:
     env:
       DATA_DIR: data/processed
       OUTPUT_DIR: outputs
-      # CONFIG: provided via --set at submit time
+      CONFIG_DIR: config
 
   evaluate:
     script: slurm/evaluate.sh

@@ -1,4 +1,4 @@
-# fcw - FirecREST Workflow CLI
+# fcw - FirecREST Container Workflows
 
 A command-line tool for orchestrating HPC workflows via [FirecREST](https://github.com/eth-cscs/pyfirecrest).
 

@@ -8,7 +8,7 @@ from fcw.commands import config, data, job, container, mount
 
 app = typer.Typer(
     name="fcw",
-    help="FirecREST workflow CLI for HPC job orchestration.",
+    help="FirecREST Container Workflows - a CLI for remote HPC job orchestration.",
     no_args_is_help=True,
     epilog="Get started: fcw config init && fcw config validate",
 )
@@ -37,7 +37,7 @@ def main(
         help="Config file path (default: ./fcw.yaml)"
     ),
 ):
-    """FirecREST workflow CLI for HPC job orchestration."""
+    """FirecREST Container Workflows - a CLI for remote HPC job orchestration."""
     # Store global options in context for subcommands
     ctx.ensure_object(dict)
     ctx.obj["system"] = system

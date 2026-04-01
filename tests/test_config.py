@@ -6,8 +6,10 @@ import pytest
 import yaml
 
 from fcw.core.config import (
+    ContainerConfig,
     DirectoryType,
     FcwConfig,
+    add_container_to_config,
     expand_config_refs,
     expand_env_vars,
     generate_default_config,
@@ -223,3 +225,115 @@ class TestGenerateDefaultConfig:
         config_path.write_text(config_str)
         config = load_config(str(config_path))
         assert config.project == "my-fcw-app"
+
+
+class TestAddContainerToConfig:
+    def test_appends_entry(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_container_to_config(
+            config_path,
+            "app-v2",
+            ContainerConfig(
+                file="./Dockerfile",
+                tag="my-app:v2",
+                remote_path="./ce-images/",
+                toml="./env/container-v2.toml",
+            ),
+        )
+        config = load_config(str(config_path))
+        assert "app-v2" in config.containers
+        assert config.containers["app-v2"].tag == "my-app:v2"
+        assert config.containers["app-v2"].toml == "./env/container-v2.toml"
+        # Original entries still intact
+        assert "app" in config.containers
+        assert config.containers["app"].tag == "my-fcw-app:latest"
+        assert "aux" in config.containers
+
+    def test_duplicate_name_raises(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        with pytest.raises(ValueError, match="already exists"):
+            add_container_to_config(
+                config_path,
+                "app",
+                ContainerConfig(file="./Dockerfile", tag="dup:v1"),
+            )
+
+    def test_preserves_comments(self, tmp_path):
+        yaml_with_comments = """\
+# My project
+project: test
+
+# Container defs
+containers:
+  app:
+    file: ./Dockerfile
+    tag: my-app:latest
+
+jobs:
+  train:
+    script: train.sh
+"""
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(yaml_with_comments)
+        add_container_to_config(
+            config_path,
+            "app-v2",
+            ContainerConfig(file="./Dockerfile", tag="my-app:v2"),
+        )
+        content = config_path.read_text()
+        assert "# My project" in content
+        assert "# Container defs" in content
+        # New entry is present
+        assert "app-v2:" in content
+        assert "my-app:v2" in content
+        # Jobs section still intact
+        assert "jobs:" in content
+
+    def test_no_containers_block_raises(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text("project: test\n")
+        with pytest.raises(ValueError, match="containers"):
+            add_container_to_config(
+                config_path,
+                "app",
+                ContainerConfig(file="./Dockerfile", tag="app:v1"),
+            )
+
+    def test_optional_fields_omitted(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_container_to_config(
+            config_path,
+            "minimal",
+            ContainerConfig(file="./Dockerfile", tag="minimal:v1"),
+        )
+        # Verify it loads correctly and has expected fields
+        config = load_config(str(config_path))
+        assert "minimal" in config.containers
+        assert config.containers["minimal"].file == "./Dockerfile"
+        assert config.containers["minimal"].tag == "minimal:v1"
+        assert config.containers["minimal"].remote_path is None
+        assert config.containers["minimal"].stage is None
+        assert config.containers["minimal"].toml is None
+        # Verify the raw YAML doesn't contain optional fields for this entry
+        content = config_path.read_text()
+        # Find the minimal block in raw text
+        idx = content.index("  minimal:\n")
+        block = content[idx:]
+        # Grab lines until next entry or top-level key
+        block_lines = block.split("\n")[1:]  # skip "  minimal:" itself
+        entry_lines = []
+        for line in block_lines:
+            if line.startswith("    "):
+                entry_lines.append(line.strip())
+            elif line.strip() == "":
+                continue
+            else:
+                break
+        assert "file: ./Dockerfile" in entry_lines
+        assert "tag: minimal:v1" in entry_lines
+        assert not any("remote_path" in l for l in entry_lines)
+        assert not any("stage" in l for l in entry_lines)
+        assert not any("toml" in l for l in entry_lines)

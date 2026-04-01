@@ -1,0 +1,15 @@
+# Example model configuration
+# Edit and re-sync with: fcw data upload config
+# Or watch for changes:   fcw data watch config
+
+model:
+  architecture: transformer
+  hidden_size: 768
+  num_layers: 12
+  num_heads: 12
+
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  epochs: 10
+  optimizer: adamw
