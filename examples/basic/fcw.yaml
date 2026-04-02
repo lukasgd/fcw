@@ -25,10 +25,12 @@ containers:
     tag: ubuntu-fcw-basic:24.04
     remote_path: ./ce-images/
     toml: ./env/container.toml
+    platform: linux/arm64
   aux:
     file: ./env/Dockerfile.aux
     tag: fcw-aux:latest
     remote_path: ./ce-images/
+    platform: linux/arm64
 
 # Job definitions with environment
 # container: references a container from the containers section;

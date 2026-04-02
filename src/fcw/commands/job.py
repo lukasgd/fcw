@@ -344,10 +344,16 @@ def _parse_sbatch_args(args: List[str]) -> tuple[dict[str, str], List[str]]:
 # Job Commands
 # -----------------------------------------------------------------------------
 
-@app.command("submit", context_settings={"allow_interspersed_args": False})
+@app.command(
+    "submit",
+    context_settings={
+        "allow_interspersed_args": False,
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+    },
+)
 def submit_job(
     ctx: typer.Context,
-    args: List[str] = typer.Argument(None, help="[SBATCH_OPTS]... -- <script> [--set KEY=VALUE]..."),
     set_vars: Optional[List[str]] = typer.Option(
         None, "--set", "-e",
         help="Override env var: KEY=VALUE"
@@ -382,7 +388,9 @@ def submit_job(
     """
     config, system, account = resolve_context(ctx)
 
-    # Parse SBATCH options and remaining arguments
+    # With ignore_unknown_options + allow_extra_args, Click passes unknown
+    # options (SBATCH overrides) through ctx.args instead of rejecting them.
+    args = ctx.args
     sbatch_overrides, remaining = _parse_sbatch_args(args or [])
 
     # Warn if SBATCH-style flags appear after the script name (missing -- separator)
@@ -434,7 +442,22 @@ def submit_job(
     script_content = Path(script_path).read_text()
     script_content = _apply_sbatch_overrides(script_content, sbatch_overrides)
 
-    # Inject container TOML before env vars (ordering matters)
+    # Inject container TOML before env vars (ordering matters).
+    # When submitting a raw script (not a config job), infer the container
+    # if the script references FCW_CONTAINER_TOML.
+    if not container_name and "FCW_CONTAINER_TOML" in script_content:
+        # Try to find a job config that uses this script
+        for jname, jcfg in config.jobs.items():
+            if jcfg.script == script_path and jcfg.container:
+                container_name = jcfg.container
+                break
+        # Fall back to the sole container with a TOML
+        if not container_name:
+            toml_containers = [
+                name for name, c in config.containers.items() if c.toml
+            ]
+            if len(toml_containers) == 1:
+                container_name = toml_containers[0]
     if container_name:
         toml_content = _build_container_toml(config, container_name)
         script_content = _inject_container_toml(script_content, toml_content)
@@ -510,10 +533,16 @@ def submit_job(
         _console().print(f"[green]Job {job_id} completed ({state})[/green]")
 
 
-@app.command("run", context_settings={"allow_interspersed_args": False})
+@app.command(
+    "run",
+    context_settings={
+        "allow_interspersed_args": False,
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+    },
+)
 def run_command(
     ctx: typer.Context,
-    args: List[str] = typer.Argument(None, help="[SBATCH_OPTS]... -- <command>"),
     time: str = typer.Option("00:30:00", "--time", "-t", help="Default time limit"),
     nodes: int = typer.Option(1, "--nodes", "-N", help="Default number of nodes"),
     remote_script: bool = typer.Option(
@@ -538,7 +567,7 @@ def run_command(
     """
     config, system, account = resolve_context(ctx)
 
-    # Parse SBATCH options and remaining arguments
+    args = ctx.args
     sbatch_overrides, remaining = _parse_sbatch_args(args or [])
 
     if not remaining:

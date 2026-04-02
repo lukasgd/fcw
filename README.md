@@ -69,7 +69,8 @@ containers:
   app:
     file: ./env/Dockerfile
     tag: my-fcw-app:latest
-    remote_path: ce-images/my-fcw-app.sqsh
+    remote_path: ce-images/
+    platform: linux/arm64  # target platform for cross-arch builds (auto-detected if omitted)
 
 jobs:
   preprocess:
@@ -155,6 +156,25 @@ fcw container build-remote my-fcw-app:download \
     -f env/Dockerfile.prod-multistage -t my-fcw-app:latest \
     --stage build-offline --build-arg BASE_IMAGE=ubuntu:24.04 \
     --enroot --wait
+```
+
+#### Cross-Architecture Builds
+
+When your local machine and the remote cluster have different architectures
+(e.g., building on x86_64 for an arm64 cluster), fcw handles this automatically:
+
+1. **Auto-detection**: `container build` and `container deploy` detect the remote
+   system's architecture via FirecREST and pass `--platform` to podman/docker.
+2. **Config**: Set `platform: linux/arm64` in the container config in `fcw.yaml` to
+   skip auto-detection.
+3. **CLI override**: `--platform linux/amd64` on the command line takes priority.
+4. **Remote check**: The SLURM script verifies the image architecture matches the
+   compute node before building — never emulates on HPC.
+
+```bash
+# Explicit platform (overrides config and auto-detection)
+fcw container build --platform linux/arm64 --stage download -t my-app:download .
+fcw container deploy app --platform linux/arm64 --wait
 ```
 
 #### Code Iteration Workflow

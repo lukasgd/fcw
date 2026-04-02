@@ -77,6 +77,8 @@ def pytest_addoption(parser):
     parser.addoption("--example", default="basic", help="Example project for e2e tests")
     parser.addoption("--cleanup-remote", action="store_true", default=False,
                      help="Delete remote workdir after successful e2e run")
+    parser.addoption("--check-perf", action="store_true", default=False,
+                     help="Fail e2e tests if step timings exceed thresholds")
 
 
 def pytest_collection_modifyitems(config, items):

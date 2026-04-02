@@ -115,6 +115,104 @@ class TestParseSbatchArgs:
         assert remaining == []
 
 
+class TestSbatchOverridesCLI:
+    """Integration tests: verify SBATCH overrides pass through Typer/Click."""
+
+    def test_submit_with_overrides_dry_run(self, tmp_path):
+        """SBATCH options before -- must not be rejected by Typer."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        # Minimal config and script
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+        )
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\n#SBATCH --time 01:00:00\necho hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "submit", "--dry-run",
+                "--time", "24:00:00", "--nodes", "4",
+                "--", str(script),
+            ])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        assert "--time=24:00:00" in result.output or "--time 24:00:00" in result.output
+        assert "--nodes=4" in result.output or "--nodes 4" in result.output
+
+    def test_submit_raw_script_infers_container(self, tmp_path):
+        """Submitting a raw script that uses FCW_CONTAINER_TOML infers the container."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+            "containers:\n  app:\n    file: Dockerfile\n    tag: my-app:latest\n"
+            "    remote_path: ./ce-images/\n    toml: ./env/container.toml\n"
+        )
+        toml_dir = tmp_path / "env"
+        toml_dir.mkdir()
+        (toml_dir / "container.toml").write_text('[container]\nimage = "placeholder"\n')
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\n"
+            "srun --environment ${FCW_CONTAINER_TOML} echo hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, ["job", "submit", "--dry-run", str(script)])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        assert "FCW_CONTAINER_TOML" in result.output
+        assert "FCWEOF" in result.output  # heredoc was injected
+
+    def test_submit_without_separator(self, tmp_path):
+        """Without --, args are treated as script name (no overrides)."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+        )
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\n#SBATCH --time 01:00:00\necho hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "submit", "--dry-run", str(script),
+            ])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        # Original time should be preserved (no override)
+        assert "#SBATCH --time 01:00:00" in result.output
+
+
 class TestResolveJobEnv:
     def test_expands_relative_paths(self, sample_config):
         job_config = sample_config.jobs["preprocess"]

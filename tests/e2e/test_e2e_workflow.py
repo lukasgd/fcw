@@ -67,14 +67,16 @@ class TestRemoteSetup:
             except Exception:
                 pass  # May already exist
 
-    def test_upload_env(self, runner):
+    def test_upload_env(self, runner, timed_step):
         """Upload env/ directory."""
-        result = runner.invoke(app, ["data", "upload", "env"])
+        with timed_step("upload-env"):
+            result = runner.invoke(app, ["data", "upload", "env"])
         assert result.exit_code == 0, result.output
 
-    def test_upload_slurm(self, runner):
+    def test_upload_slurm(self, runner, timed_step):
         """Upload slurm/ directory."""
-        result = runner.invoke(app, ["data", "upload", "slurm"])
+        with timed_step("upload-slurm"):
+            result = runner.invoke(app, ["data", "upload", "slurm"])
         assert result.exit_code == 0, result.output
 
 
@@ -85,39 +87,49 @@ class TestRemoteSetup:
 class TestContainerBuildDeploy:
     """Multi-stage container workflow: build locally, push, build-remote."""
 
-    def test_container_build_local(self, runner):
+    def test_container_build_local(self, runner, timed_step, remote_platform):
         """Build download stage locally."""
-        result = runner.invoke(app, [
+        cmd = [
             "container", "build", "--stage", "download",
-            "-t", "ubuntu-fcw-basic:24.04-download", "-f", "env/Dockerfile.app", ".",
-        ])
+            "-t", "ubuntu-fcw-basic:24.04-download", "-f", "env/Dockerfile.app",
+        ]
+        if remote_platform:
+            cmd.extend(["--platform", remote_platform])
+        cmd.append(".")
+        with timed_step("container-build-local"):
+            result = runner.invoke(app, cmd)
         assert result.exit_code == 0, result.output
 
-    def test_container_build_save(self, runner):
+    def test_container_build_save(self, runner, remote_platform):
         """Build and save image to tar file (--save)."""
-        result = runner.invoke(app, [
+        cmd = [
             "container", "build", "--stage", "download",
             "-t", "ubuntu-fcw-basic:24.04-download",
             "-f", "env/Dockerfile.app",
             "--save", "test-image.tar",
-            ".",
-        ])
+        ]
+        if remote_platform:
+            cmd.extend(["--platform", remote_platform])
+        cmd.append(".")
+        result = runner.invoke(app, cmd)
         assert result.exit_code == 0, result.output
         assert os.path.exists("test-image.tar")
         os.unlink("test-image.tar")
 
-    def test_container_push(self, runner):
+    def test_container_push(self, runner, timed_step):
         """Push image to remote."""
-        result = runner.invoke(app, ["container", "push", "ubuntu-fcw-basic:24.04-download"])
+        with timed_step("container-push"):
+            result = runner.invoke(app, ["container", "push", "ubuntu-fcw-basic:24.04-download"])
         assert result.exit_code == 0, result.output
 
-    def test_container_build_remote(self, runner):
+    def test_container_build_remote(self, runner, timed_step):
         """Build offline stage on cluster + enroot import."""
-        result = runner.invoke(app, [
-            "container", "build-remote", "ubuntu-fcw-basic:24.04-download",
-            "-f", "env/Dockerfile.app", "-t", "ubuntu-fcw-basic:24.04",
-            "--stage", "build-offline", "--enroot", "--wait",
-        ])
+        with timed_step("container-build-remote"):
+            result = runner.invoke(app, [
+                "container", "build-remote", "ubuntu-fcw-basic:24.04-download",
+                "-f", "env/Dockerfile.app", "-t", "ubuntu-fcw-basic:24.04",
+                "--stage", "build-offline", "--enroot", "--wait",
+            ])
         assert result.exit_code == 0, result.output
 
     def test_verify_sqsh(self, runner):
@@ -135,9 +147,10 @@ class TestContainerBuildDeploy:
 class TestContainerDeploy:
     """Single-command deploy workflow: build + push + import in one step."""
 
-    def test_container_deploy(self, runner):
+    def test_container_deploy(self, runner, timed_step):
         """Deploy aux container (build+push+import)."""
-        result = runner.invoke(app, ["container", "deploy", "aux", "--wait"])
+        with timed_step("container-deploy"):
+            result = runner.invoke(app, ["container", "deploy", "aux", "--wait"])
         assert result.exit_code == 0, result.output
 
     def test_verify_deploy(self, runner):
@@ -159,29 +172,31 @@ class TestContainerDeploy:
 class TestContainerIterate:
     """Code iteration workflow: extract from container, patch with bind-mount."""
 
-    def test_container_extract(self, runner):
+    def test_container_extract(self, runner, timed_step):
         """Extract files from aux container to local directory."""
-        result = runner.invoke(app, [
-            "container", "extract",
-            "fcw-aux:latest", "/workspace/aux",
-            "extracted-code",
-            "--wait",
-        ])
+        with timed_step("container-extract"):
+            result = runner.invoke(app, [
+                "container", "extract",
+                "fcw-aux:latest", "/workspace/aux",
+                "extracted-code",
+                "--wait",
+            ])
         assert result.exit_code == 0, result.output
         assert os.path.isdir("extracted-code")
 
-    def test_container_patch(self, runner):
+    def test_container_patch(self, runner, timed_step):
         """Upload patched code and create bind-mount TOML."""
         # Use extracted code dir, or data/raw as fallback
         patch_source = "extracted-code"
         if not os.path.isdir(patch_source):
             patch_source = "data/raw"
 
-        result = runner.invoke(app, [
-            "container", "patch",
-            patch_source, "/workspace",
-            "--toml", "env/container-patch.toml", "--create",
-        ])
+        with timed_step("container-patch"):
+            result = runner.invoke(app, [
+                "container", "patch",
+                patch_source, "/workspace",
+                "--toml", "env/container-patch.toml", "--create",
+            ])
         assert result.exit_code == 0, result.output
         # Verify TOML was created locally with bind-mount entry
         assert os.path.exists("env/container-patch.toml")
@@ -222,13 +237,14 @@ class TestContainerRebuild:
         assert "fcw-container-rebuild" in result.output
         assert "podman" in result.output
 
-    def test_container_rebuild(self, runner):
+    def test_container_rebuild(self, runner, timed_step):
         """Full rebuild: bake patches, create new TOML and config entry."""
-        result = runner.invoke(app, [
-            "container", "rebuild", "app",
-            "--tag", "ubuntu-fcw-basic:v2",
-            "--enroot", "--wait",
-        ])
+        with timed_step("container-rebuild"):
+            result = runner.invoke(app, [
+                "container", "rebuild", "app",
+                "--tag", "ubuntu-fcw-basic:v2",
+                "--enroot", "--wait",
+            ])
         assert result.exit_code == 0, result.output
         # Verify new config entry was added
         from fcw.core.config import load_config
@@ -256,9 +272,10 @@ class TestContainerRebuild:
 # ---------------------------------------------------------------------------
 
 class TestDataUpload:
-    def test_upload_data(self, runner):
+    def test_upload_data(self, runner, timed_step):
         """Upload raw data."""
-        result = runner.invoke(app, ["data", "upload", "data/raw"])
+        with timed_step("upload-data"):
+            result = runner.invoke(app, ["data", "upload", "data/raw"])
         assert result.exit_code == 0, result.output
 
     def test_verify_data(self, runner):
@@ -267,9 +284,10 @@ class TestDataUpload:
         assert result.exit_code == 0, result.output
         assert "test.txt" in result.output
 
-    def test_upload_incremental(self, runner):
+    def test_upload_incremental(self, runner, timed_step):
         """Re-upload with --incremental (should skip unchanged files)."""
-        result = runner.invoke(app, ["data", "upload", "--incremental", "data/raw"])
+        with timed_step("upload-incremental"):
+            result = runner.invoke(app, ["data", "upload", "--incremental", "data/raw"])
         assert result.exit_code == 0, result.output
 
     def test_data_status(self, runner):
@@ -283,11 +301,12 @@ class TestDataUpload:
 # ---------------------------------------------------------------------------
 
 class TestJobSubmission:
-    def test_submit_preprocess(self, runner):
+    def test_submit_preprocess(self, runner, timed_step):
         """Submit and wait for preprocess job."""
-        result = runner.invoke(app, [
-            "job", "submit", "--remote-script", "--wait", "--", "preprocess",
-        ])
+        with timed_step("job-preprocess"):
+            result = runner.invoke(app, [
+                "job", "submit", "--remote-script", "--wait", "--", "preprocess",
+            ])
         assert result.exit_code == 0, result.output
 
     def test_verify_preprocess(self, runner):
@@ -296,11 +315,12 @@ class TestJobSubmission:
         assert result.exit_code == 0, result.output
         assert "preprocessed_files.txt" in result.output
 
-    def test_submit_train(self, runner):
+    def test_submit_train(self, runner, timed_step):
         """Submit and wait for train job."""
-        result = runner.invoke(app, [
-            "job", "submit", "--remote-script", "--wait", "--", "train",
-        ])
+        with timed_step("job-train"):
+            result = runner.invoke(app, [
+                "job", "submit", "--remote-script", "--wait", "--", "train",
+            ])
         assert result.exit_code == 0, result.output
 
     def test_verify_train(self, runner):
@@ -309,11 +329,12 @@ class TestJobSubmission:
         assert result.exit_code == 0, result.output
         assert "train_output_" in result.output
 
-    def test_submit_evaluate(self, runner):
+    def test_submit_evaluate(self, runner, timed_step):
         """Submit and wait for evaluate job."""
-        result = runner.invoke(app, [
-            "job", "submit", "--remote-script", "--wait", "--", "evaluate",
-        ])
+        with timed_step("job-evaluate"):
+            result = runner.invoke(app, [
+                "job", "submit", "--remote-script", "--wait", "--", "evaluate",
+            ])
         assert result.exit_code == 0, result.output
 
     def test_verify_evaluate(self, runner):
@@ -348,20 +369,21 @@ class TestJobManagement:
         result = runner.invoke(app, ["job", "list"])
         assert result.exit_code == 0, result.output
 
-    def test_job_run_and_wait(self, runner, shared_state):
+    def test_job_run_and_wait(self, runner, shared_state, timed_step):
         """Run ad-hoc command, then wait for it with 'job wait'."""
-        # Submit ad-hoc job (job run has no --wait)
-        result = runner.invoke(app, [
-            "job", "run", "--remote-script",
-            "--", "echo hello-from-fcw-run",
-        ])
-        assert result.exit_code == 0, result.output
-        job_id = _extract_job_id(result.output)
-        assert job_id, f"Could not extract job ID from: {result.output}"
-        shared_state["run_job_id"] = job_id
+        with timed_step("job-run-and-wait"):
+            # Submit ad-hoc job (job run has no --wait)
+            result = runner.invoke(app, [
+                "job", "run", "--remote-script",
+                "--", "echo hello-from-fcw-run",
+            ])
+            assert result.exit_code == 0, result.output
+            job_id = _extract_job_id(result.output)
+            assert job_id, f"Could not extract job ID from: {result.output}"
+            shared_state["run_job_id"] = job_id
 
-        # Wait for completion using the separate 'job wait' command
-        result = runner.invoke(app, ["job", "wait", job_id])
+            # Wait for completion using the separate 'job wait' command
+            result = runner.invoke(app, ["job", "wait", job_id])
         assert result.exit_code == 0, result.output
 
     def test_job_status(self, runner, shared_state):
@@ -403,14 +425,16 @@ class TestJobManagement:
 # ---------------------------------------------------------------------------
 
 class TestDataDownload:
-    def test_download_outputs(self, runner):
+    def test_download_outputs(self, runner, timed_step):
         """Download outputs directory."""
-        result = runner.invoke(app, ["data", "download", "outputs"])
+        with timed_step("download-outputs"):
+            result = runner.invoke(app, ["data", "download", "outputs"])
         assert result.exit_code == 0, result.output
 
-    def test_download_incremental(self, runner):
+    def test_download_incremental(self, runner, timed_step):
         """Re-download with --incremental (should skip unchanged files)."""
-        result = runner.invoke(app, ["data", "download", "--incremental", "outputs"])
+        with timed_step("download-incremental"):
+            result = runner.invoke(app, ["data", "download", "--incremental", "outputs"])
         assert result.exit_code == 0, result.output
 
 

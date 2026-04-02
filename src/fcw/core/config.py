@@ -52,6 +52,7 @@ class ContainerConfig:
     remote_path: Optional[str] = None
     stage: Optional[str] = None
     toml: Optional[str] = None
+    platform: Optional[str] = None
 
 
 @dataclass

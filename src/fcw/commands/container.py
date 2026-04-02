@@ -139,6 +139,27 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # Helper Functions
 # -----------------------------------------------------------------------------
 
+def _detect_remote_platform(client, system: str) -> Optional[str]:
+    """Detect the remote system's platform by reading /proc/cpuinfo.
+
+    Returns a platform string like ``linux/arm64`` or ``linux/amd64``,
+    or None if detection fails.
+    """
+    try:
+        result = client.head(system_name=system, path="/proc/cpuinfo", num_lines=20)
+        content = result.get("content") or result.get("output") or ""
+        if isinstance(result, str):
+            content = result
+        content_lower = content.lower()
+        if "aarch64" in content_lower or "arm" in content_lower:
+            return "linux/arm64"
+        if "x86_64" in content_lower or "genuineintel" in content_lower or "authenticamd" in content_lower:
+            return "linux/amd64"
+    except Exception:
+        pass
+    return None
+
+
 def _detect_container_runtime() -> str:
     """Detect available container runtime (podman or docker)."""
     for runtime in ["podman", "docker"]:
@@ -217,13 +238,13 @@ def build_image(
 
     runtime = _detect_container_runtime()
     _console().print(f"[dim]Using container runtime: {runtime}[/dim]")
-    
+
     # Build command
     cmd = [runtime, "build"]
-    
+
     if file:
         cmd.extend(["-f", file])
-    
+
     if tag:
         cmd.extend(["-t", tag])
     elif config.containers:
@@ -231,10 +252,27 @@ def build_image(
         first_container = next(iter(config.containers.values()))
         tag = first_container.tag
         cmd.extend(["-t", tag])
-    
+
+    # Resolve platform: CLI flag > config > auto-detect from remote
+    if not platform and tag and config.containers:
+        for cont in config.containers.values():
+            if cont.tag == tag and cont.platform:
+                platform = cont.platform
+                break
+    if not platform:
+        try:
+            system = get_system((ctx.obj or {}).get("system"))
+            client = get_client()
+            detected = _detect_remote_platform(client, system)
+            if detected:
+                platform = detected
+                _console().print(f"[dim]Detected remote platform: {platform}[/dim]")
+        except Exception:
+            pass
+
     if stage:
         cmd.extend(["--target", stage])
-    
+
     if platform:
         cmd.extend(["--platform", platform])
 
@@ -549,6 +587,16 @@ fi
 IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{image} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {image})
 echo "Resolved image ID: $IMAGE_ID"
 
+# Verify image architecture matches compute node (never emulate on HPC)
+IMAGE_ARCH=$(podman image inspect --format '{{{{.Architecture}}}}' "$IMAGE_ID")
+NODE_ARCH=$(uname -m)
+case "$NODE_ARCH" in x86_64) NODE_ARCH=amd64;; aarch64) NODE_ARCH=arm64;; esac
+if [ "$IMAGE_ARCH" != "$NODE_ARCH" ]; then
+    echo "ERROR: Image architecture ($IMAGE_ARCH) does not match node ($NODE_ARCH)."
+    echo "Rebuild the base image with --platform linux/$NODE_ARCH"
+    exit 1
+fi
+
 echo "=== Building {q_tag} ==="
 cd {q_staging_dir}
 podman build \\
@@ -610,6 +658,9 @@ def deploy_image(
     name: Optional[str] = typer.Argument(None, help="Container name from config"),
     tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Override final image tag"),
     file: Optional[str] = typer.Option(None, "--file", "-f", help="Override Dockerfile"),
+    platform: Optional[str] = typer.Option(
+        None, "--platform", help="Target platform (e.g., linux/amd64)"
+    ),
     build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Build-time variables (KEY=VALUE)"),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for remote build"),
 ):
@@ -635,6 +686,7 @@ def deploy_image(
         cont_config = config.containers[name]
         dockerfile = file or cont_config.file
         final_tag = tag or cont_config.tag
+        platform = platform or cont_config.platform
         images_dir = config.resolve_container_images_dir(cont_config)
     elif tag:
         dockerfile = file or "Dockerfile"
@@ -657,10 +709,20 @@ def deploy_image(
     sqsh_path = os.path.join(images_dir, f"{final_tag.replace(':', '+')}.sqsh")
     runtime = _detect_container_runtime()
 
+    # Auto-detect remote platform if not specified
+    if not platform:
+        client = get_client()
+        detected = _detect_remote_platform(client, system)
+        if detected:
+            platform = detected
+            _console().print(f"[dim]Detected remote platform: {platform}[/dim]")
+
     # Step 1: Build download stage locally
     _console().print(f"[bold]Step 1: Building download stage locally ({download_tag})...[/bold]")
 
     build_cmd = [runtime, "build", "--target", "download", "-t", download_tag, "-f", dockerfile]
+    if platform:
+        build_cmd.extend(["--platform", platform])
     for arg in (build_arg or []):
         build_cmd.extend(["--build-arg", arg])
     build_cmd.append(".")
@@ -781,6 +843,16 @@ fi
 # Get the image ID for reliable reference in FROM directives
 IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{download_tag} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {download_tag})
 echo "Resolved download image ID: $IMAGE_ID"
+
+# Verify image architecture matches compute node (never emulate on HPC)
+IMAGE_ARCH=$(podman image inspect --format '{{{{.Architecture}}}}' "$IMAGE_ID")
+NODE_ARCH=$(uname -m)
+case "$NODE_ARCH" in x86_64) NODE_ARCH=amd64;; aarch64) NODE_ARCH=arm64;; esac
+if [ "$IMAGE_ARCH" != "$NODE_ARCH" ]; then
+    echo "ERROR: Image architecture ($IMAGE_ARCH) does not match node ($NODE_ARCH)."
+    echo "Rebuild the download stage with --platform linux/$NODE_ARCH"
+    exit 1
+fi
 
 echo "=== Building {q_final_tag} (build-offline stage) ==="
 cd {q_staging_dir}
