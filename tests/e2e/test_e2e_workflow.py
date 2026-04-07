@@ -116,10 +116,15 @@ class TestContainerBuildDeploy:
         assert os.path.exists("test-image.tar")
         os.unlink("test-image.tar")
 
-    def test_container_push(self, runner, timed_step):
+    def test_container_push(self, runner, timed_step, remote_platform):
         """Push image to remote."""
+        cmd = ["container", "push"]
+        if remote_platform:
+            cmd.extend(["--platform", remote_platform])
+        cmd.append("ubuntu-fcw-basic:24.04-download")
+
         with timed_step("container-push"):
-            result = runner.invoke(app, ["container", "push", "ubuntu-fcw-basic:24.04-download"])
+            result = runner.invoke(app, cmd)
         assert result.exit_code == 0, result.output
 
     def test_container_build_remote(self, runner, timed_step):
@@ -147,10 +152,14 @@ class TestContainerBuildDeploy:
 class TestContainerDeploy:
     """Single-command deploy workflow: build + push + import in one step."""
 
-    def test_container_deploy(self, runner, timed_step):
+    def test_container_deploy(self, runner, timed_step, remote_platform):
         """Deploy aux container (build+push+import)."""
+        cmd = ["container", "deploy", "aux", "--wait"]
+        if remote_platform:
+            cmd.extend(["--platform", remote_platform])
+
         with timed_step("container-deploy"):
-            result = runner.invoke(app, ["container", "deploy", "aux", "--wait"])
+            result = runner.invoke(app, cmd)
         assert result.exit_code == 0, result.output
 
     def test_verify_deploy(self, runner):

@@ -1,0 +1,4 @@
+[submodule "examples/BrainBERT"]
+	path = examples/BrainBERT
+	url = git@github.com:lukasgd/BrainBERT.git
+	branch = clariden

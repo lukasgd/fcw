@@ -10,6 +10,7 @@ from fcw.commands.container import (
     _derive_container_name,
     _detect_container_runtime,
     _find_container_config,
+    _merge_build_args,
     _parse_patch_mounts,
     _podman_setup_block,
     _resolve_remote_tar,
@@ -267,3 +268,30 @@ class TestDeriveContainerName:
 
     def test_complex_suffix(self):
         assert _derive_container_name("web", "img:v1.2-beta") == "web-v1-2-beta"
+
+
+class TestMergeBuildArgs:
+    def test_config_only(self):
+        result = _merge_build_args({"BASE": "ubuntu:24.04"}, None)
+        assert result == ["BASE=ubuntu:24.04"]
+
+    def test_cli_only(self):
+        result = _merge_build_args(None, ["BASE=ubuntu:24.04"])
+        assert result == ["BASE=ubuntu:24.04"]
+
+    def test_cli_overrides_config(self):
+        result = _merge_build_args(
+            {"BASE": "ubuntu:22.04", "EXTRA": "yes"},
+            ["BASE=ubuntu:24.04"],
+        )
+        assert "BASE=ubuntu:24.04" in result
+        assert "EXTRA=yes" in result
+        assert len(result) == 2
+
+    def test_both_none(self):
+        result = _merge_build_args(None, None)
+        assert result == []
+
+    def test_empty_dicts(self):
+        result = _merge_build_args({}, [])
+        assert result == []

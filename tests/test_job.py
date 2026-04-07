@@ -30,7 +30,7 @@ class TestApplySbatchOverrides:
     def test_replace_existing(self):
         result = _apply_sbatch_overrides(SAMPLE_SCRIPT, {"time": "24:00:00"})
         assert "#SBATCH --time=24:00:00" in result
-        assert "12:00:00" not in result
+        assert "#SBATCH --time 12:00:00" not in result
 
     def test_insert_new(self):
         result = _apply_sbatch_overrides(SAMPLE_SCRIPT, {"gpus-per-node": "4"})
@@ -55,8 +55,8 @@ class TestApplySbatchOverrides:
         assert result == SAMPLE_SCRIPT
 
     def test_multiple_overrides(self):
-        result = _apply_sbatch_overrides(SAMPLE_SCRIPT, {"time": "24:00:00", "nodes": "4"})
-        assert "#SBATCH --time=24:00:00" in result
+        result = _apply_sbatch_overrides(SAMPLE_SCRIPT, {"time": "12:00:00", "nodes": "4"})
+        assert "#SBATCH --time=12:00:00" in result
         assert "#SBATCH --nodes=4" in result
 
 
@@ -140,14 +140,14 @@ class TestSbatchOverridesCLI:
         try:
             result = runner.invoke(app, [
                 "job", "submit", "--dry-run",
-                "--time", "24:00:00", "--nodes", "4",
+                "--time", "12:00:00", "--nodes", "4",
                 "--", str(script),
             ])
         finally:
             os.chdir(old_cwd)
 
         assert result.exit_code == 0, result.output
-        assert "--time=24:00:00" in result.output or "--time 24:00:00" in result.output
+        assert "--time=12:00:00" in result.output or "--time 12:00:00" in result.output
         assert "--nodes=4" in result.output or "--nodes 4" in result.output
 
     def test_submit_raw_script_infers_container(self, tmp_path):
@@ -211,6 +211,123 @@ class TestSbatchOverridesCLI:
         assert result.exit_code == 0, result.output
         # Original time should be preserved (no override)
         assert "#SBATCH --time 01:00:00" in result.output
+
+
+    def test_submit_sbatch_after_script_is_error(self, tmp_path):
+        """SBATCH options after the script name should be a hard error."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+        )
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\necho hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "submit", "--dry-run", str(script), "--nodes", "4",
+            ])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 1
+        assert "--nodes" in result.output
+        assert "SBATCH" in result.output
+
+    def test_submit_flag_as_job_name_is_error(self, tmp_path):
+        """SBATCH option in place of job name should give a clear error."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+        )
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\necho hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "submit", "--dry-run", "--nodes", "4", str(script),
+            ])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 1
+        output = " ".join(result.output.split())  # normalize Rich line wrapping
+        assert "looks like an SBATCH option" in output
+        assert "-- separator" in output
+
+    def test_submit_sbatch_after_script_with_separator_is_error(self, tmp_path):
+        """SBATCH options after script even with -- separator should error."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+        )
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\necho hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "submit", "--dry-run",
+                "--time", "1:00:00", "--", str(script), "--nodes", "4",
+            ])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 1
+        assert "--nodes" in result.output
+
+    def test_submit_fcw_flags_after_script_still_work(self, tmp_path):
+        """fcw-specific flags like --set after the script should not be rejected."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+        )
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\necho hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "submit", "--dry-run", str(script), "--set", "X=1",
+            ])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        assert "export X=" in result.output
 
 
 class TestResolveJobEnv:

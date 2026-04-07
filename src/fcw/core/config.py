@@ -8,7 +8,7 @@ import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -53,6 +53,7 @@ class ContainerConfig:
     stage: Optional[str] = None
     toml: Optional[str] = None
     platform: Optional[str] = None
+    build_args: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -270,6 +271,8 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 remote_path=cont_data.get("remote_path"),
                 stage=cont_data.get("stage"),
                 toml=cont_data.get("toml"),
+                platform=cont_data.get("platform"),
+                build_args=cont_data.get("build_args"),
             )
     
     # Parse jobs
@@ -404,6 +407,12 @@ def add_container_to_config(
         snippet += f"    stage: {container.stage}\n"
     if container.toml is not None:
         snippet += f"    toml: {container.toml}\n"
+    if container.platform is not None:
+        snippet += f"    platform: {container.platform}\n"
+    if container.build_args:
+        snippet += "    build_args:\n"
+        for k, v in container.build_args.items():
+            snippet += f"      {k}: {v}\n"
 
     lines.insert(insert_idx, snippet)
     config_path.write_text("".join(lines))

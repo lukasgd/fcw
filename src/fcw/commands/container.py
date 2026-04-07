@@ -82,6 +82,24 @@ def _wait_and_check(client, system: str, job_id: str, label: str = "Job") -> Non
         raise typer.Exit(1)
 
 
+def _merge_build_args(
+    config_args: Optional[dict[str, str]],
+    cli_args: Optional[List[str]],
+) -> List[str]:
+    """Merge config-level build_args with CLI --build-arg flags.
+
+    CLI args override config args for the same key.
+    """
+    merged = dict(config_args or {})
+    for arg in (cli_args or []):
+        if "=" in arg:
+            k, v = arg.split("=", 1)
+            merged[k] = v
+        else:
+            merged[arg] = ""
+    return [f"{k}={v}" if v else k for k, v in merged.items()]
+
+
 def _find_container_config(config, image_tag: str):
     """Find a container config matching an image tag.
 
@@ -139,12 +157,25 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # Helper Functions
 # -----------------------------------------------------------------------------
 
+
+KNOWN_SYSTEMS = {
+    "daint": "linux/arm64",
+    "clariden": "linux/arm64",
+    "santis": "linux/arm64",
+    "lys": "linux/arm64",
+    "beverin": "linux/amd64",
+}
+
+
 def _detect_remote_platform(client, system: str) -> Optional[str]:
     """Detect the remote system's platform by reading /proc/cpuinfo.
 
     Returns a platform string like ``linux/arm64`` or ``linux/amd64``,
     or None if detection fails.
     """
+    if system in KNOWN_SYSTEMS:
+        return KNOWN_SYSTEMS[system]
+        
     try:
         result = client.head(system_name=system, path="/proc/cpuinfo", num_lines=20)
         content = result.get("content") or result.get("output") or ""
@@ -276,9 +307,13 @@ def build_image(
     if platform:
         cmd.extend(["--platform", platform])
 
-    if build_arg:
-        for arg in build_arg:
-            cmd.extend(["--build-arg", arg])
+    # Merge config-level build_args with CLI --build-arg flags
+    cont_config = _find_container_config(config, tag) if tag else None
+    all_build_args = _merge_build_args(
+        cont_config.build_args if cont_config else None, build_arg
+    )
+    for arg in all_build_args:
+        cmd.extend(["--build-arg", arg])
 
     cmd.append(context)
     
@@ -307,6 +342,7 @@ def push_image(
     ctx: typer.Context,
     image: str = typer.Argument(..., help="Image tar file or tag to push"),
     remote_path: Optional[str] = typer.Option(None, "--to", help="Remote path (default: from config)"),
+    platform: Optional[str] = typer.Option(None, "--platform", help="Target platform (e.g., linux/arm64)"),
     do_import: bool = typer.Option(False, "--import", help="Import to squashfs after push"),
 ):
     """Upload a container image to remote storage.
@@ -340,7 +376,21 @@ def push_image(
         cleanup_tar = True
 
         _console().print(f"[dim]Exporting {image}...[/dim]")
-        result = subprocess.run([runtime, "save", "-o", tar_path, image])
+
+        # Build the save command
+        save_cmd = [runtime, "save", "-o", tar_path]
+
+        # Check if the runtime's save command supports the --platform flag
+        if platform:
+            help_output = subprocess.run([runtime, "save", "--help"], capture_output=True, text=True).stdout
+            if "--platform" in help_output:
+                save_cmd.extend(["--platform", platform])
+            else:
+                _console().print(f"[yellow]Warning: {runtime} save does not support --platform. Ignoring platform argument.[/yellow]")
+
+        save_cmd.append(image)
+
+        result = subprocess.run(save_cmd)
         if result.returncode != 0:
             _console().print("[red]Failed to export image[/red]")
             raise typer.Exit(1)
@@ -550,7 +600,10 @@ def build_remote(
     # Step 2: Build job script
     _console().print("[bold]Step 2: Submitting build job...[/bold]")
 
-    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in (build_arg or []))
+    all_build_args = _merge_build_args(
+        cont_config.build_args if cont_config else None, build_arg
+    )
+    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
     target_line = f"    --target {shlex.quote(stage)} \\\n" if stage else ""
 
@@ -717,13 +770,19 @@ def deploy_image(
             platform = detected
             _console().print(f"[dim]Detected remote platform: {platform}[/dim]")
 
+    # Merge config-level build_args with CLI --build-arg flags
+    all_build_args = _merge_build_args(
+        cont_config.build_args if (name and name in config.containers) else None,
+        build_arg,
+    )
+
     # Step 1: Build download stage locally
     _console().print(f"[bold]Step 1: Building download stage locally ({download_tag})...[/bold]")
 
     build_cmd = [runtime, "build", "--target", "download", "-t", download_tag, "-f", dockerfile]
     if platform:
         build_cmd.extend(["--platform", platform])
-    for arg in (build_arg or []):
+    for arg in all_build_args:
         build_cmd.extend(["--build-arg", arg])
     build_cmd.append(".")
 
@@ -805,7 +864,7 @@ def deploy_image(
 
     asyncio.run(do_upload_dockerfile())
 
-    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in (build_arg or []))
+    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
 
     q_download_tag = shlex.quote(download_tag)
@@ -1245,11 +1304,13 @@ def update_image(
     patched_tag = tag or f"{image.split(':')[0]}:patched"
     final_tag = patched_tag
 
-    # Resolve images directory from config if available
+    # Resolve images directory and container config if available
     images_dir = config.resolve_path("ce-images/", remote=True)
+    matched_cont_config = None
     for _name, cont_config in config.containers.items():
         if cont_config.tag in (tag, image, patched_tag, final_tag):
             images_dir = config.resolve_container_images_dir(cont_config)
+            matched_cont_config = cont_config
             break
 
     # Staging paths
@@ -1297,7 +1358,10 @@ def update_image(
     remote_image_tar = _resolve_remote_tar(image, config)
 
     # Extra build args for podman build
-    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in (build_arg or []))
+    all_build_args = _merge_build_args(
+        matched_cont_config.build_args if matched_cont_config else None, build_arg
+    )
+    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
 
     q_image = shlex.quote(image)
@@ -1548,7 +1612,8 @@ def rebuild_container(
     dockerfile = cont.file
 
     # 5. Generate SLURM script
-    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in (build_arg or []))
+    all_build_args = _merge_build_args(cont.build_args, build_arg)
+    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
 
     q_download_tag = shlex.quote(download_tag)

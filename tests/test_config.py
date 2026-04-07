@@ -1,6 +1,7 @@
 """Tests for config loading, env expansion, and path resolution."""
 
 import os
+import textwrap
 
 import pytest
 import yaml
@@ -57,6 +58,56 @@ class TestLoadConfig:
     def test_job_container_parsed(self, sample_config):
         assert sample_config.jobs["preprocess"].container == "app"
         assert sample_config.jobs["train"].container == "app"
+
+    def test_build_args_parsed(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(textwrap.dedent("""\
+            project: test
+            workdir:
+              remote: /tmp/test
+              local: .
+            containers:
+              app:
+                file: ./Dockerfile
+                tag: my-app:latest
+                build_args:
+                  BASE_IMAGE: ubuntu:24.04
+                  EXTRA_FLAG: value
+        """))
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            cfg = load_config(str(config_path))
+        finally:
+            os.chdir(old_cwd)
+        assert cfg.containers["app"].build_args == {
+            "BASE_IMAGE": "ubuntu:24.04",
+            "EXTRA_FLAG": "value",
+        }
+
+    def test_build_args_none_when_absent(self, sample_config):
+        assert sample_config.containers["app"].build_args is None
+
+    def test_platform_parsed(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(textwrap.dedent("""\
+            project: test
+            workdir:
+              remote: /tmp/test
+              local: .
+            containers:
+              app:
+                file: ./Dockerfile
+                tag: my-app:latest
+                platform: linux/arm64
+        """))
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            cfg = load_config(str(config_path))
+        finally:
+            os.chdir(old_cwd)
+        assert cfg.containers["app"].platform == "linux/arm64"
 
 
 class TestEnvVarExpansion:

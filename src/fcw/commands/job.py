@@ -3,7 +3,7 @@
 This module provides commands for submitting and managing SLURM jobs via FirecREST.
 
 Key features:
-- SBATCH option override via -- separator: ``fcw job submit --time 24:00:00 -- script.sh``
+- SBATCH option override via -- separator: ``fcw job submit --time 12:00:00 -- script.sh``
 - Environment variable injection from config or CLI
 - Job monitoring, logs, and cancellation
 
@@ -12,7 +12,7 @@ Usage patterns:
     fcw job submit train.sh
     
     # With SBATCH overrides (options before -- override script's #SBATCH directives)
-    fcw job submit --time 24:00:00 --nodes 4 -- train.sh
+    fcw job submit --time 12:00:00 --nodes 4 -- train.sh
     
     # With job dependency
     JOB1=$(fcw job submit preprocess.sh)
@@ -78,8 +78,8 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
         ... #SBATCH --nodes=1
         ... echo "hello"
         ... \"\"\"
-        >>> _apply_sbatch_overrides(script, {"time": "24:00:00", "gpus-per-node": "4"})
-        # Returns script with --time changed to 24:00:00 and --gpus-per-node=4 added
+        >>> _apply_sbatch_overrides(script, {"time": "12:00:00", "gpus-per-node": "4"})
+        # Returns script with --time changed to 12:00:00 and --gpus-per-node=4 added
     """
     if not overrides:
         return script_content
@@ -302,8 +302,8 @@ def _parse_sbatch_args(args: List[str]) -> tuple[dict[str, str], List[str]]:
         Tuple of (sbatch_overrides, remaining_args).
     
     Example:
-        >>> _parse_sbatch_args(["--time", "24:00:00", "--nodes", "4", "--", "train.sh"])
-        ({"time": "24:00:00", "nodes": "4"}, ["train.sh"])
+        >>> _parse_sbatch_args(["--time", "12:00:00", "--nodes", "4", "--", "train.sh"])
+        ({"time": "12:00:00", "nodes": "4"}, ["train.sh"])
         
         >>> _parse_sbatch_args(["train.sh"])  # No SBATCH options
         ({}, ["train.sh"])
@@ -377,7 +377,7 @@ def submit_job(
         fcw job submit train  # uses jobs.train.script from fcw.yaml
 
         # Override SBATCH options
-        fcw job submit --time 24:00:00 --nodes 4 -- train.sh
+        fcw job submit --time 12:00:00 --nodes 4 -- train.sh
 
         # Chain jobs with dependency
         JOB1=$(fcw job submit preprocess.sh)
@@ -390,15 +390,67 @@ def submit_job(
 
     # With ignore_unknown_options + allow_extra_args, Click passes unknown
     # options (SBATCH overrides) through ctx.args instead of rejecting them.
+    # With allow_interspersed_args=False, Click also stops binding known options
+    # after the first positional arg, so fcw flags after the job name end up here too.
     args = ctx.args
     sbatch_overrides, remaining = _parse_sbatch_args(args or [])
 
-    # Warn if SBATCH-style flags appear after the script name (missing -- separator)
-    if not sbatch_overrides and any(a.startswith("--") for a in remaining[1:]):
+    # Extract fcw options from remaining args (after -- or after job name).
+    _FCW_BOOL_FLAGS = {
+        "--wait": "wait", "-w": "wait",
+        "--no-wait": "no-wait",
+        "--quiet": "quiet", "-q": "quiet",
+        "--dry-run": "dry_run",
+        "--remote-script": "remote_script",
+    }
+    filtered_remaining = []
+    i = 0
+    while i < len(remaining):
+        arg = remaining[i]
+        if arg in _FCW_BOOL_FLAGS:
+            flag = _FCW_BOOL_FLAGS[arg]
+            if flag == "wait":
+                wait = True
+            elif flag == "no-wait":
+                wait = False
+            elif flag == "quiet":
+                quiet = True
+            elif flag == "dry_run":
+                dry_run = True
+            elif flag == "remote_script":
+                remote_script = True
+        elif arg in ("--set", "-e") and i + 1 < len(remaining):
+            set_vars = (set_vars or []) + [remaining[i + 1]]
+            i += 1
+        else:
+            filtered_remaining.append(arg)
+        i += 1
+    remaining = filtered_remaining
+
+    # Error if first remaining arg looks like an SBATCH option (missing -- separator)
+    if remaining and remaining[0].startswith("--"):
         _console().print(
-            "[yellow]Warning: SBATCH-style options found after the script name. "
-            "Did you forget the -- separator?[/yellow]"
+            f"[red]Error: Expected a script path or job name but got "
+            f"'{remaining[0]}', which looks like an SBATCH option.[/red]"
         )
+        _console().print(
+            "[dim]SBATCH options must be placed before a -- separator:\n"
+            "  fcw job submit --time 12:00:00 --nodes 4 -- train.sh[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Error if SBATCH-style options appear after the job name
+    stray = [a for a in remaining[1:] if a.startswith("--")]
+    if stray:
+        _console().print(
+            f"[red]Error: SBATCH-style options found after the script/job name: "
+            f"{', '.join(stray)}[/red]"
+        )
+        _console().print(
+            "[dim]Place SBATCH options before the -- separator:\n"
+            f"  fcw job submit {' '.join(stray)} -- {remaining[0]}[/dim]"
+        )
+        raise typer.Exit(1)
 
     # Apply global SBATCH options (env vars), then CLI overrides on top
     sbatch_overrides = {**get_global_sbatch_options(), **sbatch_overrides}

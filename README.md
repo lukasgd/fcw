@@ -120,7 +120,7 @@ fcw job submit train.sh
 fcw job submit train                    # Uses jobs.train.script from fcw.yaml
 
 # Override SBATCH options (applied to script)
-fcw job submit --time 24:00:00 --nodes 4 -- train.sh
+fcw job submit --time 12:00:00 --nodes 4 -- train.sh
 
 # Chain jobs with dependencies
 JOB1=$(fcw job submit preprocess.sh)
@@ -209,6 +209,11 @@ tail -f ./local-outputs/train.log
 # Unmount
 fcw mount stop ./local-outputs
 ```
+
+## Example Projects
+
+- **[BrainBERT](examples/BrainBERT/)** — End-to-end pre-training of a neural language model for brain data on an HPC cluster. Multi-stage container build, data preprocessing, distributed training, and benchmarking (I/O, communication and training throughput). See the [fcw workflow guide](examples/BrainBERT/e2e_workflow.md).
+- **[basic](examples/basic/)** — Minimal example demonstrating the full fcw pipeline. See the [e2e workflow](examples/basic/e2e_workflow.md).
 
 ## Example: Full Training Workflow
 
