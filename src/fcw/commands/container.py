@@ -53,17 +53,16 @@ import typer
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from fcw.core import (
-    load_config,
-    get_client,
-    get_async_client,
-    get_system,
-    get_account,
+    SLURM_FAILED_STATES,
     extract_job_id,
-    resolve_context,
+    format_sbatch_lines,
+    get_async_client,
+    get_client,
     get_console,
     get_global_sbatch_options,
-    format_sbatch_lines,
-    SLURM_FAILED_STATES,
+    get_system,
+    load_config,
+    resolve_context,
 )
 
 app = typer.Typer(no_args_is_help=True)
@@ -175,7 +174,7 @@ def _detect_remote_platform(client, system: str) -> Optional[str]:
     """
     if system in KNOWN_SYSTEMS:
         return KNOWN_SYSTEMS[system]
-        
+
     try:
         result = client.head(system_name=system, path="/proc/cpuinfo", num_lines=20)
         content = result.get("content") or result.get("output") or ""
@@ -247,122 +246,332 @@ def _derive_container_name(original_name: str, new_tag: str) -> str:
     return f"{original_name}-{tag_suffix}"
 
 
+def _build_one_stage(
+    runtime: str,
+    *,
+    dockerfile: str,
+    tag: str,
+    stage: Optional[str],
+    platform: Optional[str],
+    build_args: List[str],
+    context: str,
+) -> None:
+    """Run a single container build (podman/docker build).
+
+    Raises typer.Exit(1) on failure.
+    """
+    cmd = [runtime, "build", "-f", dockerfile, "-t", tag]
+    if stage:
+        cmd.extend(["--target", stage])
+    if platform:
+        cmd.extend(["--platform", platform])
+    for arg in build_args:
+        cmd.extend(["--build-arg", arg])
+    cmd.append(context)
+
+    _console().print(f"[dim]Running: {' '.join(cmd)}[/dim]")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        _console().print(f"[red]Build failed: {tag}[/red]")
+        raise typer.Exit(1)
+    _console().print(f"[green]Built image: {tag}[/green]")
+
+
 @app.command("build")
 def build_image(
     ctx: typer.Context,
-    context: str = typer.Argument(".", help="Build context directory"),
+    name_or_context: str = typer.Argument(".", help="Container name from config, or build context directory"),
     file: Optional[str] = typer.Option(None, "--file", "-f", help="Dockerfile path"),
     tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Image tag"),
-    stage: Optional[str] = typer.Option(None, "--stage", help="Build specific stage only"),
+    stage: Optional[str] = typer.Option(None, "--stage", help="Build specific stage (or all local_stages if omitted)"),
     platform: Optional[str] = typer.Option(None, "--platform", help="Target platform (e.g., linux/arm64)"),
     build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Set build-time variables (KEY=VALUE)"),
-    offline: bool = typer.Option(False, "--offline", help="Build with pre-downloaded dependencies"),
+    context: Optional[str] = typer.Option(None, "--context", "-C", help="Build context directory (default: .)"),
     save: Optional[str] = typer.Option(None, "--save", "-o", help="Save image to tar file"),
 ):
     """Build a container image locally.
-    
-    This builds the image using the local container runtime (podman or docker).
-    Use --stage to build only a specific stage (e.g., for offline builds).
-    Use --save to export the image to a tar file for transfer.
+
+    When NAME_OR_CONTEXT matches a container name from fcw.yaml, all build
+    parameters (Dockerfile, tag, platform, build_args) are resolved from
+    config.  CLI flags override config values.
+
+    Without --stage, builds all local_stages defined in config (default
+    is just the download stage).  With --stage, builds only that stage.
+
+    When NAME_OR_CONTEXT is a directory, it is used as the build context
+    (backward-compatible).
+
+    Examples::
+
+        # Build all local stages for a config container
+        fcw container build ngc-brainbert
+
+        # Build only the download stage
+        fcw container build ngc-brainbert --stage download
+
+        # Legacy: build context directory with explicit flags
+        fcw container build . -f Dockerfile -t my-app:latest --stage download
     """
     config = load_config((ctx.obj or {}).get("config_file"))
+
+    # Resolve whether name_or_context is a config name or a directory
+    cont_config = config.containers.get(name_or_context) if config.containers else None
+    if cont_config:
+        resolved_file = file or cont_config.file
+        resolved_tag = tag or cont_config.tag
+        resolved_platform = platform or cont_config.platform
+        build_context = context or "."
+    else:
+        # Treat as build context directory (backward-compatible)
+        build_context = context or name_or_context
+        resolved_file = file
+        resolved_tag = tag
+        resolved_platform = platform
+
+    # If no tag yet, try first container from config
+    if not resolved_tag and config.containers:
+        first_container = next(iter(config.containers.values()))
+        resolved_tag = first_container.tag
+
+    if not resolved_file:
+        _console().print("[red]No Dockerfile specified. Use --file or configure in fcw.yaml.[/red]")
+        raise typer.Exit(1)
 
     runtime = _detect_container_runtime()
     _console().print(f"[dim]Using container runtime: {runtime}[/dim]")
 
-    # Build command
-    cmd = [runtime, "build"]
-
-    if file:
-        cmd.extend(["-f", file])
-
-    if tag:
-        cmd.extend(["-t", tag])
-    elif config.containers:
-        # Use first container from config if no tag specified
-        first_container = next(iter(config.containers.values()))
-        tag = first_container.tag
-        cmd.extend(["-t", tag])
-
-    # Resolve platform: CLI flag > config > auto-detect from remote
-    if not platform and tag and config.containers:
-        for cont in config.containers.values():
-            if cont.tag == tag and cont.platform:
-                platform = cont.platform
-                break
-    if not platform:
+    # Resolve platform: CLI/config > auto-detect from remote
+    if not resolved_platform:
         try:
             system = get_system((ctx.obj or {}).get("system"))
             client = get_client()
             detected = _detect_remote_platform(client, system)
             if detected:
-                platform = detected
-                _console().print(f"[dim]Detected remote platform: {platform}[/dim]")
+                resolved_platform = detected
+                _console().print(f"[dim]Detected remote platform: {resolved_platform}[/dim]")
         except Exception:
             pass
 
-    if stage:
-        cmd.extend(["--target", stage])
-
-    if platform:
-        cmd.extend(["--platform", platform])
-
     # Merge config-level build_args with CLI --build-arg flags
-    cont_config = _find_container_config(config, tag) if tag else None
     all_build_args = _merge_build_args(
         cont_config.build_args if cont_config else None, build_arg
     )
-    for arg in all_build_args:
-        cmd.extend(["--build-arg", arg])
 
-    cmd.append(context)
-    
-    _console().print(f"[dim]Running: {' '.join(cmd)}[/dim]")
-    
+    # Determine which stages to build
+    if stage:
+        # Single stage: derive stage-specific tag
+        if cont_config and not tag:
+            stage_tag = cont_config.stage_tag(stage)
+        else:
+            stage_tag = resolved_tag
+        _build_one_stage(
+            runtime,
+            dockerfile=resolved_file,
+            tag=stage_tag,
+            stage=stage,
+            platform=resolved_platform,
+            build_args=all_build_args,
+            context=build_context,
+        )
+        # Save if requested
+        if save:
+            _save_image(runtime, stage_tag, save)
+    elif cont_config and not tag:
+        # Config name without --stage: build all local_stages
+        local_stages = cont_config.get_local_stages()
+        for s in local_stages:
+            stage_tag = cont_config.stage_tag(s)
+            _console().print(f"[bold]Building stage '{s}' → {stage_tag}[/bold]")
+            _build_one_stage(
+                runtime,
+                dockerfile=resolved_file,
+                tag=stage_tag,
+                stage=s,
+                platform=resolved_platform,
+                build_args=all_build_args,
+                context=build_context,
+            )
+        if save:
+            # Save the last built stage
+            _save_image(runtime, cont_config.stage_tag(local_stages[-1]), save)
+    else:
+        # No config or explicit --tag: single build (legacy behavior)
+        _build_one_stage(
+            runtime,
+            dockerfile=resolved_file,
+            tag=resolved_tag,
+            stage=None,
+            platform=resolved_platform,
+            build_args=all_build_args,
+            context=build_context,
+        )
+        if save:
+            _save_image(runtime, resolved_tag, save)
+
+
+def _save_image(runtime: str, tag: str, path: str) -> None:
+    """Export a container image to a tar file."""
+    cmd = [runtime, "save", "-o", path, tag]
+    _console().print(f"[dim]Saving image to {path}...[/dim]")
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        _console().print("[red]Build failed[/red]")
+        _console().print("[red]Failed to save image[/red]")
         raise typer.Exit(1)
-    
-    _console().print(f"[green]Built image: {tag}[/green]")
-    
-    # Save if requested
-    if save:
-        save_cmd = [runtime, "save", "-o", save, tag]
-        _console().print(f"[dim]Saving image to {save}...[/dim]")
-        result = subprocess.run(save_cmd)
-        if result.returncode != 0:
-            _console().print("[red]Failed to save image[/red]")
-            raise typer.Exit(1)
-        _console().print(f"[green]Saved image to {save}[/green]")
+    _console().print(f"[green]Saved image to {path}[/green]")
+
+
+def _push_one_image(
+    image_tag: str,
+    *,
+    config,
+    system: str,
+    account: str,
+    remote_dir: str,
+    platform: Optional[str] = None,
+) -> None:
+    """Export and upload a single image tag to remote storage.
+
+    Exports the image to a temporary tar, uploads via FirecREST, then cleans up.
+    """
+    runtime = _detect_container_runtime()
+    remote_filename = image_tag.replace(":", "+").replace("/", "+") + ".tar"
+    tar_path = os.path.join(tempfile.gettempdir(), remote_filename)
+
+    _console().print(f"[dim]Exporting {image_tag}...[/dim]")
+
+    save_cmd = [runtime, "save", "-o", tar_path]
+    if platform:
+        help_output = subprocess.run(
+            [runtime, "save", "--help"], capture_output=True, text=True
+        ).stdout
+        if "--platform" in help_output:
+            save_cmd.extend(["--platform", platform])
+        else:
+            _console().print(
+                f"[yellow]Warning: {runtime} save does not support --platform. "
+                "Ignoring platform argument.[/yellow]"
+            )
+    save_cmd.append(image_tag)
+
+    result = subprocess.run(save_cmd)
+    if result.returncode != 0:
+        _console().print(f"[red]Failed to export image: {image_tag}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        async def do_upload():
+            client = get_async_client()
+            try:
+                await client.mkdir(
+                    system_name=system, path=remote_dir, create_parents=True
+                )
+            except Exception:
+                pass
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=_console(),
+            ) as progress:
+                progress.add_task(
+                    f"Uploading {remote_filename} to {remote_dir}...", total=None
+                )
+                await client.upload(
+                    system_name=system,
+                    local_file=tar_path,
+                    directory=remote_dir,
+                    filename=remote_filename,
+                    account=account,
+                    blocking=True,
+                )
+
+        asyncio.run(do_upload())
+        _console().print(f"[green]Uploaded {remote_filename} to {remote_dir}[/green]")
+    finally:
+        if os.path.exists(tar_path):
+            os.unlink(tar_path)
 
 
 @app.command("push")
 def push_image(
     ctx: typer.Context,
-    image: str = typer.Argument(..., help="Image tar file or tag to push"),
+    image: str = typer.Argument(..., help="Config name, image tag, or tar file path"),
+    stage: Optional[str] = typer.Option(None, "--stage", help="Push specific stage (e.g., download)"),
     remote_path: Optional[str] = typer.Option(None, "--to", help="Remote path (default: from config)"),
     platform: Optional[str] = typer.Option(None, "--platform", help="Target platform (e.g., linux/arm64)"),
     do_import: bool = typer.Option(False, "--import", help="Import to squashfs after push"),
 ):
     """Upload a container image to remote storage.
 
-    If image is a tar file, uploads directly.
-    If image is a tag, exports and uploads.
-    Use --import to also submit an import job to convert to squashfs.
+    When IMAGE matches a container name from fcw.yaml, pushes all local_stages
+    (or a specific stage with --stage).
+
+    When IMAGE is a tar file, uploads directly.  When IMAGE is a tag, exports
+    and uploads.
+
+    Examples::
+
+        # Push all local stages for a config container
+        fcw container push ngc-brainbert
+
+        # Push only the download stage
+        fcw container push ngc-brainbert --stage download
+
+        # Legacy: push a specific tag
+        fcw container push my-app:v1-download
     """
     config, system, account = resolve_context(ctx)
-    
+
+    # Check if image is a config name
+    cont_config = config.containers.get(image) if config.containers else None
+
+    if cont_config:
+        # Resolve remote directory
+        images_dir = remote_path or cont_config.remote_path or "ce-images/"
+        images_dir = config.resolve_path(images_dir, remote=True)
+
+        if stage:
+            # Push one specific stage
+            stage_tag = cont_config.stage_tag(stage)
+            _console().print(f"[bold]Pushing stage '{stage}' → {stage_tag}[/bold]")
+            _push_one_image(
+                stage_tag,
+                config=config,
+                system=system,
+                account=account,
+                remote_dir=images_dir,
+                platform=platform,
+            )
+        else:
+            # Push all local stages
+            local_stages = cont_config.get_local_stages()
+            for s in local_stages:
+                stage_tag = cont_config.stage_tag(s)
+                _console().print(f"[bold]Pushing stage '{s}' → {stage_tag}[/bold]")
+                _push_one_image(
+                    stage_tag,
+                    config=config,
+                    system=system,
+                    account=account,
+                    remote_dir=images_dir,
+                    platform=platform,
+                )
+
+        if do_import:
+            ctx.invoke(import_image, image=cont_config.tag)
+        return
+
+    # --- Legacy behavior: image is a tag or tar path ---
+
     # Determine remote path
     if remote_path is None:
-        cont_config = _find_container_config(config, image)
-        if cont_config and cont_config.remote_path:
-            remote_path = cont_config.remote_path
+        matched = _find_container_config(config, image)
+        if matched and matched.remote_path:
+            remote_path = matched.remote_path
         else:
             remote_path = "ce-images/"
-
     remote_path = config.resolve_path(remote_path, remote=True)
-    
+
     # Check if image is a file or a tag
     if os.path.isfile(image):
         tar_path = image
@@ -377,17 +586,18 @@ def push_image(
 
         _console().print(f"[dim]Exporting {image}...[/dim]")
 
-        # Build the save command
         save_cmd = [runtime, "save", "-o", tar_path]
-
-        # Check if the runtime's save command supports the --platform flag
         if platform:
-            help_output = subprocess.run([runtime, "save", "--help"], capture_output=True, text=True).stdout
+            help_output = subprocess.run(
+                [runtime, "save", "--help"], capture_output=True, text=True
+            ).stdout
             if "--platform" in help_output:
                 save_cmd.extend(["--platform", platform])
             else:
-                _console().print(f"[yellow]Warning: {runtime} save does not support --platform. Ignoring platform argument.[/yellow]")
-
+                _console().print(
+                    f"[yellow]Warning: {runtime} save does not support --platform. "
+                    "Ignoring platform argument.[/yellow]"
+                )
         save_cmd.append(image)
 
         result = subprocess.run(save_cmd)
@@ -396,16 +606,15 @@ def push_image(
             raise typer.Exit(1)
 
     try:
-        # Upload
         async def do_upload():
             client = get_async_client()
-
-            # Ensure remote directory exists
             target_dir = os.path.dirname(remote_path)
             try:
-                await client.mkdir(system_name=system, path=target_dir, create_parents=True)
+                await client.mkdir(
+                    system_name=system, path=target_dir, create_parents=True
+                )
             except Exception:
-                pass  # May already exist
+                pass
 
             with Progress(
                 SpinnerColumn(),
@@ -413,7 +622,6 @@ def push_image(
                 console=_console(),
             ) as progress:
                 progress.add_task(f"Uploading to {remote_path}...", total=None)
-
                 await client.upload(
                     system_name=system,
                     local_file=tar_path,
@@ -422,7 +630,7 @@ def push_image(
                     account=account,
                     blocking=True,
                 )
-        
+
         asyncio.run(do_upload())
         _console().print(f"[green]Uploaded to {remote_path}[/green]")
 
@@ -431,7 +639,6 @@ def push_image(
             os.unlink(tar_path)
 
     if do_import:
-        # Invoke import using the tag (resolved to remote tar path)
         ctx.invoke(import_image, image=image)
 
 
@@ -532,12 +739,82 @@ exit 0
         os.unlink(script_path)
 
 
+def _stage_to_build_arg_name(stage_name: str) -> str:
+    """Derive build-arg name from a stage name.
+
+    Convention: ``DOWNLOAD_IMAGE`` for the ``download`` stage (backward-compatible),
+    ``<STAGE>_IMAGE`` (uppercase, hyphens to underscores) for others.
+
+    Examples::
+
+        _stage_to_build_arg_name("download")          -> "DOWNLOAD_IMAGE"
+        _stage_to_build_arg_name("runtime-download")  -> "RUNTIME_DOWNLOAD_IMAGE"
+    """
+    return stage_name.upper().replace("-", "_") + "_IMAGE"
+
+
+def _generate_load_and_resolve_block(
+    stage_tags: list[tuple[str, str]],
+    images_dir: str,
+) -> tuple[str, str]:
+    """Generate bash for loading tars and resolving image IDs.
+
+    Args:
+        stage_tags: list of ``(stage_name, image_tag)`` pairs.
+        images_dir: quoted remote directory containing tars.
+
+    Returns:
+        ``(load_block, build_arg_lines)`` where *load_block* is the bash to
+        load all tars and verify arch, and *build_arg_lines* are the
+        ``--build-arg`` entries for the podman build command.
+    """
+    load_lines = []
+    build_arg_parts = []
+
+    for stage_name, image_tag in stage_tags:
+        var_name = _stage_to_build_arg_name(stage_name).replace("-", "_")
+        tar_name = image_tag.replace(":", "+").replace("/", "+") + ".tar"
+        q_tar = shlex.quote(f"{images_dir}/{tar_name}")
+        q_tag = shlex.quote(image_tag)
+
+        load_lines.append(f"""
+# Load {stage_name} stage from tar
+if [ -f {q_tar} ]; then
+    echo "Loading {image_tag} from {tar_name}..."
+    podman load -i {q_tar}
+else
+    echo "Error: tar not found: {q_tar}"
+    exit 1
+fi
+{var_name}_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{image_tag} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {q_tag})
+echo "Resolved {stage_name} image ID: ${var_name}_ID"
+""")
+        build_arg_parts.append(f"    --build-arg {var_name}=${var_name}_ID \\")
+
+    # Architecture check on the first loaded image
+    if stage_tags:
+        first_var = _stage_to_build_arg_name(stage_tags[0][0]).replace("-", "_")
+        load_lines.append(f"""
+# Verify image architecture matches compute node (never emulate on HPC)
+IMAGE_ARCH=$(podman image inspect --format '{{{{.Architecture}}}}' "${first_var}_ID")
+NODE_ARCH=$(uname -m)
+case "$NODE_ARCH" in x86_64) NODE_ARCH=amd64;; aarch64) NODE_ARCH=arm64;; esac
+if [ "$IMAGE_ARCH" != "$NODE_ARCH" ]; then
+    echo "ERROR: Image architecture ($IMAGE_ARCH) does not match node ($NODE_ARCH)."
+    echo "Rebuild the base image with --platform linux/$NODE_ARCH"
+    exit 1
+fi
+""")
+
+    return "\n".join(load_lines), "\n".join(build_arg_parts)
+
+
 @app.command("build-remote")
 def build_remote(
     ctx: typer.Context,
-    image: str = typer.Argument(..., help="Base image to build from (must be pushed)"),
-    dockerfile: str = typer.Option(..., "--file", "-f", help="Local Dockerfile path"),
-    tag: str = typer.Option(..., "--tag", "-t", help="Tag for the built image"),
+    image: str = typer.Argument(..., help="Config name, or base image tag (must be pushed)"),
+    dockerfile: Optional[str] = typer.Option(None, "--file", "-f", help="Local Dockerfile path"),
+    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Tag for the built image"),
     stage: Optional[str] = typer.Option(None, "--stage", help="Target stage to build"),
     build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Build-time variables (KEY=VALUE)"),
     enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"),
@@ -546,34 +823,72 @@ def build_remote(
 ):
     """Build a container image on the remote cluster via a SLURM job.
 
-    Uploads the Dockerfile, then submits a job that loads the base image
-    from its pushed tar, runs podman build, and optionally exports to
-    enroot squashfs.
+    When IMAGE matches a container name from fcw.yaml, resolves the
+    Dockerfile, output tag, stage, and images to load from config.  The
+    --file and --tag options become optional.
 
-    Examples:
-        # Build build-offline stage from pushed download image
-        fcw container build-remote my-fcw-app:download \\
-            -f env/Dockerfile.prod-multistage -t my-fcw-app:latest \\
-            --stage build-offline --build-arg BASE_IMAGE=ubuntu:24.04 \\
-            --enroot --wait
+    Otherwise, IMAGE is treated as a base image tag (legacy behavior).
+
+    Examples::
+
+        # Config-aware: resolves everything from fcw.yaml
+        fcw container build-remote ngc-brainbert --enroot --wait
+
+        # Legacy: explicit flags
+        fcw container build-remote my-app:download \\
+            -f env/Dockerfile -t my-app:latest \\
+            --stage build-offline --enroot --wait
     """
     config, system, account = resolve_context(ctx)
 
-    if not os.path.isfile(dockerfile):
-        _console().print(f"[red]Dockerfile not found: {dockerfile}[/red]")
+    # Check if image is a config name
+    cont_config = config.containers.get(image) if config.containers else None
+
+    if cont_config:
+        # Resolve from config
+        resolved_dockerfile = dockerfile or cont_config.file
+        resolved_tag = tag or cont_config.tag
+        resolved_stage = stage or cont_config.get_remote_stage()
+        images_dir = config.resolve_container_images_dir(cont_config)
+
+        # Build list of (stage_name, tag) for all local stages to load
+        local_stages = cont_config.get_local_stages()
+        stage_tags = [(s, cont_config.stage_tag(s)) for s in local_stages]
+
+        all_build_args = _merge_build_args(cont_config.build_args, build_arg)
+    else:
+        # Legacy: image is a raw tag
+        if not dockerfile:
+            _console().print("[red]--file/-f is required when not using a config name.[/red]")
+            raise typer.Exit(1)
+        if not tag:
+            _console().print("[red]--tag/-t is required when not using a config name.[/red]")
+            raise typer.Exit(1)
+        resolved_dockerfile = dockerfile
+        resolved_tag = tag
+        resolved_stage = stage
+
+        # Legacy: single image, resolve from tag matching
+        matched = _find_container_config(config, tag) or _find_container_config(config, image)
+        images_dir = config.resolve_container_images_dir(matched) if matched else config.resolve_path("ce-images/", remote=True)
+
+        # Single stage: use "download" convention for the loaded image
+        stage_tags = [("download", image)]
+
+        all_build_args = _merge_build_args(
+            matched.build_args if matched else None, build_arg
+        )
+
+    if not os.path.isfile(resolved_dockerfile):
+        _console().print(f"[red]Dockerfile not found: {resolved_dockerfile}[/red]")
         raise typer.Exit(1)
 
-    # Resolve paths
-    remote_image_tar = _resolve_remote_tar(image, config)
     staging_dir = config.resolve_path(".fcw/build-remote", remote=True)
-    remote_dockerfile = f"{staging_dir}/Dockerfile"
-
-    # Resolve images directory from config if available
-    cont_config = _find_container_config(config, tag) or _find_container_config(config, image)
-    images_dir = config.resolve_container_images_dir(cont_config) if cont_config else config.resolve_path("ce-images/", remote=True)
 
     if enroot:
-        output_path = output or os.path.join(images_dir, f"{tag.replace(':', '+')}.sqsh")
+        output_path = output or os.path.join(
+            images_dir, f"{resolved_tag.replace(':', '+')}.sqsh"
+        )
 
     # Step 1: Upload Dockerfile
     _console().print("[bold]Step 1: Uploading Dockerfile...[/bold]")
@@ -588,7 +903,7 @@ def build_remote(
             pass
         await async_client.upload(
             system_name=system,
-            local_file=dockerfile,
+            local_file=resolved_dockerfile,
             directory=staging_dir,
             filename="Dockerfile",
             account=account,
@@ -600,16 +915,16 @@ def build_remote(
     # Step 2: Build job script
     _console().print("[bold]Step 2: Submitting build job...[/bold]")
 
-    all_build_args = _merge_build_args(
-        cont_config.build_args if cont_config else None, build_arg
+    # Generate image loading and build-arg blocks
+    load_block, image_build_args = _generate_load_and_resolve_block(
+        stage_tags, images_dir
     )
+
     extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
-    target_line = f"    --target {shlex.quote(stage)} \\\n" if stage else ""
+    target_line = f"    --target {shlex.quote(resolved_stage)} \\\n" if resolved_stage else ""
 
-    q_image = shlex.quote(image)
-    q_tag = shlex.quote(tag)
-    q_remote_image_tar = shlex.quote(remote_image_tar)
+    q_tag = shlex.quote(resolved_tag)
     q_staging_dir = shlex.quote(staging_dir)
     q_images_dir = shlex.quote(images_dir)
 
@@ -625,39 +940,16 @@ set -euxo pipefail
 {_podman_setup_block()}
 export CE_IMAGES_DIR={q_images_dir}
 
-# Load base image from tar
-if ! podman image exists {q_image} 2>/dev/null; then
-    if [ -f {q_remote_image_tar} ]; then
-        echo "Loading image from {q_remote_image_tar}..."
-        podman load -i {q_remote_image_tar}
-    else
-        echo "Error: image {q_image} not found and no tar at {q_remote_image_tar}"
-        exit 1
-    fi
-fi
-
-# Get the image ID for reliable reference in FROM directives
-IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{image} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {image})
-echo "Resolved image ID: $IMAGE_ID"
-
-# Verify image architecture matches compute node (never emulate on HPC)
-IMAGE_ARCH=$(podman image inspect --format '{{{{.Architecture}}}}' "$IMAGE_ID")
-NODE_ARCH=$(uname -m)
-case "$NODE_ARCH" in x86_64) NODE_ARCH=amd64;; aarch64) NODE_ARCH=arm64;; esac
-if [ "$IMAGE_ARCH" != "$NODE_ARCH" ]; then
-    echo "ERROR: Image architecture ($IMAGE_ARCH) does not match node ($NODE_ARCH)."
-    echo "Rebuild the base image with --platform linux/$NODE_ARCH"
-    exit 1
-fi
+{load_block}
 
 echo "=== Building {q_tag} ==="
 cd {q_staging_dir}
 podman build \\
-{target_line}    --build-arg DOWNLOAD_IMAGE=$IMAGE_ID \\
+{target_line}{image_build_args}
 {extra_build_args_line}    -t {q_tag} \\
     -f Dockerfile .
 
-echo "Built image: {q_tag}"
+echo "Built image: {resolved_tag}"
 """
 
     if enroot:
@@ -666,7 +958,7 @@ echo "Built image: {q_tag}"
 echo "=== Exporting to enroot ==="
 mkdir -p $(dirname {q_output_path})
 rm -f {q_output_path}
-enroot import -x mount -o {q_output_path} podman://{tag} || true
+enroot import -x mount -o {q_output_path} podman://{resolved_tag} || true
 if [ ! -f {q_output_path} ]; then
     echo "ERROR: enroot import failed - output not found: {q_output_path}"
     exit 1
@@ -698,7 +990,7 @@ ls -lh {q_output_path}
         if wait:
             _console().print("[dim]Waiting for build to complete...[/dim]")
             _wait_and_check(client, system, job_id, "Build job")
-            _console().print(f"[green]Build complete: {tag}[/green]")
+            _console().print(f"[green]Build complete: {resolved_tag}[/green]")
             if enroot:
                 _console().print(f"[green]Enroot image: {output_path}[/green]")
     finally:
@@ -721,20 +1013,20 @@ def deploy_image(
 
     Orchestrates the full deployment workflow:
 
-    1. Build the ``download`` stage locally (has network access)
-    2. Export and push the download image to the remote cluster
-    3. Submit a SLURM job that builds the ``build-offline`` stage and exports to enroot
+    1. Build all local stages (default: download) with network access
+    2. Export and push each local stage image to the remote cluster
+    3. Submit a SLURM job that builds the remote stage (default: build-offline)
+       and exports to enroot squashfs
 
-    The Dockerfile must follow the multistage pattern with ``download`` and
-    ``build-offline`` stages (see ``examples/basic/env/Dockerfile.app``).
+    Examples::
 
-    Examples:
         fcw container deploy app --wait
         fcw container deploy app --tag my-app:v2 --build-arg BASE_IMAGE=python:3.12
     """
     config, system, account = resolve_context(ctx)
 
     # Resolve container config
+    cont_config = None
     if name and name in config.containers:
         cont_config = config.containers[name]
         dockerfile = file or cont_config.file
@@ -753,11 +1045,13 @@ def deploy_image(
         _console().print(f"[red]Dockerfile not found: {dockerfile}[/red]")
         raise typer.Exit(1)
 
-    # Derive download tag: <image>:<version>-download
-    if ":" in final_tag:
-        download_tag = f"{final_tag}-download"
+    # Determine local stages and remote stage
+    if cont_config:
+        local_stages = cont_config.get_local_stages()
+        remote_stage = cont_config.get_remote_stage()
     else:
-        download_tag = f"{final_tag}:download"
+        local_stages = ["download"]
+        remote_stage = "build-offline"
 
     sqsh_path = os.path.join(images_dir, f"{final_tag.replace(':', '+')}.sqsh")
     runtime = _detect_container_runtime()
@@ -772,76 +1066,51 @@ def deploy_image(
 
     # Merge config-level build_args with CLI --build-arg flags
     all_build_args = _merge_build_args(
-        cont_config.build_args if (name and name in config.containers) else None,
+        cont_config.build_args if cont_config else None,
         build_arg,
     )
 
-    # Step 1: Build download stage locally
-    _console().print(f"[bold]Step 1: Building download stage locally ({download_tag})...[/bold]")
+    # Step 1: Build all local stages
+    stage_tags = []
+    for i, stage_name in enumerate(local_stages, 1):
+        if cont_config:
+            stage_tag = cont_config.stage_tag(stage_name)
+        elif ":" in final_tag:
+            stage_tag = f"{final_tag}-{stage_name}"
+        else:
+            stage_tag = f"{final_tag}:{stage_name}"
 
-    build_cmd = [runtime, "build", "--target", "download", "-t", download_tag, "-f", dockerfile]
-    if platform:
-        build_cmd.extend(["--platform", platform])
-    for arg in all_build_args:
-        build_cmd.extend(["--build-arg", arg])
-    build_cmd.append(".")
+        _console().print(
+            f"[bold]Step 1.{i}: Building '{stage_name}' stage locally ({stage_tag})...[/bold]"
+        )
+        _build_one_stage(
+            runtime,
+            dockerfile=dockerfile,
+            tag=stage_tag,
+            stage=stage_name,
+            platform=platform,
+            build_args=all_build_args,
+            context=".",
+        )
+        stage_tags.append((stage_name, stage_tag))
 
-    _console().print(f"[dim]Running: {' '.join(build_cmd)}[/dim]")
-    result = subprocess.run(build_cmd)
-    if result.returncode != 0:
-        _console().print("[red]Build failed[/red]")
-        raise typer.Exit(1)
-    _console().print(f"[green]Built download stage: {download_tag}[/green]")
-
-    # Step 2: Export and push download image
-    _console().print("[bold]Step 2: Uploading download image...[/bold]")
-
-    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as f:
-        tar_path = f.name
-
-    try:
-        result = subprocess.run([runtime, "save", "-o", tar_path, download_tag])
-        if result.returncode != 0:
-            _console().print("[red]Failed to export image[/red]")
-            raise typer.Exit(1)
-
-        remote_tar_filename = download_tag.replace(":", "+").replace("/", "+") + ".tar"
-        remote_tar_dir = images_dir
-
-        async def do_upload():
-            client = get_async_client()
-            try:
-                await client.mkdir(
-                    system_name=system, path=remote_tar_dir, create_parents=True
-                )
-            except Exception:
-                pass
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=_console(),
-            ) as progress:
-                progress.add_task(f"Uploading {remote_tar_filename}...", total=None)
-                await client.upload(
-                    system_name=system,
-                    local_file=tar_path,
-                    directory=remote_tar_dir,
-                    filename=remote_tar_filename,
-                    account=account,
-                    blocking=True,
-                )
-
-        asyncio.run(do_upload())
-        remote_tar = os.path.join(remote_tar_dir, remote_tar_filename)
-        _console().print(f"[green]Uploaded to {remote_tar}[/green]")
-
-    finally:
-        if os.path.exists(tar_path):
-            os.unlink(tar_path)
+    # Step 2: Export and push all local stage images
+    for i, (stage_name, stage_tag) in enumerate(stage_tags, 1):
+        _console().print(
+            f"[bold]Step 2.{i}: Uploading '{stage_name}' image ({stage_tag})...[/bold]"
+        )
+        _push_one_image(
+            stage_tag,
+            config=config,
+            system=system,
+            account=account,
+            remote_dir=images_dir,
+        )
 
     # Step 3: Upload Dockerfile and submit remote build job
-    _console().print(f"[bold]Step 3: Building offline stage on cluster ({final_tag})...[/bold]")
+    _console().print(
+        f"[bold]Step 3: Building '{remote_stage}' stage on cluster ({final_tag})...[/bold]"
+    )
 
     staging_dir = config.resolve_path(".fcw/deploy", remote=True)
 
@@ -864,12 +1133,15 @@ def deploy_image(
 
     asyncio.run(do_upload_dockerfile())
 
+    # Generate image loading and build-arg blocks
+    load_block, image_build_args = _generate_load_and_resolve_block(
+        stage_tags, images_dir
+    )
+
     extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
 
-    q_download_tag = shlex.quote(download_tag)
     q_final_tag = shlex.quote(final_tag)
-    q_remote_tar = shlex.quote(remote_tar)
     q_staging_dir = shlex.quote(staging_dir)
     q_images_dir = shlex.quote(images_dir)
     q_sqsh_path = shlex.quote(sqsh_path)
@@ -888,36 +1160,13 @@ set -euxo pipefail
 {setup_block}
 export CE_IMAGES_DIR={q_images_dir}
 
-# Load download image from tar
-if ! podman image exists {q_download_tag} 2>/dev/null; then
-    if [ -f {q_remote_tar} ]; then
-        echo "Loading image from {q_remote_tar}..."
-        podman load -i {q_remote_tar}
-    else
-        echo "Error: image {q_download_tag} not found and no tar at {q_remote_tar}"
-        exit 1
-    fi
-fi
+{load_block}
 
-# Get the image ID for reliable reference in FROM directives
-IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{download_tag} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {download_tag})
-echo "Resolved download image ID: $IMAGE_ID"
-
-# Verify image architecture matches compute node (never emulate on HPC)
-IMAGE_ARCH=$(podman image inspect --format '{{{{.Architecture}}}}' "$IMAGE_ID")
-NODE_ARCH=$(uname -m)
-case "$NODE_ARCH" in x86_64) NODE_ARCH=amd64;; aarch64) NODE_ARCH=arm64;; esac
-if [ "$IMAGE_ARCH" != "$NODE_ARCH" ]; then
-    echo "ERROR: Image architecture ($IMAGE_ARCH) does not match node ($NODE_ARCH)."
-    echo "Rebuild the download stage with --platform linux/$NODE_ARCH"
-    exit 1
-fi
-
-echo "=== Building {q_final_tag} (build-offline stage) ==="
+echo "=== Building {q_final_tag} ({remote_stage} stage) ==="
 cd {q_staging_dir}
 podman build \\
-    --target build-offline \\
-    --build-arg DOWNLOAD_IMAGE=$IMAGE_ID \\
+    --target {shlex.quote(remote_stage)} \\
+{image_build_args}
 {extra_build_args_line}    -t {q_final_tag} \\
     -f Dockerfile .
 
@@ -998,7 +1247,7 @@ def extract_from_image(
         fcw container extract my-fcw-app:download /workspace/BrainBERT .
     """
     config, system, account = resolve_context(ctx)
-    
+
     # Staging path for extraction
     staging_dir = config.resolve_path(".fcw/extract", remote=True)
     archive_name = f"{os.path.basename(container_path.rstrip('/'))}.tar.gz"
@@ -1077,13 +1326,13 @@ echo "Extracted to: {q_remote_archive}"
 ls -lh {q_remote_archive}
 exit 0
 """
-    
+
     client = get_client()
-    
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(script)
         script_path = f.name
-    
+
     try:
         result = client.submit(
             system_name=system,
@@ -1091,20 +1340,20 @@ exit 0
             working_dir=config.workdir.remote,
             script_local_path=script_path,
         )
-        
+
         job_id = extract_job_id(result)
         _console().print(f"[green]Submitted extract job: {job_id}[/green]")
-        
+
         if wait:
             _console().print("[dim]Waiting for extraction...[/dim]")
             _wait_and_check(client, system, job_id, "Extract job")
-            _console().print(f"[green]Extraction complete[/green]")
-            
+            _console().print("[green]Extraction complete[/green]")
+
             # Download the archive
             _console().print(f"[dim]Downloading {remote_archive}...[/dim]")
             local_archive = os.path.join(local_dest, archive_name)
             os.makedirs(local_dest, exist_ok=True)
-            
+
             async def do_download():
                 async_client = get_async_client()
                 await async_client.download(
@@ -1114,20 +1363,20 @@ exit 0
                     account=account,
                     blocking=True,
                 )
-            
+
             asyncio.run(do_download())
-            
+
             # Extract locally
             _console().print(f"[dim]Extracting to {local_dest}...[/dim]")
             subprocess.run(["tar", "xzf", local_archive, "-C", local_dest], check=True)
             os.unlink(local_archive)
-            
+
             _console().print(f"[green]Extracted to {local_dest}[/green]")
         else:
             print(job_id)
-            _console().print(f"[dim]After job completes, download with:[/dim]")
+            _console().print("[dim]After job completes, download with:[/dim]")
             _console().print(f"  fcw data download .fcw/extract/{archive_name} {local_dest}")
-            
+
     finally:
         os.unlink(script_path)
 
@@ -1160,19 +1409,19 @@ def patch_container(
         fcw container patch ./code /workspace/BrainBERT
     """
     config, system, account = resolve_context(ctx)
-    
+
     local_path = os.path.abspath(local_path)
     if not os.path.isdir(local_path):
         _console().print(f"[red]Not a directory: {local_path}[/red]")
         raise typer.Exit(1)
-    
+
     # Determine remote patch directory
     patch_name = os.path.basename(local_path.rstrip("/"))
     remote_patch_dir = config.resolve_path(f".patches/{patch_name}", remote=True)
-    
+
     # Upload the patched code
     _console().print(f"[dim]Uploading {local_path} to {remote_patch_dir}...[/dim]")
-    
+
     async def do_upload():
         from fcw.commands.data import _upload_directory
         async_client = get_async_client()
@@ -1180,7 +1429,7 @@ def patch_container(
 
     asyncio.run(do_upload())
     _console().print(f"[green]Uploaded to {remote_patch_dir}[/green]")
-    
+
     # Update TOML file if specified
     bind_mount = f"{remote_patch_dir}:{container_path}"
     if toml:
@@ -1222,7 +1471,7 @@ mounts = [
                 content += f'\nmounts = [\n    "{bind_mount}",\n]\n'
 
             toml_path.write_text(content)
-        
+
         # Upload TOML to remote
         remote_toml = config.resolve_path(toml, remote=True)
 
@@ -1248,8 +1497,8 @@ mounts = [
         _console().print(f"[green]Updated {toml} (local + remote)[/green]")
         _console().print(f"[dim]Run with: srun --environment {remote_toml} ...[/dim]")
     else:
-        _console().print(f"[dim]To use, add to your container TOML:[/dim]")
-        _console().print(f'  [mounts]')
+        _console().print("[dim]To use, add to your container TOML:[/dim]")
+        _console().print('  [mounts]')
         _console().print(f'  "{remote_patch_dir}" = "{container_path}"')
 
 
@@ -1290,16 +1539,16 @@ def update_image(
             --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.prod-multistage --enroot --wait
     """
     config, system, account = resolve_context(ctx)
-    
+
     if rebuild and not dockerfile:
         _console().print("[red]--rebuild requires --file[/red]")
         raise typer.Exit(1)
-    
+
     local_path = os.path.abspath(local_path)
     if not os.path.isdir(local_path):
         _console().print(f"[red]Not a directory: {local_path}[/red]")
         raise typer.Exit(1)
-    
+
     # Generate tag if not provided
     patched_tag = tag or f"{image.split(':')[0]}:patched"
     final_tag = patched_tag
@@ -1318,10 +1567,10 @@ def update_image(
     staging_dir = config.resolve_path(".fcw/update", remote=True)
     remote_patch_path = f"{staging_dir}/{patch_name}"
     remote_dockerfile = f"{staging_dir}/Dockerfile" if dockerfile else None
-    
+
     # Step 1: Upload patched code
-    _console().print(f"[bold]Step 1: Uploading patched code...[/bold]")
-    
+    _console().print("[bold]Step 1: Uploading patched code...[/bold]")
+
     async def do_upload():
         from fcw.commands.data import _upload_directory
         async_client = get_async_client()
@@ -1347,13 +1596,13 @@ def update_image(
                 account=account,
                 blocking=True,
             )
-    
+
     asyncio.run(do_upload())
     _console().print(f"[green]Uploaded to {staging_dir}[/green]")
-    
+
     # Step 2: Build job script
-    _console().print(f"[bold]Step 2: Submitting build job...[/bold]")
-    
+    _console().print("[bold]Step 2: Submitting build job...[/bold]")
+
     # Resolve the pushed tar path so the job can load it if needed
     remote_image_tar = _resolve_remote_tar(image, config)
 
@@ -1496,11 +1745,11 @@ ls -lh {q_output_path}
         script += "\nexit 0\n"
 
     client = get_client()
-    
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(script)
         script_path = f.name
-    
+
     try:
         result = client.submit(
             system_name=system,
@@ -1508,11 +1757,11 @@ ls -lh {q_output_path}
             working_dir=config.workdir.remote,
             script_local_path=script_path,
         )
-        
+
         job_id = extract_job_id(result)
         print(job_id)
         _console().print(f"[green]Submitted build job: {job_id}[/green]")
-        
+
         if wait:
             _console().print("[dim]Waiting for build to complete...[/dim]")
             _wait_and_check(client, system, job_id, "Build job")
@@ -1536,6 +1785,9 @@ def rebuild_container(
     build_arg: Optional[List[str]] = typer.Option(
         None, "--build-arg", help="Build-time variables (KEY=VALUE)"
     ),
+    patch_stage: Optional[str] = typer.Option(
+        None, "--patch-stage", help="Stage to apply patches to (default: first local stage)"
+    ),
     enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"),
     output: Optional[str] = typer.Option(
         None, "--output", "-o", help="Output path for enroot squashfs"
@@ -1550,7 +1802,8 @@ def rebuild_container(
 
     Reads the container's TOML to discover ``.patches/`` bind-mounts added by
     ``container patch``, then submits a SLURM job that applies all patches to
-    the download-stage image and rebuilds the build-offline stage.
+    the target stage image (default: first local stage) and rebuilds the
+    remote stage.
 
     On success, creates a new container entry in fcw.yaml and a new TOML file
     with patch mounts removed. The original container entry is preserved.
@@ -1598,16 +1851,14 @@ def rebuild_container(
     for host_path, container_path in patch_mounts:
         _console().print(f"  {host_path} → {container_path}")
 
-    # 3. Derive download tag (convention: <tag>-download or <tag>:download)
-    existing_tag = cont.tag
-    if ":" in existing_tag:
-        download_tag = f"{existing_tag}-download"
-    else:
-        download_tag = f"{existing_tag}:download"
+    # 3. Derive stage tag for the image to patch
+    target_stage = patch_stage or cont.get_local_stages()[0]
+    stage_tag = cont.stage_tag(target_stage)
+    remote_stage = cont.get_remote_stage()
 
     # 4. Resolve paths
     images_dir = config.resolve_container_images_dir(cont)
-    remote_download_tar = _resolve_remote_tar(download_tag, config)
+    remote_stage_tar = _resolve_remote_tar(stage_tag, config)
     staging_dir = config.resolve_path(".fcw/rebuild", remote=True)
     dockerfile = cont.file
 
@@ -1616,8 +1867,8 @@ def rebuild_container(
     extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
 
-    q_download_tag = shlex.quote(download_tag)
-    q_remote_download_tar = shlex.quote(remote_download_tar)
+    q_stage_tag = shlex.quote(stage_tag)
+    q_remote_stage_tar = shlex.quote(remote_stage_tar)
     q_tag = shlex.quote(tag)
     q_staging_dir = shlex.quote(staging_dir)
     q_images_dir = shlex.quote(images_dir)
@@ -1631,6 +1882,8 @@ def rebuild_container(
         patch_cp_lines.append(f'podman cp {q_host}/. "$CID:{container_path}"')
     patch_cp_block = "\n".join(patch_cp_lines)
 
+    build_arg_name = _stage_to_build_arg_name(target_stage)
+
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-rebuild
 #SBATCH --time=01:00:00
@@ -1642,33 +1895,33 @@ def rebuild_container(
 {setup_block}
 export CE_IMAGES_DIR={q_images_dir}
 
-# Load download image from tar
-if ! podman image exists {q_download_tag} 2>/dev/null; then
-    if [ -f {q_remote_download_tar} ]; then
-        echo "Loading image from {q_remote_download_tar}..."
-        podman load -i {q_remote_download_tar}
+# Load {target_stage} stage image from tar
+if ! podman image exists {q_stage_tag} 2>/dev/null; then
+    if [ -f {q_remote_stage_tar} ]; then
+        echo "Loading image from {q_remote_stage_tar}..."
+        podman load -i {q_remote_stage_tar}
     else
-        echo "Error: image {q_download_tag} not found and no tar at {q_remote_download_tar}"
+        echo "Error: image {q_stage_tag} not found and no tar at {q_remote_stage_tar}"
         exit 1
     fi
 fi
 
-IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{download_tag} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {download_tag})
-echo "Resolved download image ID: $IMAGE_ID"
+IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{stage_tag} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {stage_tag})
+echo "Resolved {target_stage} image ID: $IMAGE_ID"
 
-echo "=== Baking {len(patch_mounts)} patch(es) into download image ==="
+echo "=== Baking {len(patch_mounts)} patch(es) into {target_stage} image ==="
 CID=$(podman create $IMAGE_ID /bin/true)
 {patch_cp_block}
-PATCHED_IMAGE="{download_tag}-patched"
+PATCHED_IMAGE="{stage_tag}-patched"
 podman commit "$CID" "$PATCHED_IMAGE"
 podman rm "$CID"
 PATCHED_ID=$(podman image inspect --format '{{{{.Id}}}}' "$PATCHED_IMAGE")
-echo "Committed patched download image: $PATCHED_IMAGE (ID: $PATCHED_ID)"
+echo "Committed patched image: $PATCHED_IMAGE (ID: $PATCHED_ID)"
 
-echo "=== Rebuilding build-offline stage ==="
+echo "=== Rebuilding {remote_stage} stage ==="
 cd {q_staging_dir}
-podman build --target build-offline \\
-    --build-arg DOWNLOAD_IMAGE=$PATCHED_ID \\
+podman build --target {shlex.quote(remote_stage)} \\
+    --build-arg {build_arg_name}=$PATCHED_ID \\
 {extra_build_args_line}    -t {q_tag} \\
     -f Dockerfile .
 

@@ -142,7 +142,24 @@ fcw job wait $JOB1
 
 #### Initial Build & Deploy
 
-For multi-stage Dockerfiles (download + build-offline pattern):
+The simplest path is `deploy`, which builds local stages, pushes them, and submits
+a remote build job in one command:
+
+```bash
+# All-in-one: build, push, and deploy (resolves everything from fcw.yaml)
+fcw container deploy app --wait
+```
+
+For more control, the same workflow as explicit steps:
+
+```bash
+# Config-aware: resolves Dockerfile, tag, platform, build args from fcw.yaml
+fcw container build app
+fcw container push app
+fcw container build-remote app --enroot --wait
+```
+
+Or with fully explicit flags (legacy style):
 
 ```bash
 # Build download stage locally (fetches dependencies, requires network)
@@ -193,8 +210,18 @@ fcw container patch ./code /workspace/BrainBERT --toml env/container.toml
 
 # 3b. Bake changes: patch + rebuild (when satisfied with changes)
 fcw container update ./code my-fcw-app:download /workspace/BrainBERT \
-    --tag my-fcw-app:v2 --rebuild --dockerfile env/Dockerfile.prod-multistage \
+    --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.prod-multistage \
     --build-arg BASE_IMAGE=ubuntu:24.04 --enroot --wait
+```
+
+#### Other Commands
+
+```bash
+# Rebuild from patched TOML (removes bind-mounts, rebuilds build-offline stage)
+fcw container rebuild app --wait
+
+# List remote container images
+fcw container list
 ```
 
 ### FUSE Mount (Optional, Untested)
@@ -212,7 +239,7 @@ fcw mount stop ./local-outputs
 
 ## Example Projects
 
-- **[BrainBERT](examples/BrainBERT/)** — End-to-end pre-training of a neural language model for brain data on an HPC cluster. Multi-stage container build, data preprocessing, distributed training, and benchmarking (I/O, communication and training throughput). See the [fcw workflow guide](examples/BrainBERT/e2e_workflow.md).
+- **[BrainBERT](examples/BrainBERT/)** — End-to-end pre-training of a neural language model for brain data on an HPC cluster. Multi-stage container build, data preprocessing, distributed training, and benchmarking (I/O, communication and training throughput). See the [fcw workflow guide](examples/BrainBERT/fcw_e2e_workflow.md).
 - **[basic](examples/basic/)** — Minimal example demonstrating the full fcw pipeline. See the [e2e workflow](examples/basic/e2e_workflow.md).
 
 ## Example: Full Training Workflow
@@ -226,12 +253,7 @@ fcw data upload data/raw
 fcw data upload configs
 
 # Build and deploy container (first time)
-fcw container build --stage download -t my-fcw-app:download .
-fcw container push my-fcw-app:download
-fcw container build-remote my-fcw-app:download \
-    -f env/Dockerfile.prod-multistage -t my-fcw-app:latest \
-    --stage build-offline --build-arg BASE_IMAGE=ubuntu:24.04 \
-    --enroot --wait
+fcw container deploy app --wait
 
 # Run preprocessing
 JOB_PREP=$(fcw job submit --time 01:00:00 -- slurm/preprocess.sh)
@@ -277,6 +299,6 @@ done
 
 # When satisfied, bake changes into new image
 fcw container update ./code my-fcw-app:download /workspace/BrainBERT \
-    --tag my-fcw-app:v2 --rebuild --dockerfile env/Dockerfile.prod-multistage \
+    --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.prod-multistage \
     --build-arg BASE_IMAGE=ubuntu:24.04 --enroot --wait
 ```

@@ -10,10 +10,12 @@ from fcw.commands.container import (
     _derive_container_name,
     _detect_container_runtime,
     _find_container_config,
+    _generate_load_and_resolve_block,
     _merge_build_args,
     _parse_patch_mounts,
     _podman_setup_block,
     _resolve_remote_tar,
+    _stage_to_build_arg_name,
 )
 
 
@@ -295,3 +297,46 @@ class TestMergeBuildArgs:
     def test_empty_dicts(self):
         result = _merge_build_args({}, [])
         assert result == []
+
+
+class TestStageToBuildArgName:
+    def test_download(self):
+        assert _stage_to_build_arg_name("download") == "DOWNLOAD_IMAGE"
+
+    def test_runtime_download(self):
+        assert _stage_to_build_arg_name("runtime-download") == "RUNTIME_DOWNLOAD_IMAGE"
+
+    def test_simple_name(self):
+        assert _stage_to_build_arg_name("base") == "BASE_IMAGE"
+
+
+class TestGenerateLoadAndResolveBlock:
+    def test_single_stage(self):
+        load, args = _generate_load_and_resolve_block(
+            [("download", "app:v1-download")],
+            "/scratch/ce-images",
+        )
+        assert "app+v1-download.tar" in load
+        assert "podman load" in load
+        assert "DOWNLOAD_IMAGE_ID" in load
+        assert "--build-arg DOWNLOAD_IMAGE=$DOWNLOAD_IMAGE_ID" in args
+        # Architecture check present
+        assert "IMAGE_ARCH" in load
+        assert "NODE_ARCH" in load
+
+    def test_multiple_stages(self):
+        load, args = _generate_load_and_resolve_block(
+            [("download", "app:v1-download"), ("runtime-download", "app:v1-runtime-download")],
+            "/scratch/ce-images",
+        )
+        assert "app+v1-download.tar" in load
+        assert "app+v1-runtime-download.tar" in load
+        assert "DOWNLOAD_IMAGE_ID" in load
+        assert "RUNTIME_DOWNLOAD_IMAGE_ID" in load
+        assert "--build-arg DOWNLOAD_IMAGE=$DOWNLOAD_IMAGE_ID" in args
+        assert "--build-arg RUNTIME_DOWNLOAD_IMAGE=$RUNTIME_DOWNLOAD_IMAGE_ID" in args
+
+    def test_empty_stages(self):
+        load, args = _generate_load_and_resolve_block([], "/scratch")
+        assert load == ""
+        assert args == ""

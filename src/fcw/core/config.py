@@ -8,7 +8,7 @@ import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -54,6 +54,22 @@ class ContainerConfig:
     toml: Optional[str] = None
     platform: Optional[str] = None
     build_args: Optional[Dict[str, str]] = None
+    local_stages: Optional[List[str]] = None
+    remote_stage: Optional[str] = None
+
+    def get_local_stages(self) -> List[str]:
+        """Return local stages, defaulting to ["download"]."""
+        return self.local_stages or ["download"]
+
+    def get_remote_stage(self) -> str:
+        """Return remote stage, defaulting to "build-offline"."""
+        return self.remote_stage or "build-offline"
+
+    def stage_tag(self, stage: str) -> str:
+        """Derive tag for a specific stage: <tag>-<stage>."""
+        if ":" in self.tag:
+            return f"{self.tag}-{stage}"
+        return f"{self.tag}:{stage}"
 
 
 @dataclass
@@ -273,6 +289,8 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 toml=cont_data.get("toml"),
                 platform=cont_data.get("platform"),
                 build_args=cont_data.get("build_args"),
+                local_stages=cont_data.get("local_stages"),
+                remote_stage=cont_data.get("remote_stage"),
             )
     
     # Parse jobs
@@ -413,6 +431,10 @@ def add_container_to_config(
         snippet += "    build_args:\n"
         for k, v in container.build_args.items():
             snippet += f"      {k}: {v}\n"
+    if container.local_stages is not None:
+        snippet += f"    local_stages: [{', '.join(container.local_stages)}]\n"
+    if container.remote_stage is not None:
+        snippet += f"    remote_stage: {container.remote_stage}\n"
 
     lines.insert(insert_idx, snippet)
     config_path.write_text("".join(lines))

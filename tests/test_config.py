@@ -110,6 +110,47 @@ class TestLoadConfig:
         assert cfg.containers["app"].platform == "linux/arm64"
 
 
+    def test_local_stages_parsed(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(textwrap.dedent("""\
+            project: test
+            workdir:
+              remote: /tmp/test
+              local: .
+            containers:
+              app:
+                file: ./Dockerfile
+                tag: my-app:latest
+                local_stages: [download, runtime-download]
+                remote_stage: build-offline
+        """))
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            cfg = load_config(str(config_path))
+        finally:
+            os.chdir(old_cwd)
+        assert cfg.containers["app"].local_stages == ["download", "runtime-download"]
+        assert cfg.containers["app"].remote_stage == "build-offline"
+
+    def test_local_stages_defaults(self, sample_config):
+        """When local_stages/remote_stage are absent, defaults apply."""
+        assert sample_config.containers["app"].local_stages is None
+        assert sample_config.containers["app"].get_local_stages() == ["download"]
+        assert sample_config.containers["app"].get_remote_stage() == "build-offline"
+
+    def test_stage_tag_with_colon(self):
+        from fcw.core.config import ContainerConfig
+        c = ContainerConfig(file="f", tag="my-app:v1")
+        assert c.stage_tag("download") == "my-app:v1-download"
+        assert c.stage_tag("runtime-download") == "my-app:v1-runtime-download"
+
+    def test_stage_tag_without_colon(self):
+        from fcw.core.config import ContainerConfig
+        c = ContainerConfig(file="f", tag="my-app")
+        assert c.stage_tag("download") == "my-app:download"
+
+
 class TestEnvVarExpansion:
     def test_simple_var(self, monkeypatch):
         monkeypatch.setenv("TEST_VAR", "hello")
