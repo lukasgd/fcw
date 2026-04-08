@@ -1,0 +1,17 @@
+image = "${CE_IMAGES}/node-burn+12.4.1-devel-ubuntu22.04.sqsh"
+
+mounts = [
+  "${SCRATCH}",
+  "${HOME}",
+]
+
+workdir = "${PWD}"
+
+writable = true
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
+
+[env]
+#NCCL_DEBUG = "INFO"

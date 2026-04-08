@@ -1,0 +1,99 @@
+ARG BASE_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04
+ARG RUNTIME_IMAGE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
+ARG DOWNLOAD_IMAGE=download
+
+FROM ${BASE_IMAGE} AS download
+
+ARG NODEBURN_COMMIT_ID=be4f759
+
+RUN mkdir -p /workspace/build_deps/apt-build \
+             /workspace/build_deps/apt-runtime \
+             /workspace/build_deps/src
+
+# Install git and wget immediately so we can fetch external dependencies
+RUN apt-get update && apt-get install -y wget git
+
+# Download the keyring and clone the repository
+RUN cd /workspace/build_deps/src \
+    && wget -O cuda-keyring_1.1-1_all.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb \
+    && git clone https://github.com/eth-cscs/node-burn.git \
+    && cd node-burn \
+    && git checkout ${NODEBURN_COMMIT_ID}
+
+# Setup keyring locally so apt can resolve packages like 'nvpl'
+RUN if [ "$(uname -m)" != "x86_64" ]; then \
+        dpkg -i /workspace/build_deps/src/cuda-keyring_1.1-1_all.deb; \
+        apt-get update; \
+    fi
+
+# Fetch APT dependencies needed exclusively for the compilation stage
+RUN cd /workspace/build_deps/apt-build \
+    && apt-get update \
+    && if [ "$(uname -m)" != "x86_64" ]; then \
+        apt-get install -y --download-only --no-install-recommends cmake nvpl; \
+    else \
+        apt-get install -y --download-only --no-install-recommends cmake libopenblas-dev; \
+    fi \
+    && mv /var/cache/apt/archives/*.deb ./
+
+# Fetch APT dependencies needed exclusively for the runtime stage
+RUN cd /workspace/build_deps/apt-runtime \
+    && if [ "$(uname -m)" != "x86_64" ]; then \
+        apt-get install -y --download-only --no-install-recommends libgomp1 libnvpl-blas0; \
+    else \
+        apt-get install -y --download-only --no-install-recommends libgomp1 libopenblas-dev; \
+    fi \
+    && mv /var/cache/apt/archives/*.deb ./
+
+
+FROM ${DOWNLOAD_IMAGE} AS download-copy
+
+FROM ${RUNTIME_IMAGE} AS runtime-download
+
+FROM ${BASE_IMAGE} AS build-offline-compile
+
+COPY --from=download-copy /workspace/build_deps /workspace/build_deps
+
+RUN apt-get update \
+    && apt-get install -yqq --no-install-recommends /workspace/build_deps/apt-build/*.deb \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -r /workspace/build_deps/apt-build
+
+RUN cp -r /workspace/build_deps/src/node-burn /workspace/node-burn \
+    && cd /workspace/node-burn \
+    && if [ "$(uname -m)" != "x86_64" ]; then \
+        sed -i 's/find_package(BLAS REQUIRED)/find_package(nvpl REQUIRED COMPONENTS blas)/' CMakeLists.txt; \
+        sed -i 's/BLAS::BLAS/nvpl::lapack_lp64_omp/' CMakeLists.txt; \
+    fi \
+    && cmake -DCMAKE_BUILD_TYPE=Release -DTF32=ON -DDOUBLE=OFF -B build \
+    && cmake -DCMAKE_BUILD_TYPE=Release -B build-f64 \
+    && cmake -DNB_GPU=OFF -DCMAKE_BUILD_TYPE=Release -DTF32=ON -DDOUBLE=OFF -B build-cpu \
+    && cmake -DNB_GPU=OFF -DCMAKE_BUILD_TYPE=Release -B build-f64-cpu \
+    && cmake --build build \
+    && cmake --build build-f64 \
+    && cmake --build build-cpu \
+    && cmake --build build-f64-cpu \
+    && cp build/burn /usr/local/bin \
+    && cp build-f64/burn /usr/local/bin/burn-f64 \
+    && cp build-cpu/burn /usr/local/bin/burn-cpu \
+    && cp build-f64-cpu/burn /usr/local/bin/burn-f64-cpu \
+    && cd .. \
+    && rm -rf /workspace/node-burn
+
+
+FROM ${RUNTIME_IMAGE} AS build-offline
+
+
+# Propagate the root artifact analogous to the original target image
+COPY --from=download-copy /workspace/build_deps/src/cuda-keyring_1.1-1_all.deb /cuda-keyring_1.1-1_all.deb
+COPY --from=download-copy /workspace/build_deps /workspace/build_deps
+
+RUN if [ "$(uname -m)" != "x86_64" ]; then \
+        dpkg -i cuda-keyring_1.1-1_all.deb; \
+    fi \
+    && apt-get update \
+    && apt-get install -yqq --no-install-recommends /workspace/build_deps/apt-runtime/*.deb \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -r /workspace/build_deps
+
+COPY --from=build-offline-compile /usr/local/bin/burn* /usr/local/bin/
