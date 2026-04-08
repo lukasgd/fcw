@@ -21,7 +21,6 @@ _console = get_console
 FUSE_AVAILABLE = False
 try:
     import pyfuse3
-    import trio
     FUSE_AVAILABLE = True
 except ImportError:
     pass
