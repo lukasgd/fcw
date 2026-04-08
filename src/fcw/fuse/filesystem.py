@@ -336,7 +336,7 @@ class FirecrestFS(pyfuse3.Operations):
         self.open_files[fh] = {
             "path": path,
             "dirty": is_truncated,
-            "buffer": tempfile.NamedTemporaryFile(delete=False),
+            "buffer": tempfile.NamedTemporaryFile(delete=False, dir=self.read_cache_dir),
             "cached": False,
         }
 
@@ -544,8 +544,13 @@ class FirecrestFS(pyfuse3.Operations):
         path = os.path.join(self._inode_to_path(parent_inode), name.decode("utf-8"))
 
         try:
-            # Check if empty
-            files = await self._fc_list_files(path)
+            # Check if empty — bypass cache to avoid stale ENOTEMPTY
+            files = await self.client.list_files(
+                system_name=self.system,
+                path=path,
+                recursive=False,
+                show_hidden=True,
+            )
             for f in files:
                 fname = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
                 if fname and fname not in (".", ".."):
@@ -626,7 +631,7 @@ class FirecrestFS(pyfuse3.Operations):
         self.open_files[fh] = {
             "path": path,
             "dirty": True,
-            "buffer": tempfile.NamedTemporaryFile(delete=False),
+            "buffer": tempfile.NamedTemporaryFile(delete=False, dir=self.read_cache_dir),
             "cached": False,
         }
 
@@ -662,7 +667,6 @@ def run_filesystem(
     cache_ttl: int = 5,
     read_only: bool = False,
     allow_other: bool = False,
-    foreground: bool = True,
     debug: bool = False,
 ):
     """Run the FUSE filesystem.
@@ -675,7 +679,6 @@ def run_filesystem(
         cache_ttl: Cache TTL in seconds
         read_only: Mount read-only
         allow_other: Allow other users to access mount
-        foreground: Run in foreground (vs daemonize)
         debug: Enable debug logging
     """
     if debug:
@@ -715,4 +718,5 @@ def run_filesystem(
         pass
     finally:
         pyfuse3.close()
+        asyncio.run(client.close_session())
         shutil.rmtree(fs.read_cache_dir, ignore_errors=True)

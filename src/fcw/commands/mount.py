@@ -42,7 +42,6 @@ def mount_filesystem(
     mountpoint: str = typer.Argument(..., help="Local mount point"),
     read_only: bool = typer.Option(False, "--read-only", "-r", help="Mount read-only"),
     cache_ttl: int = typer.Option(5, "--cache-ttl", help="Cache TTL in seconds"),
-    foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in foreground"),
     allow_other: bool = typer.Option(False, "--allow-other", help="Allow other users to access"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging"),
 ):
@@ -73,10 +72,7 @@ def mount_filesystem(
     
     _console().print(f"Mounting {system}:{remote_path} at {mountpoint}")
     _console().print(f"[dim]Cache TTL: {cache_ttl}s, Read-only: {read_only}[/dim]")
-    
-    if not foreground:
-        _console().print("[dim]Running in background. Use 'fcw mount stop' to unmount.[/dim]")
-    
+
     # Run the filesystem
     run_filesystem(
         mountpoint=mountpoint,
@@ -86,7 +82,6 @@ def mount_filesystem(
         cache_ttl=cache_ttl,
         read_only=read_only,
         allow_other=allow_other,
-        foreground=foreground,
         debug=debug,
     )
 
