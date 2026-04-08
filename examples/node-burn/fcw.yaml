@@ -16,9 +16,10 @@ directories:
 containers:
   node-burn:
     file: ./env/Dockerfile.multistage
-    tag: node-burn:12.4.1-devel-ubuntu22.04
+    tag: node-burn:12.4.1-runtime-ubuntu22.04
     remote_path: ./ce-images/
     toml: ./env/node-burn.toml
+    platform: linux/arm64
     build_args:
       BASE_IMAGE: nvidia/cuda:12.4.1-devel-ubuntu22.04
       RUNTIME_IMAGE: nvidia/cuda:12.4.1-runtime-ubuntu22.04
@@ -34,4 +35,4 @@ jobs:
     script: slurm/submit-node-burn.sh
     container: node-burn
     time: "1:00:00"
-    nodes: 1
+    nodes: 4

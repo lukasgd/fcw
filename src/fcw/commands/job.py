@@ -98,9 +98,15 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
             # Handles: #SBATCH --key=value, #SBATCH --key value, #SBATCH -k value
             for key, value in overrides.items():
                 # Match both --key=... and --key ...
-                pattern = rf'^(\s*#SBATCH\s+--{re.escape(key)})(?:=|\s+)\S*(.*)$'
+                pattern = rf'^\s*#SBATCH\s+--{re.escape(key)}(?:=|\s+)(\S+)'
                 match = re.match(pattern, line)
                 if match:
+                    old_value = match.group(1)
+                    if old_value != value:
+                        _console().print(
+                            f"[yellow]Overriding script #SBATCH "
+                            f"--{key} ({old_value} → {value})[/yellow]"
+                        )
                     lines[i] = f"#SBATCH --{key}={value}"
                     modified_keys.add(key)
                     break
@@ -452,9 +458,6 @@ def submit_job(
         )
         raise typer.Exit(1)
 
-    # Apply global SBATCH options (env vars), then CLI overrides on top
-    sbatch_overrides = {**get_global_sbatch_options(), **sbatch_overrides}
-
     if not remaining:
         _console().print("[red]Error: No script or job name provided[/red]")
         _console().print("[dim]Usage: fcw job submit [SBATCH_OPTS]... -- <script|job_name> [--set KEY=VALUE]...[/dim]")
@@ -474,10 +477,12 @@ def submit_job(
 
     # Determine if job_name is a config job or a script path
     container_name = None
+    config_sbatch: dict[str, str] = {}
     if job_name in config.jobs:
         job_config = config.jobs[job_name]
         script_path = job_config.script
         container_name = job_config.container
+        config_sbatch = job_config.sbatch_options()
 
         # Resolve environment variables from config
         env_vars = _resolve_job_env(config, job_config, overrides)
@@ -485,6 +490,9 @@ def submit_job(
         # Treat as script path
         script_path = job_name
         env_vars = overrides
+
+    # Merge SBATCH options: CLI args > job config > global env > script directives
+    sbatch_overrides = {**get_global_sbatch_options(), **config_sbatch, **sbatch_overrides}
 
     # Read and modify script
     if not os.path.exists(script_path):

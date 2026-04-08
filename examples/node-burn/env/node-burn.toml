@@ -1,4 +1,4 @@
-image = "${CE_IMAGES}/node-burn+12.4.1-devel-ubuntu22.04.sqsh"
+image = "${CE_IMAGES}/node-burn+12.4.1-runtime-ubuntu22.04.sqsh"
 
 mounts = [
   "${SCRATCH}",

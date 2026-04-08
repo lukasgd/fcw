@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 import yaml
 
@@ -75,14 +75,14 @@ class ContainerConfig:
 @dataclass
 class JobConfig:
     """Configuration for a job definition.
-    
+
     Attributes:
         script: Path to the SLURM script file.
         env: Environment variables to inject (name -> value).
-        time: Suggested time limit (informational, override via CLI).
-        nodes: Suggested node count (informational, override via CLI).
-        gpus_per_node: Suggested GPUs per node (informational).
-        cpus_per_task: Suggested CPUs per task (informational).
+        time: SBATCH time limit (applied as override, CLI takes precedence).
+        nodes: SBATCH node count (applied as override, CLI takes precedence).
+        gpus_per_node: SBATCH GPUs per node (applied as override, CLI takes precedence).
+        cpus_per_task: SBATCH CPUs per task (applied as override, CLI takes precedence).
     """
     script: str
     container: Optional[str] = None
@@ -91,6 +91,24 @@ class JobConfig:
     nodes: Optional[int] = None
     gpus_per_node: Optional[int] = None
     cpus_per_task: Optional[int] = None
+
+    # Fields that are not SBATCH options
+    _NON_SBATCH_FIELDS: ClassVar[frozenset[str]] = frozenset({"script", "container", "env"})
+
+    def sbatch_options(self) -> dict[str, str]:
+        """Return non-None SBATCH fields as a dict suitable for overrides.
+
+        Field names are converted from snake_case to kebab-case
+        (e.g. ``gpus_per_node`` -> ``gpus-per-node``).
+        """
+        opts: dict[str, str] = {}
+        for f in fields(self):
+            if f.name in self._NON_SBATCH_FIELDS or f.name.startswith("_"):
+                continue
+            val = getattr(self, f.name)
+            if val is not None:
+                opts[f.name.replace("_", "-")] = str(val)
+        return opts
 
 
 @dataclass

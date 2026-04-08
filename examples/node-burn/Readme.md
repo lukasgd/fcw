@@ -1,18 +1,23 @@
 # node-burn: CPU/GPU GEMM tests
 
-## Build container image
+## Build and deploy container image
 
-Following the main Readme, these commands have initially succeeded to build a container:
+All-in-one:
 
-```
-fcw container build --platform linux/arm64 -f env/Dockerfile.multistage --stage download -t node-burn:12.4.1-devel-ubuntu22.04-download .
-
-fcw container push node-burn:12.4.1-devel-ubuntu22.04-download
-
-fcw container build-remote node-burn:12.4.1-devel-ubuntu22.04-download \
-    -f env/Dockerfile.multistage -t node-burn:12.4.1-devel-ubuntu22.04 \
-    --stage build-offline \
-    --enroot --wait
+```bash
+fcw container deploy node-burn --wait
 ```
 
-This should still be reviewed/double-checked.
+Or as explicit steps:
+
+```bash
+fcw container build node-burn
+fcw container push node-burn
+fcw container build-remote node-burn --enroot --wait
+```
+
+## Run
+
+```bash
+fcw job submit node-burn
+```

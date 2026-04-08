@@ -59,6 +59,50 @@ class TestApplySbatchOverrides:
         assert "#SBATCH --time=12:00:00" in result
         assert "#SBATCH --nodes=4" in result
 
+    def test_same_value_no_warning(self, capsys):
+        """No warning when override matches existing script value."""
+        _apply_sbatch_overrides(SAMPLE_SCRIPT, {"nodes": "1"})
+        captured = capsys.readouterr()
+        output = captured.out + captured.err
+        assert "Overriding" not in output
+
+    def test_different_value_warns(self, capsys):
+        """Warning when override replaces a different script value."""
+        _apply_sbatch_overrides(SAMPLE_SCRIPT, {"nodes": "4"})
+        captured = capsys.readouterr()
+        output = captured.out + captured.err
+        assert "Overriding" in output
+        assert "--nodes" in output
+
+
+class TestJobConfigSbatchOptions:
+    def test_returns_set_fields(self):
+        job = JobConfig(script="train.sh", time="12:00:00", nodes=4)
+        assert job.sbatch_options() == {"time": "12:00:00", "nodes": "4"}
+
+    def test_skips_none_fields(self):
+        job = JobConfig(script="train.sh", time="1:00:00")
+        opts = job.sbatch_options()
+        assert "time" in opts
+        assert "nodes" not in opts
+
+    def test_converts_underscores_to_hyphens(self):
+        job = JobConfig(script="train.sh", gpus_per_node=4, cpus_per_task=8)
+        opts = job.sbatch_options()
+        assert opts == {"gpus-per-node": "4", "cpus-per-task": "8"}
+
+    def test_excludes_non_sbatch_fields(self):
+        job = JobConfig(script="train.sh", container="app", env={"K": "V"}, time="1:00:00")
+        opts = job.sbatch_options()
+        assert "script" not in opts
+        assert "container" not in opts
+        assert "env" not in opts
+        assert opts == {"time": "1:00:00"}
+
+    def test_empty_when_no_sbatch_fields(self):
+        job = JobConfig(script="train.sh")
+        assert job.sbatch_options() == {}
+
 
 class TestInjectEnvVars:
     def test_basic_injection(self):
