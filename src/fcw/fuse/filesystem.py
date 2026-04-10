@@ -18,6 +18,7 @@ import shutil
 import stat
 import tempfile
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 import firecrest
@@ -33,6 +34,32 @@ if TYPE_CHECKING:
     from firecrest.v2 import AsyncFirecrest
 
 logger = logging.getLogger("fcw.fuse")
+
+def _parse_permissions(perm_str: str) -> int:
+    """Convert permission string like 'rwxr-xr-x' to octal mode bits."""
+    if len(perm_str) < 9:
+        return 0o644
+    mode = 0
+    for i, char in enumerate(perm_str[:9]):
+        if char in "rwxsStT":
+            mode |= 1 << (8 - i)
+    return mode
+
+
+def _parse_timestamp(ts_str: str) -> int:
+    """Parse a timestamp string to epoch nanoseconds. Tries ISO 8601 then common formats."""
+    if not ts_str:
+        return 0
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(ts_str[:19], fmt[:len(fmt)])
+            return int(dt.replace(tzinfo=timezone.utc).timestamp()) * 10**9
+        except ValueError:
+            continue
+    try:
+        return int(float(ts_str)) * 10**9
+    except (ValueError, TypeError):
+        return 0
 
 
 class FirecrestFS(pyfuse3.Operations):
@@ -70,6 +97,7 @@ class FirecrestFS(pyfuse3.Operations):
         # Caching
         self.attr_cache: TTLCache = TTLCache(maxsize=10000, ttl=cache_ttl)
         self.dir_cache: TTLCache = TTLCache(maxsize=1000, ttl=cache_ttl)
+        self.negative_cache: TTLCache = TTLCache(maxsize=10000, ttl=cache_ttl)
         self.read_cache_dir = tempfile.mkdtemp(prefix="fcw_cache_")
 
         # File handle management (for writes)
@@ -112,8 +140,8 @@ class FirecrestFS(pyfuse3.Operations):
 
         entry.st_mode = int(get_val(fc_stat, "mode", 0))
         entry.st_nlink = int(get_val(fc_stat, "nlink", 1))
-        entry.st_uid = int(get_val(fc_stat, "uid", os.getuid()))
-        entry.st_gid = int(get_val(fc_stat, "gid", os.getgid()))
+        entry.st_uid = os.getuid()
+        entry.st_gid = os.getgid()
         entry.st_rdev = int(get_val(fc_stat, "dev", 0))
         entry.st_size = int(get_val(fc_stat, "size", 0))
 
@@ -160,6 +188,8 @@ class FirecrestFS(pyfuse3.Operations):
         """Get file stats with caching."""
         if path in self.attr_cache:
             return self.attr_cache[path]
+        if path in self.negative_cache:
+            raise pyfuse3.FUSEError(errno.ENOENT)
 
         result = await self.client.stat(system_name=self.system, path=path)
 
@@ -176,6 +206,11 @@ class FirecrestFS(pyfuse3.Operations):
                 "ctime": getattr(result, "ctime", 0),
             }
 
+        logger.debug(
+            f"stat {os.path.basename(path)}: "
+            f"mtime={result.get('mtime')} atime={result.get('atime')} "
+            f"ctime={result.get('ctime')} size={result.get('size')}"
+        )
         self.attr_cache[path] = result
         return result
 
@@ -223,8 +258,13 @@ class FirecrestFS(pyfuse3.Operations):
             fc_stat = await self._fc_stat(path)
             inode = self._get_inode(path)
             return self._stat_to_attr(fc_stat, inode)
+        except pyfuse3.FUSEError:
+            raise
         except FirecrestException as e:
-            raise pyfuse3.FUSEError(self._map_error(e))
+            err = self._map_error(e)
+            if err == errno.ENOENT:
+                self.negative_cache[path] = True
+            raise pyfuse3.FUSEError(err)
         except Exception as e:
             logger.error(f"lookup error for {path}: {e}")
             raise pyfuse3.FUSEError(errno.EIO)
@@ -254,6 +294,92 @@ class FirecrestFS(pyfuse3.Operations):
             return self._stat_to_attr(fc_stat, inode)
         except FirecrestException as e:
             raise pyfuse3.FUSEError(self._map_error(e))
+
+    async def setattr(self, inode: int, attr, fields, fh, ctx):
+        """Set file attributes (truncate, chmod, chown)."""
+        path = self._inode_to_path(inode)
+
+        # Check if file only exists locally (created but not yet uploaded)
+        local_only = any(
+            d["path"] == path and d["dirty"] and not d["cached"]
+            for d in self.open_files.values()
+        )
+
+        # Handle truncate
+        if fields.update_size:
+            target_fh = fh
+            if target_fh is None:
+                for open_fh, data in self.open_files.items():
+                    if data["path"] == path:
+                        target_fh = open_fh
+                        break
+
+            if target_fh is not None and target_fh in self.open_files:
+                data = self.open_files[target_fh]
+                data["buffer"].truncate(attr.st_size)
+                data["dirty"] = True
+            else:
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False,
+                                                     dir=self.read_cache_dir) as tmp:
+                        tmp_path = tmp.name
+
+                    if attr.st_size > 0:
+                        await self.client.download(
+                            system_name=self.system,
+                            source_path=path,
+                            target_path=tmp_path,
+                            account=self.account,
+                            blocking=True,
+                        )
+
+                    os.truncate(tmp_path, attr.st_size)
+
+                    target_dir = os.path.dirname(path)
+                    filename = os.path.basename(path)
+                    await self.client.upload(
+                        system_name=self.system,
+                        local_file=tmp_path,
+                        directory=target_dir,
+                        filename=filename,
+                        account=self.account,
+                        blocking=True,
+                    )
+                except Exception as e:
+                    logger.error(f"Remote truncate failed: {e}")
+                    raise pyfuse3.FUSEError(self._map_error(e))
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+
+        # Handle chmod — skip for files not yet uploaded
+        if fields.update_mode and not local_only:
+            mode_octal = f"{stat.S_IMODE(attr.st_mode):03o}"
+            try:
+                await self.client.chmod(
+                    system_name=self.system, path=path, mode=mode_octal
+                )
+            except Exception as e:
+                logger.error(f"chmod failed: {e}")
+                raise pyfuse3.FUSEError(self._map_error(e))
+
+        # Handle chown — skip for files not yet uploaded
+        if (fields.update_uid or fields.update_gid) and not local_only:
+            owner = str(attr.st_uid) if fields.update_uid else ""
+            group = str(attr.st_gid) if fields.update_gid else ""
+            try:
+                await self.client.chown(
+                    system_name=self.system, path=path, owner=owner, group=group
+                )
+            except Exception as e:
+                logger.warning(f"chown failed for {path}: {e}")
+                raise pyfuse3.FUSEError(errno.EPERM)
+
+        # Invalidate cached attrs
+        if path in self.attr_cache:
+            del self.attr_cache[path]
+
+        return await self.getattr(inode, ctx)
 
     async def opendir(self, inode: int, ctx):
         """Open a directory for reading."""
@@ -289,6 +415,8 @@ class FirecrestFS(pyfuse3.Operations):
         entries.append((b"..", attr_dotdot))
 
         # Add directory contents
+        local_uid = os.getuid()
+        local_gid = os.getgid()
         for f in files:
             name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
             ftype = f.get("type") if isinstance(f, dict) else getattr(f, "type", None)
@@ -296,18 +424,48 @@ class FirecrestFS(pyfuse3.Operations):
             if not name or name in (".", ".."):
                 continue
 
-            mode = stat.S_IFREG | 0o644
+            # Parse permissions from API response, fall back to defaults
+            perm_str = (f.get("permissions") if isinstance(f, dict)
+                        else getattr(f, "permissions", None))
+            if perm_str:
+                perm_bits = _parse_permissions(perm_str)
+            else:
+                perm_bits = 0o755 if ftype == "d" else 0o644
+
             if ftype == "d":
-                mode = stat.S_IFDIR | 0o755
+                mode = stat.S_IFDIR | perm_bits
             elif ftype == "l":
                 mode = stat.S_IFLNK | 0o777
+            else:
+                mode = stat.S_IFREG | perm_bits
 
             child_path = os.path.join(path, name)
             child_inode = self._get_inode(child_path)
 
+            # Parse size and timestamp from API response
+            size_str = (f.get("size") if isinstance(f, dict)
+                        else getattr(f, "size", "0"))
+            try:
+                file_size = int(size_str)
+            except (ValueError, TypeError):
+                file_size = 0
+
+            last_mod = (f.get("lastModified") if isinstance(f, dict)
+                        else getattr(f, "lastModified", None))
+            mtime_ns = _parse_timestamp(last_mod) if last_mod else 0
+
             attr = pyfuse3.EntryAttributes()
             attr.st_ino = child_inode
             attr.st_mode = mode
+            attr.st_nlink = 2 if ftype == "d" else 1
+            attr.st_uid = local_uid
+            attr.st_gid = local_gid
+            attr.st_size = file_size
+            attr.st_atime_ns = mtime_ns
+            attr.st_mtime_ns = mtime_ns
+            attr.st_ctime_ns = mtime_ns
+            attr.entry_timeout = self.cache_ttl
+            attr.attr_timeout = 0
 
             entries.append((name.encode("utf-8"), attr))
 
@@ -447,9 +605,11 @@ class FirecrestFS(pyfuse3.Operations):
                 blocking=True,
             )
 
-            # Invalidate cache
+            # Re-stat to populate cache with new mtime so editors
+            # don't see a stale mtime on their post-save check
             if path in self.attr_cache:
                 del self.attr_cache[path]
+            await self._fc_stat(path)
 
         except Exception as e:
             logger.error(f"Upload failed: {e}")
@@ -623,6 +783,10 @@ class FirecrestFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EROFS)
 
         path = os.path.join(self._inode_to_path(parent_inode), name.decode("utf-8"))
+
+        # Invalidate negative cache since file is being created
+        if path in self.negative_cache:
+            del self.negative_cache[path]
 
         fh = self.next_fh
         self.next_fh += 1
