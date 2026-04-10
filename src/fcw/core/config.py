@@ -456,3 +456,240 @@ def add_container_to_config(
 
     lines.insert(insert_idx, snippet)
     config_path.write_text("".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Round-trip YAML editing via ruamel.yaml
+# ---------------------------------------------------------------------------
+
+def _load_yaml_roundtrip(config_path: Path) -> tuple:
+    """Load YAML with ruamel for round-trip editing.
+
+    Returns:
+        Tuple of (yaml_instance, data) where data is a CommentedMap.
+    """
+    from ruamel.yaml import YAML
+
+    ryaml = YAML()
+    ryaml.preserve_quotes = True
+    with open(config_path) as f:
+        data = ryaml.load(f)
+    if data is None:
+        from ruamel.yaml.comments import CommentedMap
+
+        data = CommentedMap()
+    return ryaml, data
+
+
+def _save_yaml_roundtrip(config_path: Path, ryaml: Any, data: Any) -> None:
+    """Write YAML back preserving comments and formatting."""
+    from io import StringIO
+
+    stream = StringIO()
+    ryaml.dump(data, stream)
+    config_path.write_text(stream.getvalue())
+
+
+def add_directory_to_config(config_path: Path, path: str, dir_type: DirectoryType) -> None:
+    """Add a directory entry to fcw.yaml using round-trip YAML editing.
+
+    Creates the ``directories:`` section if it does not exist.
+
+    Raises:
+        ValueError: If *path* already exists in the directories section.
+    """
+    from ruamel.yaml.comments import CommentedMap
+
+    ryaml, data = _load_yaml_roundtrip(config_path)
+    if "directories" not in data:
+        data["directories"] = CommentedMap()
+    dirs = data["directories"]
+    if path in dirs:
+        raise ValueError(f"Directory '{path}' already exists in config")
+    entry = CommentedMap()
+    entry["type"] = dir_type.value
+    dirs[path] = entry
+    _save_yaml_roundtrip(config_path, ryaml, data)
+
+
+def remove_directory_from_config(config_path: Path, path: str) -> None:
+    """Remove a directory entry from fcw.yaml.
+
+    Raises:
+        ValueError: If *path* is not found in the directories section.
+    """
+    ryaml, data = _load_yaml_roundtrip(config_path)
+    dirs = data.get("directories")
+    if dirs is None or path not in dirs:
+        raise ValueError(f"Directory '{path}' not found in config")
+    del dirs[path]
+    _save_yaml_roundtrip(config_path, ryaml, data)
+
+
+def add_container_to_config_roundtrip(
+    config_path: Path,
+    name: str,
+    container: ContainerConfig,
+) -> None:
+    """Add a container entry to fcw.yaml using round-trip YAML editing.
+
+    Creates the ``containers:`` section if it does not exist.
+
+    Raises:
+        ValueError: If *name* already exists in the containers section.
+    """
+    from ruamel.yaml.comments import CommentedMap
+
+    ryaml, data = _load_yaml_roundtrip(config_path)
+    if "containers" not in data:
+        data["containers"] = CommentedMap()
+    conts = data["containers"]
+    if name in conts:
+        raise ValueError(f"Container '{name}' already exists in config")
+    entry = CommentedMap()
+    entry["file"] = container.file
+    entry["tag"] = container.tag
+    if container.remote_path is not None:
+        entry["remote_path"] = container.remote_path
+    if container.stage is not None:
+        entry["stage"] = container.stage
+    if container.toml is not None:
+        entry["toml"] = container.toml
+    if container.platform is not None:
+        entry["platform"] = container.platform
+    if container.build_args:
+        entry["build_args"] = dict(container.build_args)
+    if container.local_stages is not None:
+        entry["local_stages"] = list(container.local_stages)
+    if container.remote_stage is not None:
+        entry["remote_stage"] = container.remote_stage
+    conts[name] = entry
+    _save_yaml_roundtrip(config_path, ryaml, data)
+
+
+def remove_container_from_config(config_path: Path, name: str) -> None:
+    """Remove a container entry from fcw.yaml.
+
+    Raises:
+        ValueError: If *name* is not found in the containers section.
+    """
+    ryaml, data = _load_yaml_roundtrip(config_path)
+    conts = data.get("containers")
+    if conts is None or name not in conts:
+        raise ValueError(f"Container '{name}' not found in config")
+    del conts[name]
+    _save_yaml_roundtrip(config_path, ryaml, data)
+
+
+def add_job_to_config(config_path: Path, name: str, job: JobConfig) -> None:
+    """Add a job entry to fcw.yaml using round-trip YAML editing.
+
+    Creates the ``jobs:`` section if it does not exist.
+
+    Raises:
+        ValueError: If *name* already exists in the jobs section.
+    """
+    from ruamel.yaml.comments import CommentedMap
+
+    ryaml, data = _load_yaml_roundtrip(config_path)
+    if "jobs" not in data:
+        data["jobs"] = CommentedMap()
+    jobs = data["jobs"]
+    if name in jobs:
+        raise ValueError(f"Job '{name}' already exists in config")
+    entry = CommentedMap()
+    entry["script"] = job.script
+    if job.container is not None:
+        entry["container"] = job.container
+    if job.time is not None:
+        from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
+        entry["time"] = DoubleQuotedScalarString(job.time)
+    if job.nodes is not None:
+        entry["nodes"] = job.nodes
+    if job.gpus_per_node is not None:
+        entry["gpus_per_node"] = job.gpus_per_node
+    if job.cpus_per_task is not None:
+        entry["cpus_per_task"] = job.cpus_per_task
+    if job.env:
+        entry["env"] = dict(job.env)
+    jobs[name] = entry
+    _save_yaml_roundtrip(config_path, ryaml, data)
+
+
+def remove_job_from_config(config_path: Path, name: str) -> None:
+    """Remove a job entry from fcw.yaml.
+
+    Raises:
+        ValueError: If *name* is not found in the jobs section.
+    """
+    ryaml, data = _load_yaml_roundtrip(config_path)
+    jobs = data.get("jobs")
+    if jobs is None or name not in jobs:
+        raise ValueError(f"Job '{name}' not found in config")
+    del jobs[name]
+    _save_yaml_roundtrip(config_path, ryaml, data)
+
+
+def generate_interactive_config(project: str, remote_workdir: str, local_workdir: str) -> str:
+    """Generate an fcw.yaml template with the given project settings.
+
+    Follows the conventions from the basic example: ce-images/ for container
+    images, data/ prefix for data directories, config/ as type in.
+    """
+    return f'''\
+# fcw configuration file
+project: {project}
+
+# Workdir mapping - all paths are relative to this
+workdir:
+  remote: {remote_workdir}
+  local: {local_workdir}
+
+# Directory declarations with data flow type
+# type: in (upload only), out (download only), both (bidirectional)
+directories:
+  data/raw:
+    type: in
+  data/processed:
+    type: out
+  data/outputs:
+    type: out
+  config:
+    type: in
+
+# Container definitions
+containers:
+  app:
+    file: ./env/Dockerfile
+    tag: {project}:latest
+    remote_path: ./ce-images/
+    toml: ./env/container.toml    # optional, user-editable enroot environment
+
+# Job definitions with environment
+# container: references a container name from the containers section;
+# at submit time, fcw inlines the TOML into the script and resolves the image path
+jobs:
+  preprocess:
+    script: slurm/preprocess.sh
+    container: app
+    env:
+      DATA_IN: data/raw
+      DATA_OUT: data/processed
+
+  train:
+    script: slurm/train.sh
+    container: app
+    time: "12:00:00"
+    nodes: 1
+    env:
+      DATA_DIR: data/processed
+      OUTPUT_DIR: data/outputs
+      CONFIG_DIR: config
+
+  evaluate:
+    script: slurm/evaluate.sh
+    container: app
+    env:
+      MODEL_DIR: data/outputs
+'''

@@ -2,29 +2,74 @@
 
 import asyncio
 import os
+import sys
 import time
 from pathlib import Path
+from typing import List, Optional
 
 import typer
 from rich.table import Table
 
 from fcw.core import (
+    ContainerConfig,
+    DirectoryType,
+    JobConfig,
+    add_container_to_config_roundtrip,
+    add_directory_to_config,
+    add_job_to_config,
     generate_default_config,
+    generate_interactive_config,
     get_async_client,
     get_client,
     get_console,
     get_system,
     load_config,
+    remove_container_from_config,
+    remove_directory_from_config,
+    remove_job_from_config,
 )
 
 app = typer.Typer(no_args_is_help=True)
 _console = get_console
 
+# Nested sub-typers for managing config sections
+directory_app = typer.Typer(no_args_is_help=True)
+container_app = typer.Typer(no_args_is_help=True)
+job_app = typer.Typer(no_args_is_help=True)
+
+app.add_typer(directory_app, name="directory", help="Manage directory entries")
+app.add_typer(container_app, name="container", help="Manage container entries")
+app.add_typer(job_app, name="job", help="Manage job entries")
+
+
+def _is_interactive() -> bool:
+    """Check if stdin is a TTY (interactive terminal)."""
+    return sys.stdin.isatty()
+
+
+def _resolve_config_path(ctx: typer.Context) -> Path:
+    """Resolve config file path from context or default to ./fcw.yaml."""
+    custom = (ctx.obj or {}).get("config_file")
+    if custom:
+        p = Path(custom)
+        if not p.exists():
+            _console().print(f"[red]Config file not found: {custom}[/red]")
+            raise typer.Exit(1)
+        return p
+    default = Path.cwd() / "fcw.yaml"
+    if not default.exists():
+        _console().print("[red]No fcw.yaml found. Run 'fcw config init' first.[/red]")
+        raise typer.Exit(1)
+    return default
+
 
 @app.command()
 def init(
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing config"),
-):
+    non_interactive: bool = typer.Option(
+        False, "--non-interactive", help="Skip prompts, use static template"
+    ),
+) -> None:
     """Create fcw.yaml template in current directory."""
     config_path = Path.cwd() / "fcw.yaml"
 
@@ -33,10 +78,219 @@ def init(
         _console().print("Use --force to overwrite.")
         raise typer.Exit(1)
 
-    config_path.write_text(generate_default_config())
+    if non_interactive or not _is_interactive():
+        config_path.write_text(generate_default_config())
+    else:
+        project = typer.prompt("Project name", default=Path.cwd().name)
+        remote_workdir = typer.prompt(
+            "Remote workdir", default=f"${{FIRECREST_SCRATCH}}/{project}"
+        )
+        local_workdir = typer.prompt("Local workdir", default=".")
+        config_path.write_text(
+            generate_interactive_config(project, remote_workdir, local_workdir)
+        )
+
     _console().print(f"[green]Created config file: {config_path}[/green]")
     _console().print("\nEdit the file to configure your project, then run:")
     _console().print("  fcw config validate")
+
+
+# ---------------------------------------------------------------------------
+# Directory sub-commands
+# ---------------------------------------------------------------------------
+
+
+@directory_app.command("add")
+def directory_add(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="Directory path (e.g., data/raw)"),
+    type: DirectoryType = typer.Option(DirectoryType.BOTH, "--type", "-t", help="Directory type"),
+) -> None:
+    """Add a directory entry to fcw.yaml."""
+    config_path = _resolve_config_path(ctx)
+    try:
+        add_directory_to_config(config_path, path, type)
+        _console().print(f"[green]Added directory '{path}' (type: {type.value})[/green]")
+    except ValueError as e:
+        _console().print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@directory_app.command("remove")
+def directory_remove(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="Directory path to remove"),
+) -> None:
+    """Remove a directory entry from fcw.yaml."""
+    config_path = _resolve_config_path(ctx)
+    try:
+        remove_directory_from_config(config_path, path)
+        _console().print(f"[green]Removed directory '{path}'[/green]")
+    except ValueError as e:
+        _console().print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@directory_app.command("list")
+def directory_list(ctx: typer.Context) -> None:
+    """List configured directories."""
+    config_path = _resolve_config_path(ctx)
+    config = load_config(str(config_path))
+    if not config.directories:
+        _console().print("[yellow]No directories configured.[/yellow]")
+        return
+    table = Table(show_header=True)
+    table.add_column("Path")
+    table.add_column("Type")
+    for path, dir_config in config.directories.items():
+        table.add_row(path, dir_config.type.value)
+    _console().print(table)
+
+
+# ---------------------------------------------------------------------------
+# Container sub-commands
+# ---------------------------------------------------------------------------
+
+
+@container_app.command("add")
+def container_add(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Container name"),
+    file: str = typer.Option(..., "--file", "-f", help="Dockerfile path"),
+    tag: str = typer.Option(..., "--tag", "-t", help="Image tag"),
+    remote_path: Optional[str] = typer.Option(None, "--remote-path", help="Remote image directory"),
+    toml: Optional[str] = typer.Option(None, "--toml", help="Container TOML path"),
+    platform: Optional[str] = typer.Option(None, "--platform", help="Target platform"),
+) -> None:
+    """Add a container entry to fcw.yaml."""
+    config_path = _resolve_config_path(ctx)
+    container = ContainerConfig(
+        file=file,
+        tag=tag,
+        remote_path=remote_path,
+        toml=toml,
+        platform=platform,
+    )
+    try:
+        add_container_to_config_roundtrip(config_path, name, container)
+        _console().print(f"[green]Added container '{name}' (tag: {tag})[/green]")
+    except ValueError as e:
+        _console().print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@container_app.command("remove")
+def container_remove(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Container name to remove"),
+) -> None:
+    """Remove a container entry from fcw.yaml."""
+    config_path = _resolve_config_path(ctx)
+    try:
+        remove_container_from_config(config_path, name)
+        _console().print(f"[green]Removed container '{name}'[/green]")
+    except ValueError as e:
+        _console().print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@container_app.command("list")
+def container_list(ctx: typer.Context) -> None:
+    """List configured containers."""
+    config_path = _resolve_config_path(ctx)
+    config = load_config(str(config_path))
+    if not config.containers:
+        _console().print("[yellow]No containers configured.[/yellow]")
+        return
+    table = Table(show_header=True)
+    table.add_column("Name")
+    table.add_column("Tag")
+    table.add_column("Remote Path")
+    for name, cont_config in config.containers.items():
+        table.add_row(name, cont_config.tag, cont_config.remote_path or "-")
+    _console().print(table)
+
+
+# ---------------------------------------------------------------------------
+# Job sub-commands
+# ---------------------------------------------------------------------------
+
+
+@job_app.command("add")
+def job_add(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Job name"),
+    script: str = typer.Option(..., "--script", "-s", help="SLURM script path"),
+    container: Optional[str] = typer.Option(None, "--container", "-c", help="Container name"),
+    env: Optional[List[str]] = typer.Option(None, "--env", "-e", help="Env var: KEY=VALUE"),
+    time: Optional[str] = typer.Option(None, "--time", help="SBATCH time limit"),
+    nodes: Optional[int] = typer.Option(None, "--nodes", help="SBATCH node count"),
+    gpus_per_node: Optional[int] = typer.Option(None, "--gpus-per-node", help="SBATCH GPUs/node"),
+    cpus_per_task: Optional[int] = typer.Option(None, "--cpus-per-task", help="SBATCH CPUs/task"),
+) -> None:
+    """Add a job entry to fcw.yaml."""
+    config_path = _resolve_config_path(ctx)
+    env_dict: dict[str, str] = {}
+    if env:
+        for item in env:
+            if "=" not in item:
+                _console().print(f"[red]Invalid --env format: '{item}' (expected KEY=VALUE)[/red]")
+                raise typer.Exit(1)
+            k, v = item.split("=", 1)
+            env_dict[k] = v
+    job = JobConfig(
+        script=script,
+        container=container,
+        env=env_dict,
+        time=time,
+        nodes=nodes,
+        gpus_per_node=gpus_per_node,
+        cpus_per_task=cpus_per_task,
+    )
+    try:
+        add_job_to_config(config_path, name, job)
+        _console().print(f"[green]Added job '{name}' (script: {script})[/green]")
+    except ValueError as e:
+        _console().print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@job_app.command("remove")
+def job_remove(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Job name to remove"),
+) -> None:
+    """Remove a job entry from fcw.yaml."""
+    config_path = _resolve_config_path(ctx)
+    try:
+        remove_job_from_config(config_path, name)
+        _console().print(f"[green]Removed job '{name}'[/green]")
+    except ValueError as e:
+        _console().print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@job_app.command("list")
+def job_list(ctx: typer.Context) -> None:
+    """List configured jobs."""
+    config_path = _resolve_config_path(ctx)
+    config = load_config(str(config_path))
+    if not config.jobs:
+        _console().print("[yellow]No jobs configured.[/yellow]")
+        return
+    table = Table(show_header=True)
+    table.add_column("Name")
+    table.add_column("Script")
+    table.add_column("Container")
+    table.add_column("Time")
+    for name, job_config in config.jobs.items():
+        table.add_row(
+            name,
+            job_config.script,
+            job_config.container or "-",
+            str(job_config.time) if job_config.time is not None else "-",
+        )
+    _console().print(table)
 
 
 @app.command()

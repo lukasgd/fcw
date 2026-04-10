@@ -10,11 +10,19 @@ from fcw.core.config import (
     ContainerConfig,
     DirectoryType,
     FcwConfig,
+    JobConfig,
     add_container_to_config,
+    add_container_to_config_roundtrip,
+    add_directory_to_config,
+    add_job_to_config,
     expand_config_refs,
     expand_env_vars,
     generate_default_config,
+    generate_interactive_config,
     load_config,
+    remove_container_from_config,
+    remove_directory_from_config,
+    remove_job_from_config,
 )
 
 
@@ -429,3 +437,441 @@ jobs:
         assert not any("remote_path" in l for l in entry_lines)
         assert not any("stage" in l for l in entry_lines)
         assert not any("toml" in l for l in entry_lines)
+
+
+# ---------------------------------------------------------------------------
+# Round-trip YAML editing tests
+# ---------------------------------------------------------------------------
+
+
+class TestAddDirectoryToConfig:
+    def test_adds_entry(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_directory_to_config(config_path, "data/new", DirectoryType.IN)
+        config = load_config(str(config_path))
+        assert "data/new" in config.directories
+        assert config.directories["data/new"].type == DirectoryType.IN
+        # Original entries still intact
+        assert "data/raw" in config.directories
+        assert "data/processed" in config.directories
+
+    def test_creates_directories_block(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text("project: test\nworkdir:\n  remote: /tmp\n  local: .\n")
+        add_directory_to_config(config_path, "data/raw", DirectoryType.IN)
+        config = load_config(str(config_path))
+        assert "data/raw" in config.directories
+        assert config.directories["data/raw"].type == DirectoryType.IN
+
+    def test_duplicate_raises(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        with pytest.raises(ValueError, match="already exists"):
+            add_directory_to_config(config_path, "data/raw", DirectoryType.IN)
+
+    def test_preserves_comments(self, tmp_path):
+        yaml_text = """\
+# My project
+project: test
+
+# Data directories
+directories:
+  data/raw:
+    type: in
+
+jobs:
+  train:
+    script: train.sh
+"""
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(yaml_text)
+        add_directory_to_config(config_path, "outputs", DirectoryType.OUT)
+        content = config_path.read_text()
+        assert "# My project" in content
+        assert "# Data directories" in content
+        config = load_config(str(config_path))
+        assert "outputs" in config.directories
+
+
+class TestRemoveDirectoryFromConfig:
+    def test_removes_entry(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        remove_directory_from_config(config_path, "data/raw")
+        config = load_config(str(config_path))
+        assert "data/raw" not in config.directories
+        # Other entries preserved
+        assert "data/processed" in config.directories
+
+    def test_missing_raises(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        with pytest.raises(ValueError, match="not found"):
+            remove_directory_from_config(config_path, "nonexistent")
+
+    def test_missing_section_raises(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text("project: test\n")
+        with pytest.raises(ValueError, match="not found"):
+            remove_directory_from_config(config_path, "data/raw")
+
+
+class TestAddContainerRoundtrip:
+    def test_adds_entry(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_container_to_config_roundtrip(
+            config_path,
+            "app-v2",
+            ContainerConfig(file="./Dockerfile", tag="my-app:v2", remote_path="./ce-images/"),
+        )
+        config = load_config(str(config_path))
+        assert "app-v2" in config.containers
+        assert config.containers["app-v2"].tag == "my-app:v2"
+        assert "app" in config.containers
+
+    def test_duplicate_raises(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        with pytest.raises(ValueError, match="already exists"):
+            add_container_to_config_roundtrip(
+                config_path,
+                "app",
+                ContainerConfig(file="./Dockerfile", tag="dup:v1"),
+            )
+
+    def test_creates_containers_block(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text("project: test\nworkdir:\n  remote: /tmp\n  local: .\n")
+        add_container_to_config_roundtrip(
+            config_path,
+            "app",
+            ContainerConfig(file="./Dockerfile", tag="app:v1"),
+        )
+        config = load_config(str(config_path))
+        assert "app" in config.containers
+
+    def test_optional_fields_omitted(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_container_to_config_roundtrip(
+            config_path,
+            "minimal",
+            ContainerConfig(file="./Dockerfile", tag="minimal:v1"),
+        )
+        config = load_config(str(config_path))
+        assert config.containers["minimal"].remote_path is None
+        assert config.containers["minimal"].toml is None
+
+
+class TestRemoveContainerFromConfig:
+    def test_removes_entry(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        remove_container_from_config(config_path, "aux")
+        config = load_config(str(config_path))
+        assert "aux" not in config.containers
+        assert "app" in config.containers
+
+    def test_missing_raises(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        with pytest.raises(ValueError, match="not found"):
+            remove_container_from_config(config_path, "nonexistent")
+
+
+class TestAddJobToConfig:
+    def test_adds_entry(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_job_to_config(
+            config_path,
+            "evaluate",
+            JobConfig(script="slurm/evaluate.sh", container="app"),
+        )
+        config = load_config(str(config_path))
+        assert "evaluate" in config.jobs
+        assert config.jobs["evaluate"].script == "slurm/evaluate.sh"
+        assert config.jobs["evaluate"].container == "app"
+
+    def test_with_env_and_sbatch(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_job_to_config(
+            config_path,
+            "benchmark",
+            JobConfig(
+                script="slurm/bench.sh",
+                time="1:00:00",
+                nodes=2,
+                env={"DATA": "data/raw"},
+            ),
+        )
+        config = load_config(str(config_path))
+        assert config.jobs["benchmark"].time == "1:00:00"
+        assert config.jobs["benchmark"].nodes == 2
+        assert config.jobs["benchmark"].env == {"DATA": "data/raw"}
+
+    def test_duplicate_raises(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        with pytest.raises(ValueError, match="already exists"):
+            add_job_to_config(
+                config_path,
+                "preprocess",
+                JobConfig(script="slurm/preprocess.sh"),
+            )
+
+    def test_creates_jobs_block(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text("project: test\nworkdir:\n  remote: /tmp\n  local: .\n")
+        add_job_to_config(
+            config_path,
+            "train",
+            JobConfig(script="train.sh"),
+        )
+        config = load_config(str(config_path))
+        assert "train" in config.jobs
+
+
+class TestRemoveJobFromConfig:
+    def test_removes_entry(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        remove_job_from_config(config_path, "preprocess")
+        config = load_config(str(config_path))
+        assert "preprocess" not in config.jobs
+        assert "train" in config.jobs
+
+    def test_missing_raises(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        with pytest.raises(ValueError, match="not found"):
+            remove_job_from_config(config_path, "nonexistent")
+
+
+class TestGenerateInteractiveConfig:
+    def test_valid_yaml(self):
+        config_str = generate_interactive_config("my-project", "/scratch/my-project", ".")
+        data = yaml.safe_load(config_str)
+        assert data["project"] == "my-project"
+        assert data["workdir"]["remote"] == "/scratch/my-project"
+        assert data["workdir"]["local"] == "."
+        assert "directories" in data
+        assert "containers" in data
+        assert "jobs" in data
+
+    def test_project_name_in_tag(self):
+        config_str = generate_interactive_config("cool-app", "/scratch/cool-app", ".")
+        data = yaml.safe_load(config_str)
+        assert data["containers"]["app"]["tag"] == "cool-app:latest"
+
+    def test_roundtrip(self, tmp_path):
+        config_str = generate_interactive_config("test-proj", "/scratch/test-proj", ".")
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(config_str)
+        config = load_config(str(config_path))
+        assert config.project == "test-proj"
+
+
+# ---------------------------------------------------------------------------
+# CLI integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigInitInteractive:
+    def test_non_interactive_flag(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(main_app, ["config", "init", "--non-interactive"])
+        assert result.exit_code == 0
+        config_path = tmp_path / "fcw.yaml"
+        assert config_path.exists()
+        data = yaml.safe_load(config_path.read_text())
+        assert data["project"] == "my-fcw-app"
+
+    def test_interactive_prompts(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("fcw.commands.config._is_interactive", lambda: True)
+        runner = CliRunner()
+        result = runner.invoke(
+            main_app,
+            ["config", "init"],
+            input="cool-project\n/scratch/cool-project\n.\n",
+        )
+        assert result.exit_code == 0
+        config_path = tmp_path / "fcw.yaml"
+        data = yaml.safe_load(config_path.read_text())
+        assert data["project"] == "cool-project"
+        assert data["workdir"]["remote"] == "/scratch/cool-project"
+
+    def test_force_overwrite(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text("project: old\n")
+        runner = CliRunner()
+        result = runner.invoke(
+            main_app, ["config", "init", "--force", "--non-interactive"]
+        )
+        assert result.exit_code == 0
+        data = yaml.safe_load((tmp_path / "fcw.yaml").read_text())
+        assert data["project"] == "my-fcw-app"
+
+    def test_existing_config_without_force(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text("project: old\n")
+        runner = CliRunner()
+        result = runner.invoke(
+            main_app, ["config", "init", "--non-interactive"]
+        )
+        assert result.exit_code == 1
+
+
+class TestConfigDirectoryCLI:
+    def test_add_and_list(self, tmp_path, monkeypatch, sample_config_yaml):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text(sample_config_yaml)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main_app, ["config", "directory", "add", "data/new", "--type", "in"]
+        )
+        assert result.exit_code == 0
+
+        result = runner.invoke(main_app, ["config", "directory", "list"])
+        assert result.exit_code == 0
+        assert "data/new" in result.output
+
+    def test_remove(self, tmp_path, monkeypatch, sample_config_yaml):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text(sample_config_yaml)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main_app, ["config", "directory", "remove", "data/raw"]
+        )
+        assert result.exit_code == 0
+
+        config = load_config(str(tmp_path / "fcw.yaml"))
+        assert "data/raw" not in config.directories
+
+
+class TestConfigContainerCLI:
+    def test_add_and_list(self, tmp_path, monkeypatch, sample_config_yaml):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text(sample_config_yaml)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main_app,
+            ["config", "container", "add", "gpu-app", "--file", "Dockerfile", "--tag", "gpu:v1"],
+        )
+        assert result.exit_code == 0
+
+        result = runner.invoke(main_app, ["config", "container", "list"])
+        assert result.exit_code == 0
+        assert "gpu-app" in result.output
+
+    def test_remove(self, tmp_path, monkeypatch, sample_config_yaml):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text(sample_config_yaml)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main_app, ["config", "container", "remove", "aux"]
+        )
+        assert result.exit_code == 0
+
+        config = load_config(str(tmp_path / "fcw.yaml"))
+        assert "aux" not in config.containers
+
+
+class TestConfigJobCLI:
+    def test_add_and_list(self, tmp_path, monkeypatch, sample_config_yaml):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text(sample_config_yaml)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main_app,
+            [
+                "config", "job", "add", "evaluate",
+                "--script", "slurm/eval.sh",
+                "--container", "app",
+                "--env", "MODEL_DIR=outputs",
+                "--time", "2:00:00",
+            ],
+        )
+        assert result.exit_code == 0
+
+        result = runner.invoke(main_app, ["config", "job", "list"])
+        assert result.exit_code == 0
+        assert "evaluate" in result.output
+
+    def test_remove(self, tmp_path, monkeypatch, sample_config_yaml):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text(sample_config_yaml)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main_app, ["config", "job", "remove", "preprocess"]
+        )
+        assert result.exit_code == 0
+
+        config = load_config(str(tmp_path / "fcw.yaml"))
+        assert "preprocess" not in config.jobs
+
+    def test_add_invalid_env_format(self, tmp_path, monkeypatch, sample_config_yaml):
+        from typer.testing import CliRunner
+
+        from fcw.cli import app as main_app
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "fcw.yaml").write_text(sample_config_yaml)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            main_app,
+            ["config", "job", "add", "bad", "--script", "s.sh", "--env", "NOEQUALS"],
+        )
+        assert result.exit_code == 1

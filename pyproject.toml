@@ -33,6 +33,7 @@ dependencies = [
     "typer>=0.9.0",
     "rich>=13.0.0",
     "pyyaml>=6.0",
+    "ruamel.yaml>=0.17.0",
 ]
 
 [project.optional-dependencies]
