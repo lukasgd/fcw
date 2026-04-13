@@ -1,18 +1,13 @@
-# fcw configuration file
 project: node-burn
 
-# Workdir mapping - all paths are relative to this
 workdir:
   remote: ${FIRECREST_SCRATCH}/node-burn-${FCW_NODE_BURN_RUN_ID}
   local: .
 
-# Directory declarations with data flow type
-# type: in (upload only), out (download only), both (bidirectional)
 directories:
   config:
     type: in
 
-# Container definitions
 containers:
   node-burn:
     file: ./env/Dockerfile.multistage
@@ -22,14 +17,11 @@ containers:
     platform: linux/arm64
     build_args:
       BASE_IMAGE: nvidia/cuda:12.4.1-devel-ubuntu22.04
-      RUNTIME_IMAGE: nvidia/cuda:12.4.1-runtime-ubuntu22.04
+      RUNTIME_BASE_IMAGE: nvidia/cuda:12.4.1-runtime-ubuntu22.04
       NODEBURN_COMMIT_ID: be4f759
     local_stages: [download, runtime-download]
     remote_stage: build-offline
 
-# Job definitions with environment
-# container: references a container from the containers section;
-# at submit time, fcw inlines the TOML and resolves the image path automatically
 jobs:
   node-burn:
     script: slurm/submit-node-burn.sh

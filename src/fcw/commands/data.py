@@ -607,3 +607,5 @@ def status(
         table.add_row(path, dir_config.type.value, push_str, pull_str)
     
     _console().print(table)
+
+# FIXME: ls has already been implemented, others from pyfirerest not, e.g. mkdir, mv, chmod, chown, cp, compress, extract, file, stat, symlink, checksum, head, tail. However, for productivity these commands should probably be implemented relative to the remote workdir, possibly even relative to the current local working directory.

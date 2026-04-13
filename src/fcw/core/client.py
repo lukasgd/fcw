@@ -45,7 +45,7 @@ def _get_firecrest_url() -> str:
     return url
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=1)  # FIXME: can you explain how the client is reused across calls? 
 def get_client() -> "Firecrest":
     """Get a synchronous FirecREST v2 client.
     

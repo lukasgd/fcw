@@ -1,6 +1,7 @@
 ARG BASE_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04
-ARG RUNTIME_IMAGE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
+ARG RUNTIME_BASE_IMAGE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
 ARG DOWNLOAD_IMAGE=download
+ARG RUNTIME_DOWNLOAD_IMAGE=runtime-download
 
 FROM ${BASE_IMAGE} AS download
 
@@ -45,10 +46,11 @@ RUN cd /workspace/build_deps/apt-runtime \
     fi \
     && mv /var/cache/apt/archives/*.deb ./
 
+FROM ${RUNTIME_BASE_IMAGE} AS runtime-download
 
 FROM ${DOWNLOAD_IMAGE} AS download-copy
 
-FROM ${RUNTIME_IMAGE} AS runtime-download
+FROM ${RUNTIME_DOWNLOAD_IMAGE} AS runtime-download-copy
 
 FROM ${BASE_IMAGE} AS build-offline-compile
 
@@ -81,7 +83,7 @@ RUN cp -r /workspace/build_deps/src/node-burn /workspace/node-burn \
     && rm -rf /workspace/node-burn
 
 
-FROM ${RUNTIME_IMAGE} AS build-offline
+FROM ${RUNTIME_BASE_IMAGE} AS build-offline
 
 
 # Propagate the root artifact analogous to the original target image

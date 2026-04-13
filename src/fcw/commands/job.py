@@ -96,7 +96,7 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
             
             # Parse the SBATCH option from this line
             # Handles: #SBATCH --key=value, #SBATCH --key value, #SBATCH -k value
-            for key, value in overrides.items():
+            for key, value in overrides.items(): # FIXME: does this handle (or error on) multiple SBATCH options on the same line? Furthermore, where is #SBATCH -k value handled? Or should we let SLURM just report an error if the user uses inconsistent overrides (maybe easier)?
                 # Match both --key=... and --key ...
                 pattern = rf'^\s*#SBATCH\s+--{re.escape(key)}(?:=|\s+)(\S+)'
                 match = re.match(pattern, line)
@@ -126,7 +126,7 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
         else:
             insert_idx = 0
         
-        for directive in reversed(new_directives):
+        for directive in reversed(new_directives):  # FIXME: why reverse? Does this enforce some kind of precedence?
             lines.insert(insert_idx, directive)
     
     return "\n".join(lines)
@@ -191,13 +191,13 @@ def _resolve_job_env(config, job_config, overrides: dict[str, str]) -> dict[str,
     
     for key, value in job_config.env.items():
         # Expand relative paths
-        if not value.startswith("/") and not value.startswith("$"):
+        if not value.startswith("/") and not value.startswith("$"):  # FIXME: probably we don't need all environment variables to be resolved as remote paths
             value = config.resolve_path(value, remote=True)
         env[key] = value
     
     # Apply overrides (resolve relative paths the same way as config values)
     for key, value in overrides.items():
-        if not value.startswith("/") and not value.startswith("$"):
+        if not value.startswith("/") and not value.startswith("$"):  #FIXME: probably we don't need all environment variables to be resolved as remote paths
             value = config.resolve_path(value, remote=True)
         env[key] = value
 
@@ -505,7 +505,7 @@ def submit_job(
     # Inject container TOML before env vars (ordering matters).
     # When submitting a raw script (not a config job), infer the container
     # if the script references FCW_CONTAINER_TOML.
-    if not container_name and "FCW_CONTAINER_TOML" in script_content:
+    if not container_name and "FCW_CONTAINER_TOML" in script_content:  # FIXME: Why not requiring the user to explicitly specify the container with --container when submitting a script instead of a named job, if FCW_CONTAINER_TOML is present? One could also offer the option to override the toml by having an extra option --environment (both for named jobs and script submissions). If FCW_CONTAINER_TOML is absent, should check that --environment is not being used, otherwise inform user that container environment is not managed by fcw. Probably any srun with a --environment option that doesn't evaluate to an FCW_CONTAINER_TOML injection should be logged to the user so they don't accidentally bypass the fcw-managed container environment without realizing it.
         # Try to find a job config that uses this script
         for jname, jcfg in config.jobs.items():
             if jcfg.script == script_path and jcfg.container:
@@ -601,7 +601,7 @@ def submit_job(
         "ignore_unknown_options": True,
     },
 )
-def run_command(
+def run_command( # FIXME: should probably enable running commands in a container from the config (e.g. with --container, possibly also overriding the TOML with --environment). Supporting containers here is not quite straightforward as they act on srun commands and one wouldn't want to user to write complicated srun-commands with --environment FCW_CONTAINER_TOML - maybe fcw can just inject the TOML if a container is specified (alternatively use special shorthand for srun with container)? Also note that submit has some more options - it seems especially --dry-run would be useful here as well. 
     ctx: typer.Context,
     time: str = typer.Option("00:30:00", "--time", "-t", help="Default time limit"),
     nodes: int = typer.Option(1, "--nodes", "-N", help="Default number of nodes"),
@@ -624,7 +624,7 @@ def run_command(
 
         # With dependency
         fcw job run --dependency afterok:12345 -- 'python analyze.py'
-    """
+    """  # FIXME: the python example command should be run inside a suitable container
     config, system, account = resolve_context(ctx)
 
     args = ctx.args
@@ -642,7 +642,7 @@ def run_command(
         "job-name": "fcw-run",
         "time": time,
         "nodes": str(nodes),
-        "output": "fcw-run-%j.out",
+        "output": "fcw-run-%j.out",  # FIXME: consider using a dedicated output directory for fcw-related log files (be it from running commands, building containers, etc.) to avoid cluttering the user's working directory. This would also make it easier to find logs related to a specific job or command, and to manage them (e.g. cleanup old logs).
     }
     sbatch_final = {**sbatch_defaults, **get_global_sbatch_options(), **sbatch_overrides}
     
@@ -667,7 +667,7 @@ def run_command(
         # + pyxis segfault is fixed
         if remote_script:
             remote_scripts_dir = f"{working_dir}/.fcw/scripts"
-            remote_filename = "fcw-run.sh"
+            remote_filename = "fcw-run.sh"  # FIXME: make script name unique to avoid collisions if multiple fcw-run commands are submitted in a short time frame?
             client.mkdir(system_name=system, path=remote_scripts_dir, create_parents=True)
             client.upload(
                 system_name=system,
@@ -728,7 +728,7 @@ def job_status(
 
 
 @app.command("logs")
-def job_logs(
+def job_logs( # FIXME: this currently follows only stdout. Consider also supporting stderr (e.g. by checking job metadata for separate stderr path, or by allowing the user to specify which stream to follow). Furthermore, consider supporting the case where stdout and stderr are combined into a single file (e.g. by checking job metadata for a single output path and documenting that behavior).
     ctx: typer.Context,
     job_id: str = typer.Argument(..., help="Job ID"),
     tail: bool = typer.Option(False, "--tail", help="Show last lines only"),
@@ -799,7 +799,7 @@ def job_logs(
                 )
                 output_lines = output.split("\n")
                 
-                if follow:
+                if follow:  # FIXME: this is faulty because seen_lines points into the current tail output, which gets reset every 2 seconds. To properly implement --follow (which should mimick tail -f in a shell on the remote system), would need to keep track of the file offset and use that for subsequent reads (polling on tail endpoint might not be suitable for this).
                     # Only print new lines
                     new_lines = output_lines[seen_lines:]
                     if new_lines:
@@ -882,7 +882,7 @@ def list_jobs(
     try:
         jobs = client.job_info(system_name=system)
 
-        table = Table(title="Jobs")
+        table = Table(title="Jobs")  # FIXME: usually, on the cluster squeue --me displays all of: JOBID, USER, ACCOUNT, PARTITION, NAME,  EXEC_HOST, ST, REASON, START_TIME, END_TIME, TIME_LEFT, NODES, PRIORITY. A --long/-l version displays NODELIST in addition. Consider adding more of these fields to the table, and also supporting filtering by user (e.g. --user) and other criteria (e.g. partition, time range, etc.). Furthermore, consider adding a summary line with counts of jobs in each state (e.g. RUNNING: 5, PENDING: 3, etc.).
         table.add_column("Job ID")
         table.add_column("Name")
         table.add_column("State")

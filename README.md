@@ -4,10 +4,10 @@ A command-line tool for orchestrating HPC workflows via [FirecREST](https://gith
 
 ## Features
 
-- **Container Management**: Build, deploy, and iterate on container images (fast iteration with mirrored, bind-mounted patches and image rebuild when stable)
-- **Data Transfer**: Directory mirroring with continuous upload/download using type enforcement (`in`/`out`/`both`)
-- **Job Management**: Submit jobs from TOML with SBATCH overrides via `--` separator
-- **FUSE Mount**: Mount remote storage as local filesystem over FirecREST (optional, untested)
+- **Container deployment**: Build, deploy, and iterate on container images (mirror bind-mounted patches and rebuild images when stable)
+- **Data transfer**: Directory mirroring with continuous upload/download using direction enforcement (`in`/`out`/`both`)
+- **Job management**: Submit jobs from TOML with SBATCH overrides via `--` separator
+- **FUSE mount**: Mount remote storage as local filesystem over FirecREST (optional)
 
 ## Installation
 
@@ -18,10 +18,10 @@ pip install fcw
 pip install fcw[fuse]
 ```
 
-## Quick Start
+## Quick start
 
 
-1. Set up FirecREST credentials:
+Set up FirecREST credentials, e.g. for Clariden:
 
 ```bash
 export FIRECREST_URL="https://api.cscs.ch/ml/firecrest/v2"
@@ -32,71 +32,88 @@ export FIRECREST_CLIENT_ID="<client_id>"
 export FIRECREST_CLIENT_SECRET="<client_secret>"
 ```
 
-2. Initialize a project:
+Initialize a project:
 
 ```bash
 fcw config init
 fcw config validate
 ```
 
-3. Edit `fcw.yaml` to configure your project.
+Interactively add/remove data directories, containers and jobs to configure your project using
+
+```bash
+fcw config directory add ...
+fcw config container add ...
+fcw config job add ...
+```
 
 ## Configuration
 
 Example `fcw.yaml`:
 
 ```yaml
-project: my-app
+project: my-fcw-app
 
 workdir:
-  remote: /scratch/${USER}/my-project
+  remote: ${FIRECREST_SCRATCH}/my-fcw-app
   local: .
 
-# Directory types: in/out/both relative to HPC job (upload/download/both)
-directories:
+directories:  # dataflow types: in/out/both (relative to remote job)
   data/raw:
     type: in
   data/processed:
     type: out
-  outputs:
-    type: out
-  code:
-    type: both
   configs:
     type: in
+  outputs:
+    type: out
 
-containers:
-  app:
-    file: ./env/Dockerfile
-    tag: my-fcw-app:latest
+containers:  # using multistage Dockerfiles (download and build-offline by default)
+  app-main:
+    file: ./env/Dockerfile.main
+    tag: my-fcw-app-main:26.03
     remote_path: ce-images/
-    platform: linux/arm64  # target platform for cross-arch builds (auto-detected if omitted)
+    toml: ./env/container.toml  # optional, user-editable enroot environment
+    platform: linux/arm64  # optional, for cross-arch builds (auto-detect if omitted)
+  app-prep:
+    file: ./env/Dockerfile.prep
+    tag: my-fcw-app-prep:26.01
+    remote_path: ce-images/
+    toml: ./env/container.toml  # optional, user-editable enroot environment
+    platform: linux/arm64  # optional, for cross-arch builds (auto-detect if omitted)
 
-jobs:
+jobs:  # Job definitions
+       # at submit time, fcw inlines the TOML and resolves the image path automatically.
+       # Env vars with relative paths are expanded to ${workdir.remote}/<path> and
+       # injected as shell defaults (export VAR="${VAR:-value}"), so pre-set env vars
+       # take precedence.
   preprocess:
     script: slurm/preprocess.sh
+    container: app-prep  # references a container from the containers section
     env:
       DATA_IN: data/raw
       DATA_OUT: data/processed
 
   train:
     script: slurm/train.sh
+    container: app-main
     time: "12:00:00"
-    nodes: 1
+    nodes: 2
     env:
       DATA_DIR: data/processed
-      OUTPUT_DIR: outputs
       CONFIG_DIR: configs
+      OUTPUT_DIR: outputs
 
   evaluate:
     script: slurm/evaluate.sh
+    container: app-main
     env:
       MODEL_DIR: outputs
 ```
 
 ## Usage
 
-### Data Transfer
+### Data transfer
 
 ```bash
 # Upload input data
@@ -109,27 +126,27 @@ fcw data download outputs --incremental --watch
 fcw data ls outputs -R
 ```
 
-### Job Submission
+### Job submission
 
 Jobs are submitted using the `--` separator pattern: SBATCH options before `--`, 
 script/job name after.
 
 ```bash
-# Simple submission (script path or config job name)
-fcw job submit train.sh
-fcw job submit train                    # Uses jobs.train.script from fcw.yaml
+# Single job submission
+fcw job submit train.sh       # explicit script path
+fcw job submit train          # use jobs.train config from fcw.yaml
 
-# Override SBATCH options (applied to script)
+# Override SBATCH options
 fcw job submit --time 12:00:00 --nodes 4 -- train.sh
 
-# Chain jobs with dependencies
+# Chain jobs with SLURM dependencies
 JOB1=$(fcw job submit preprocess.sh)
 fcw job submit --dependency afterok:$JOB1 -- train.sh
 
-# Set environment variables
+# Set additional environment variables after --
 fcw job submit train --set CONFIG=configs/exp1.yaml --set EPOCHS=100
 
-# Ad-hoc command
+# Run individual command
 fcw job run 'nvidia-smi'
 fcw job run --time 01:00:00 --nodes 2 -- 'python train.py'
 
@@ -140,107 +157,85 @@ fcw job wait $JOB1
 
 ### Container Management
 
-#### Initial Build & Deploy
+#### Initial build and deploy
 
-The simplest path is `deploy`, which builds local stages, pushes them, and submits
-a remote build job in one command:
+The build process is distributed across machines - a download stage built on the client that collects the base image(s) and dependencies and a build-offline stage on the remote cluster to build the dependencies.
 
+This can be run end-toend with the command `deploy`, which builds local stages, pushes them, and submits a remote build job according to config in `fcw.yaml`:
 ```bash
-# All-in-one: build, push, and deploy (resolves everything from fcw.yaml)
-fcw container deploy app --wait
+fcw container deploy app-main --wait
 ```
 
 For more control, the same workflow as explicit steps:
-
 ```bash
-# Config-aware: resolves Dockerfile, tag, platform, build args from fcw.yaml
-fcw container build app
-fcw container push app
-fcw container build-remote app --enroot --wait
+fcw container build app-main
+fcw container push app-main
+fcw container build-remote app-main --enroot --wait
 ```
 
-Or with fully explicit flags (legacy style):
+For customizing the build, these commands allow overriding Dockerfile, tag, platform, build args, etc. from the CLI (takes priority over `fcw.yaml`).
+
+When the client and remote cluster have different CPU architectures
+(e.g., building on x86_64 for an arm64 cluster), `fcw` handles this automatically: `container build` and `container deploy` detect the remote system's architecture via FirecREST and pass `--platform` to podman/docker (set `platform: linux/arm64` in the container config in `fcw.yaml` to skip auto-detection). Furthermore, the remote build step verifies the image architecture matches the compute node.
+
+#### Iterative code development workflow
+
+For quick iteration without rebuilding the full container:
 
 ```bash
-# Build download stage locally (fetches dependencies, requires network)
-fcw container build --stage download -f env/Dockerfile.prod-multistage --build-arg BASE_IMAGE=ubuntu:24.04 -t my-fcw-app:download .
-
-# Push download image to remote
-fcw container push my-fcw-app:download
-
-# Build offline stage on the cluster and import as enroot squashfs
-fcw container build-remote my-fcw-app:download \
-    -f env/Dockerfile.prod-multistage -t my-fcw-app:latest \
-    --stage build-offline --build-arg BASE_IMAGE=ubuntu:24.04 \
-    --enroot --wait
+# extract code from download container locally
+fcw container extract app-main /workspace/BrainBERT ./code
 ```
 
-#### Cross-Architecture Builds
-
-When your local machine and the remote cluster have different architectures
-(e.g., building on x86_64 for an arm64 cluster), fcw handles this automatically:
-
-1. **Auto-detection**: `container build` and `container deploy` detect the remote
-   system's architecture via FirecREST and pass `--platform` to podman/docker.
-2. **Config**: Set `platform: linux/arm64` in the container config in `fcw.yaml` to
-   skip auto-detection.
-3. **CLI override**: `--platform linux/amd64` on the command line takes priority.
-4. **Remote check**: The SLURM script verifies the image architecture matches the
-   compute node before building — never emulates on HPC.
-
+Then edit the `./code` locally. Test with bind-mounting of patched code (no rebuild)
 ```bash
-# Explicit platform (overrides config and auto-detection)
-fcw container build --platform linux/arm64 --stage download -t my-app:download .
-fcw container deploy app --platform linux/arm64 --wait
-```
-
-#### Code Iteration Workflow
-
-For fast iteration without rebuilding the full container:
-
-```bash
-# 1. Extract code from container for local editing
-fcw container extract my-fcw-app:download /workspace/BrainBERT ./code
-
-# 2. Edit ./code locally...
-
-# 3a. Quick iteration: bind-mount patched code (no rebuild)
 fcw container patch ./code /workspace/BrainBERT --toml env/container.toml
-# Then: srun --environment env/container.toml python train.py
-
-# 3b. Bake changes: patch + rebuild (when satisfied with changes)
-fcw container update ./code my-fcw-app:download /workspace/BrainBERT \
-    --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.prod-multistage \
+```
+Now run a test job with the patched container
+```bash
+fcw job submit srun --environment env/container.toml python train.py
+```
+This can be repeated several times until tests are successful. When satisfied, bake changes in with patch + rebuild
+```bash
+fcw container update ./code app-main:download /workspace/BrainBERT \
+    --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.multistage \
     --build-arg BASE_IMAGE=ubuntu:24.04 --enroot --wait
 ```
 
+Now you can re-run the same job with the updated container image tag. The example script appended below automates this workflow
+
+
 #### Other Commands
+
+TODO: This seems to need fixing
 
 ```bash
 # Rebuild from patched TOML (removes bind-mounts, rebuilds build-offline stage)
-fcw container rebuild app --wait
-
-# List remote container images
-fcw container list
+fcw container rebuild app-main --wait
 ```
 
-### FUSE Mount (Optional, Untested)
+### FUSE Mount (experimental)
 
+Requires installation with FUSE support. Mount directory from remote with:
 ```bash
-# Mount remote storage
-fcw mount start outputs ./local-outputs --read-only
-
-# Work with files locally
+fcw mount start outputs ./local-outputs
+```
+This allows working with files locally, e.g.
+```bash
 tail -f ./local-outputs/train.log
+```
+Note that for expensive filesystem operations, continuous synchronization is recommended over FUSE-mounting due to better performance.
 
-# Unmount
+When done, unmount with
+```
 fcw mount stop ./local-outputs
 ```
 
 ## Example Projects
 
-- **[BrainBERT](examples/BrainBERT/)** — End-to-end pre-training of a neural language model for brain data on an HPC cluster. Multi-stage container build, data preprocessing, distributed training, and benchmarking (I/O, communication and training throughput). See the [fcw workflow guide](examples/BrainBERT/fcw_e2e_workflow.md).
 - **[basic](examples/basic/)** — Minimal example demonstrating the full fcw pipeline. See the [e2e workflow](examples/basic/e2e_workflow.md).
+- **[node-burn](examples/node-burn/)** — Benchmarking of GEMM operations on CPU and GPU on an HPC cluster analogous to the [CSCS ReFrame test-suite](https://github.com/eth-cscs/cscs-reframe-tests). Demonstrates multi-stage container builds with different build-time vs run-time base images.
+- **[BrainBERT](examples/BrainBERT/)** — End-to-end pre-training of a Transformer model for intra-cranial EEG data on an HPC cluster. Includes multi-stage container build, data transfer and preprocessing, distributed training, and benchmarking (I/O, communication and training throughput). See the [fcw workflow guide](examples/BrainBERT/fcw_e2e_workflow.md).
 
 ## Example: Full Training Workflow
 

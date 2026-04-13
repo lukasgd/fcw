@@ -152,7 +152,7 @@ def directory_list(ctx: typer.Context) -> None:
 # ---------------------------------------------------------------------------
 
 
-@container_app.command("add")
+@container_app.command("add")  # FIXME: What about optional params build_args, local_stages, remote_stage?
 def container_add(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Container name"),
@@ -194,7 +194,7 @@ def container_remove(
         raise typer.Exit(1)
 
 
-@container_app.command("list")
+@container_app.command("list")  # FIXME: this doesn't list download image(s), just the final remote image
 def container_list(ctx: typer.Context) -> None:
     """List configured containers."""
     config_path = _resolve_config_path(ctx)

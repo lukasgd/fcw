@@ -11,7 +11,7 @@ Key workflows:
    Build the download stage locally, push it, then build-offline on the cluster:
 
        fcw container build --stage download -t my-fcw-app:download .
-       fcw container push my-fcw-app:download
+       fcw container push my-fcw-app:download  # FIXME: does this push the Dockerfile?
        fcw container build-remote my-fcw-app:download \\
            -f env/Dockerfile.prod-multistage -t my-fcw-app:latest \\
            --stage build-offline --build-arg BASE_IMAGE=ubuntu:24.04 \\
@@ -32,7 +32,7 @@ Key workflows:
 
 4. **Bake Changes (rebuild)**:
    
-   Patch the download image and rebuild build-offline:
+   Patch the download image and rebuild build-offline: # FIXME: does this cover multipatch updates?
    
        fcw container update ./code my-fcw-app:download /workspace/BrainBERT \\
            --tag my-fcw-app:v2 --rebuild --enroot --wait
@@ -66,7 +66,7 @@ from fcw.core import (
 )
 
 app = typer.Typer(no_args_is_help=True)
-_console = get_console
+_console = get_console  # FIXME: why do we need this indirection instead of just using get_console() directly?
 
 
 def _wait_and_check(client, system: str, job_id: str, label: str = "Job") -> None:
@@ -91,7 +91,7 @@ def _merge_build_args(
     """
     merged = dict(config_args or {})
     for arg in (cli_args or []):
-        if "=" in arg:
+        if "=" in arg:  # FIXME: does this handle both --build-arg KEY=VALUE and --build-arg KEY VALUE correctly?
             k, v = arg.split("=", 1)
             merged[k] = v
         else:
@@ -119,7 +119,7 @@ def _find_container_config(config, image_tag: str):
     return None
 
 
-def _podman_setup_block() -> str:
+def _podman_setup_block() -> str:  # TODO: simplify these to strictly necessary ones on lys/clariden
     """Generate the common shell setup block for podman on HPC nodes.
 
     Handles: HOME fallback, systemd wait, podman state cleanup, storage.conf,
@@ -166,7 +166,7 @@ KNOWN_SYSTEMS = {
 }
 
 
-def _detect_remote_platform(client, system: str) -> Optional[str]:
+def _detect_remote_platform(client, system: str) -> Optional[str]:  # FIXME: This currently doesn't work (seems like a remote permission issue). Could it be alternatively solved with an fcw job run like approach? 
     """Detect the remote system's platform by reading /proc/cpuinfo.
 
     Returns a platform string like ``linux/arm64`` or ``linux/amd64``,
@@ -233,7 +233,7 @@ def _create_rebuilt_toml(original_toml_path: str, new_toml_path: str) -> None:
     Path(new_toml_path).write_text(result)
 
 
-def _derive_container_name(original_name: str, new_tag: str) -> str:
+def _derive_container_name(original_name: str, new_tag: str) -> str:  # FIXME: check how different versions of an app accumulate in the config - is this sensible?
     """Derive a new container config name from the original name and new tag.
 
     Examples::
@@ -280,7 +280,7 @@ def _build_one_stage(
 @app.command("build")
 def build_image(
     ctx: typer.Context,
-    name_or_context: str = typer.Argument(".", help="Container name from config, or build context directory"),
+    name_or_context: str = typer.Argument(".", help="Container name from config, or build context directory"), # FIXME: this should be just the name, not build context dir (no overlap between these two). It should be optional and default to None. Requires adapting the code below.
     file: Optional[str] = typer.Option(None, "--file", "-f", help="Dockerfile path"),
     tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Image tag"),
     stage: Optional[str] = typer.Option(None, "--stage", help="Build specific stage (or all local_stages if omitted)"),
@@ -315,20 +315,20 @@ def build_image(
     config = load_config((ctx.obj or {}).get("config_file"))
 
     # Resolve whether name_or_context is a config name or a directory
-    cont_config = config.containers.get(name_or_context) if config.containers else None
+    cont_config = config.containers.get(name_or_context) if config.containers else None  # FIXME: throw error if argument was not none, but not found in containers
     if cont_config:
         resolved_file = file or cont_config.file
         resolved_tag = tag or cont_config.tag
         resolved_platform = platform or cont_config.platform
-        build_context = context or "."
+        build_context = context or "."  # FIXME: this should default to cont_config.context, i.e. build context needs to be part of the config.
     else:
         # Treat as build context directory (backward-compatible)
-        build_context = context or name_or_context
+        build_context = context or name_or_context  # FIXME: should be just context, not name_or_context
         resolved_file = file
         resolved_tag = tag
         resolved_platform = platform
 
-    # If no tag yet, try first container from config
+    # If no tag yet, try first container from config  # FIXME: rather than just using the first containers tag, throw an error that tag is required.
     if not resolved_tag and config.containers:
         first_container = next(iter(config.containers.values()))
         resolved_tag = first_container.tag
@@ -393,7 +393,7 @@ def build_image(
             )
         if save:
             # Save the last built stage
-            _save_image(runtime, cont_config.stage_tag(local_stages[-1]), save)
+            _save_image(runtime, cont_config.stage_tag(local_stages[-1]), save)  # FIXME: need to save all of the built local_stages, not just the last one
     else:
         # No config or explicit --tag: single build (legacy behavior)
         _build_one_stage(
@@ -433,7 +433,7 @@ def _push_one_image(
 
     Exports the image to a temporary tar, uploads via FirecREST, then cleans up.
     """
-    runtime = _detect_container_runtime()
+    runtime = _detect_container_runtime()  # FIXME: do the following lines do the same thing like _save_image above?  
     remote_filename = image_tag.replace(":", "+").replace("/", "+") + ".tar"
     tar_path = os.path.join(tempfile.gettempdir(), remote_filename)
 
@@ -605,7 +605,7 @@ def push_image(
             _console().print("[red]Failed to export image[/red]")
             raise typer.Exit(1)
 
-    try:
+    try:  # FIXME: is this the same do_upload function as the one in _push_one_image?
         async def do_upload():
             client = get_async_client()
             target_dir = os.path.dirname(remote_path)
@@ -666,7 +666,7 @@ def import_image(
     image: str = typer.Argument(..., help="Image tag or remote tar file path"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path for squashfs"),
 ):
-    """Import a container image on the remote cluster.
+    """Import a container image with enroot on the remote cluster.
 
     Submits a job that loads the tar with podman and converts it to
     enroot squashfs format.
@@ -810,14 +810,14 @@ fi
 
 
 @app.command("build-remote")
-def build_remote(
+def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir - should this be configured in one place?
     ctx: typer.Context,
     image: str = typer.Argument(..., help="Config name, or base image tag (must be pushed)"),
     dockerfile: Optional[str] = typer.Option(None, "--file", "-f", help="Local Dockerfile path"),
     tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Tag for the built image"),
     stage: Optional[str] = typer.Option(None, "--stage", help="Target stage to build"),
     build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Build-time variables (KEY=VALUE)"),
-    enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"),
+    enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"), # FIXME: additionally enable pushing to registry
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path for enroot squashfs"),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for job completion"),
 ):
@@ -1045,7 +1045,7 @@ def deploy_image(
         _console().print(f"[red]Dockerfile not found: {dockerfile}[/red]")
         raise typer.Exit(1)
 
-    # Determine local stages and remote stage
+    # Determine local stages and remote stage # FIXME: make these overridable from CLI
     if cont_config:
         local_stages = cont_config.get_local_stages()
         remote_stage = cont_config.get_remote_stage()
@@ -1090,7 +1090,7 @@ def deploy_image(
             stage=stage_name,
             platform=platform,
             build_args=all_build_args,
-            context=".",
+            context=".",  # FIXME: this should default to cont_config.context, i.e. build context needs to be part of the config. And it should also be possible to override the build context from the CLI, e.g. with a --context flag.
         )
         stage_tags.append((stage_name, stage_tag))
 
@@ -1112,7 +1112,7 @@ def deploy_image(
         f"[bold]Step 3: Building '{remote_stage}' stage on cluster ({final_tag})...[/bold]"
     )
 
-    staging_dir = config.resolve_path(".fcw/deploy", remote=True)
+    staging_dir = config.resolve_path(".fcw/deploy", remote=True)  # FIXME: Don't all the Dockerfiles overwrite each other in the staging dir like this?
 
     async def do_upload_dockerfile():
         async_client = get_async_client()
@@ -1126,7 +1126,7 @@ def deploy_image(
             system_name=system,
             local_file=dockerfile,
             directory=staging_dir,
-            filename="Dockerfile",
+            filename="Dockerfile",  # FIXME: shouldn't this be dockerfile?
             account=account,
             blocking=True,
         )
@@ -1257,7 +1257,7 @@ def extract_from_image(
     # With the multistage deploy workflow, the pushed tar is the download
     # stage (e.g., fcw-aux+latest-download.tar), not the final tag. Try both.
     remote_tar = _resolve_remote_tar(image, config)
-    if ":" in image:
+    if ":" in image:  # FIXME: this applies download again even though the help message and examples already suggest to use the download tag. It would be simpler, if the user could just specify the stage and then the stage to tag mapping is done by fcw consistent with the deploy workflow. Also, it should be possible to refer to a container config and not need to specify the fully qualified image name (this is more sort of the legacy interface)
         download_tag = f"{image}-download"
     else:
         download_tag = f"{image}:download"
@@ -1270,7 +1270,7 @@ def extract_from_image(
     q_staging_dir = shlex.quote(staging_dir)
     q_remote_archive = shlex.quote(remote_archive)
 
-    q_download_tag = shlex.quote(download_tag)
+    q_download_tag = shlex.quote(download_tag)  # FIXME: extracting this directly can't work on the remote machine won't work as it has to first be loaded from a tar
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-extract
@@ -1382,12 +1382,12 @@ exit 0
 
 
 @app.command("patch")
-def patch_container(
+def patch_container(  # FIXME: this is still only for the low-level interface, can't refer to container by config name/stage
     ctx: typer.Context,
     local_path: str = typer.Argument(..., help="Local directory with patched code"),
     container_path: str = typer.Argument(..., help="Target path inside container"),
     toml: Optional[str] = typer.Option(None, "--toml", help="TOML file to update with bind-mount"),
-    create_toml: bool = typer.Option(False, "--create", help="Create new TOML file if it doesn't exist"),
+    create_toml: bool = typer.Option(False, "--create", help="Create new TOML file if it doesn't exist"),  # FIXME why would this be needed?
 ):
     """Upload patched code and configure bind-mount for quick iteration.
     
@@ -1503,13 +1503,13 @@ mounts = [
 
 
 @app.command("update")
-def update_image(
+def update_image(  # FIXME: this is still only for the low-level interface, can't refer to container by config name/stage
     ctx: typer.Context,
     local_path: str = typer.Argument(..., help="Local directory with patched code"),
     image: str = typer.Argument(..., help="Base image to patch (e.g., my-fcw-app:download)"),
     container_path: str = typer.Argument(..., help="Path inside container to replace"),
     tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Tag for patched image"),
-    rebuild: bool = typer.Option(False, "--rebuild", help="Rebuild build-offline stage from patched image"),
+    rebuild: bool = typer.Option(False, "--rebuild", help="Rebuild build-offline stage from patched image"), # FIXME: why would skipping the rebuild be useful? How should the user make use of the patched image or even know where to find it? 
     dockerfile: Optional[str] = typer.Option(None, "--file", "-f", help="Dockerfile for rebuild (required with --rebuild)"),
     enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path for enroot squashfs"),
@@ -1852,7 +1852,7 @@ def rebuild_container(
         _console().print(f"  {host_path} → {container_path}")
 
     # 3. Derive stage tag for the image to patch
-    target_stage = patch_stage or cont.get_local_stages()[0]
+    target_stage = patch_stage or cont.get_local_stages()[0]  # FIXME: need a systematic way to map patches to the local stage they were extracted from, otherwise prefer to make patch_stage a required argument
     stage_tag = cont.stage_tag(target_stage)
     remote_stage = cont.get_remote_stage()
 
@@ -1950,7 +1950,7 @@ ls -lh {q_output_path}
     if dry_run:
         new_name = _derive_container_name(name, tag)
         toml_dir = toml_path.parent
-        new_toml_name = f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml"
+        new_toml_name = f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml" # FIXME: no hard-coding of toml path, just create a new toml based on the existing one and the name of the new version
         new_toml_path = toml_dir / new_toml_name
         _console().print("[bold]Generated SLURM script:[/bold]")
         _console().print(script)
@@ -1975,7 +1975,7 @@ ls -lh {q_output_path}
                 system_name=system,
                 local_file=dockerfile,
                 directory=staging_dir,
-                filename="Dockerfile",
+                filename="Dockerfile",  # FIXME: doesn't this cause conflicts if multiple containers are rebuilt at the same time?
                 account=account,
                 blocking=True,
             )
@@ -2014,7 +2014,7 @@ ls -lh {q_output_path}
             new_name = _derive_container_name(name, tag)
             toml_dir = toml_path.parent
             new_toml_name = (
-                f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml"
+                f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml"  # FIXME: no hard-coding of toml path, just create a new toml based on the existing one and the name of the new version
             )
             new_toml_path = toml_dir / new_toml_name
             _create_rebuilt_toml(str(toml_path), str(new_toml_path))
@@ -2107,4 +2107,4 @@ def list_images(
     else:
         # List local images
         runtime = _detect_container_runtime()
-        subprocess.run([runtime, "images"])
+        subprocess.run([runtime, "images"])  # FIXME: should proabably offer an option to restrict display to containers in config 

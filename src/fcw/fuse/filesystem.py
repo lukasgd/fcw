@@ -14,12 +14,14 @@ import asyncio
 import errno
 import logging
 import os
+import re
 import shutil
 import stat
 import tempfile
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import IO, TYPE_CHECKING, Any, Optional
 
 import firecrest
 import pyfuse3
@@ -28,12 +30,74 @@ from cachetools import TTLCache
 from firecrest import FirecrestException
 from firecrest.FirecrestException import HeaderException, UnauthorizedException
 
-from fcw.core.client import _get_auth, _get_firecrest_url
+from fcw.core.client import _get_auth, _get_firecrest_url, extract_job_id
 
 if TYPE_CHECKING:
     from firecrest.v2 import AsyncFirecrest
 
 logger = logging.getLogger("fcw.fuse")
+
+# Warn (but don't refuse) when a file larger than this is opened with
+# non-O_TRUNC write intent: the whole file gets downloaded, edited
+# locally, and re-uploaded on flush, which can take minutes over a WAN.
+WRITE_WARN_SIZE = 100 * 1024 * 1024  # 100 MB
+
+# Matches cache dirs created by this module: fcw_cache_{pid}_xxxxxx
+_CACHE_DIR_RE = re.compile(r"^fcw_cache_(\d+)_")
+
+
+def _cleanup_stale_cache_dirs() -> None:
+    """Remove orphaned fcw_cache_{pid}_* dirs whose owning process is dead.
+
+    Handles the SIGKILL/umount -l case where the runner's finally-block
+    cleanup never ran.
+    """
+    tmp = tempfile.gettempdir()
+    try:
+        entries = os.listdir(tmp)
+    except OSError:
+        return
+    for name in entries:
+        match = _CACHE_DIR_RE.match(name)
+        if not match:
+            continue
+        try:
+            pid = int(match.group(1))
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            path = os.path.join(tmp, name)
+            logger.info(f"Removing stale cache dir from dead PID {pid}: {path}")
+            shutil.rmtree(path, ignore_errors=True)
+        except (PermissionError, OSError):
+            # PID exists but we can't signal it — leave it alone
+            continue
+
+
+@dataclass
+class _InodeOpenState:
+    """Shared write buffer and metadata for all file handles on one inode.
+
+    The correctness goal: two concurrent writers on the same inode must not
+    end up with independent buffers, or flush() will silently clobber one of
+    their writes (last-write-wins). All opens on the same inode share one
+    buffer and one refcount.
+
+    ``download_lock`` serializes the lazy first-download path: pyfuse3 can
+    dispatch multiple read()/write() calls concurrently on the same inode,
+    and without a lock both would see ``cached == False`` and race into
+    duplicate ``client.download()`` calls writing the same temp file.
+    """
+    path: str
+    buffer: IO[bytes]
+    refcount: int = 1
+    dirty: bool = False
+    cached: bool = False
+    fhs: set[int] = field(default_factory=set)
+    download_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
 
 def _parse_permissions(perm_str: str) -> int:
     """Convert permission string like 'rwxr-xr-x' to octal mode bits."""
@@ -80,6 +144,7 @@ class FirecrestFS(pyfuse3.Operations):
         account: Optional[str] = None,
         cache_ttl: int = 5,
         read_only: bool = False,
+        statfs_partition: Optional[str] = None,
     ):
         super().__init__()
         self.client = client
@@ -88,6 +153,7 @@ class FirecrestFS(pyfuse3.Operations):
         self.account = account
         self.cache_ttl = cache_ttl
         self.read_only = read_only
+        self.statfs_partition = statfs_partition
 
         # Inode management
         self.inode_map: dict[int, str] = {pyfuse3.ROOT_INODE: self.remote_root}
@@ -98,14 +164,25 @@ class FirecrestFS(pyfuse3.Operations):
         self.attr_cache: TTLCache = TTLCache(maxsize=10000, ttl=cache_ttl)
         self.dir_cache: TTLCache = TTLCache(maxsize=1000, ttl=cache_ttl)
         self.negative_cache: TTLCache = TTLCache(maxsize=10000, ttl=cache_ttl)
-        self.read_cache_dir = tempfile.mkdtemp(prefix="fcw_cache_")
+        self.readdir_cache: TTLCache = TTLCache(maxsize=100, ttl=cache_ttl)
 
-        # File handle management (for writes)
-        self.open_files: dict[int, dict] = {}
+        # Clean up stale cache dirs from dead processes, then make ours.
+        _cleanup_stale_cache_dirs()
+        self.read_cache_dir = tempfile.mkdtemp(prefix=f"fcw_cache_{os.getpid()}_")
+
+        # Per-inode shared open state (refcounted) + fh->inode reverse lookup
+        self.inode_state: dict[int, _InodeOpenState] = {}
+        self.fh_to_inode: dict[int, int] = {}
         self.next_fh = 1
+
+        # statfs: lazy remote fetch via one-shot job on statfs_partition
+        self.statfs_cache: Optional[dict[str, int]] = None
+        self.statfs_task: Optional[asyncio.Task] = None
 
         logger.info(f"Initialized FirecrestFS: {system}:{remote_root}")
         logger.info(f"Cache TTL: {cache_ttl}s, Read-only: {read_only}")
+        if statfs_partition:
+            logger.info(f"statfs partition: {statfs_partition}")
 
     def _get_inode(self, path: str) -> int:
         """Get or create inode for path."""
@@ -232,19 +309,109 @@ class FirecrestFS(pyfuse3.Operations):
     # --- FUSE Operations ---
 
     async def statfs(self, ctx):
-        """Return filesystem statistics."""
-        # TODO: Query remote via job and cache result
-        # For now, return reasonable defaults
+        """Return filesystem statistics.
+
+        If ``statfs_partition`` is configured, fetches real values from the
+        remote via a one-shot ``stat -f`` job and caches them for the mount's
+        lifetime. Returns fallback big-fake numbers until the job completes
+        so tools that pre-check free space don't spuriously hit ENOSPC.
+        """
+        # Lazy task kickoff: first statfs() call after mount. We can't start
+        # tasks from __init__ since no event loop is running yet.
+        if (
+            self.statfs_partition
+            and self.statfs_cache is None
+            and self.statfs_task is None
+        ):
+            self.statfs_task = asyncio.create_task(self._fetch_statfs())
+
         stats = pyfuse3.StatvfsData()
+        stats.f_namemax = 255
+
+        if self.statfs_cache is not None:
+            c = self.statfs_cache
+            stats.f_bsize = c["f_bsize"]
+            stats.f_frsize = c["f_frsize"]
+            stats.f_blocks = c["f_blocks"]
+            stats.f_bfree = c["f_bfree"]
+            stats.f_bavail = c["f_bavail"]
+            stats.f_files = c["f_files"]
+            stats.f_ffree = c["f_ffree"]
+            return stats
+
+        # Fallback: big numbers so tools don't refuse writes pre-flight.
         stats.f_bsize = 65536
         stats.f_frsize = 65536
-        stats.f_blocks = 10000000
-        stats.f_bfree = 5000000
-        stats.f_bavail = 5000000
-        stats.f_files = 1000000
-        stats.f_ffree = 500000
-        stats.f_namemax = 255
+        stats.f_blocks = 1 << 40
+        stats.f_bfree = 1 << 40
+        stats.f_bavail = 1 << 40
+        stats.f_files = 1 << 32
+        stats.f_ffree = 1 << 32
         return stats
+
+    async def _fetch_statfs(self) -> None:
+        """Fetch real statvfs data by running ``stat -f`` on the xfer partition.
+
+        On any failure (submit error, timeout, parse error), logs a warning
+        and leaves ``statfs_cache`` unset so ``statfs()`` keeps serving the
+        fallback numbers. Does not retry — remount to retry.
+        """
+        script = (
+            "#!/bin/bash\n"
+            f"#SBATCH --partition={self.statfs_partition}\n"
+            "#SBATCH --time=00:01:00\n"
+            "#SBATCH --output=statfs.out\n"
+            f"stat -f --format='%s %S %b %f %a %c %d' {self.remote_root!r}\n"
+        )
+        try:
+            submit_kwargs: dict[str, Any] = {
+                "system_name": self.system,
+                "working_dir": self.remote_root,
+                "script_str": script,
+            }
+            if self.account:
+                submit_kwargs["account"] = self.account
+            resp = await self.client.submit(**submit_kwargs)
+            job_id = extract_job_id(resp)
+            if not job_id:
+                logger.warning(f"statfs: submit returned no job id: {resp}")
+                return
+
+            await self.client.wait_for_job(
+                system_name=self.system, job_id=job_id, timeout=60.0
+            )
+
+            stdout_path = os.path.join(self.remote_root, "statfs.out")
+            output = await self.client.view(
+                system_name=self.system, path=stdout_path
+            )
+            parts = output.strip().split()
+            if len(parts) != 7:
+                logger.warning(
+                    f"statfs: unexpected output from stat -f: {output!r}"
+                )
+                return
+            bsize, frsize, blocks, bfree, bavail, files, ffree = (
+                int(p) for p in parts
+            )
+            self.statfs_cache = {
+                "f_bsize": bsize,
+                "f_frsize": frsize,
+                "f_blocks": blocks,
+                "f_bfree": bfree,
+                "f_bavail": bavail,
+                "f_files": files,
+                "f_ffree": ffree,
+            }
+            logger.info(
+                f"statfs: {blocks * frsize / 1e12:.2f} TB total, "
+                f"{bavail * frsize / 1e12:.2f} TB available"
+            )
+        except Exception as e:
+            logger.warning(
+                f"statfs: failed to fetch real values ({type(e).__name__}: {e}); "
+                f"using fallback numbers"
+            )
 
     async def lookup(self, parent_inode: int, name: bytes, ctx=None):
         """Look up a directory entry by name."""
@@ -274,20 +441,21 @@ class FirecrestFS(pyfuse3.Operations):
         path = self._inode_to_path(inode)
         logger.debug(f"getattr: {path}")
 
-        # Check if file is open with dirty buffer
-        for fh, data in self.open_files.items():
-            if data["path"] == path and data["dirty"]:
-                entry = pyfuse3.EntryAttributes()
-                entry.st_ino = inode
-                entry.st_mode = stat.S_IFREG | 0o644
-                entry.st_size = os.fstat(data["buffer"].fileno()).st_size
-                now_ns = int(time.time() * 10**9)
-                entry.st_mtime_ns = now_ns
-                entry.st_atime_ns = now_ns
-                entry.st_ctime_ns = now_ns
-                entry.st_uid = os.getuid()
-                entry.st_gid = os.getgid()
-                return entry
+        # If the file is open with a dirty buffer, report buffer state
+        # instead of (stale) remote attrs so editors see the new size.
+        state = self.inode_state.get(inode)
+        if state is not None and state.dirty:
+            entry = pyfuse3.EntryAttributes()
+            entry.st_ino = inode
+            entry.st_mode = stat.S_IFREG | 0o644
+            entry.st_size = os.fstat(state.buffer.fileno()).st_size
+            now_ns = int(time.time() * 10**9)
+            entry.st_mtime_ns = now_ns
+            entry.st_atime_ns = now_ns
+            entry.st_ctime_ns = now_ns
+            entry.st_uid = os.getuid()
+            entry.st_gid = os.getgid()
+            return entry
 
         try:
             fc_stat = await self._fc_stat(path)
@@ -300,24 +468,14 @@ class FirecrestFS(pyfuse3.Operations):
         path = self._inode_to_path(inode)
 
         # Check if file only exists locally (created but not yet uploaded)
-        local_only = any(
-            d["path"] == path and d["dirty"] and not d["cached"]
-            for d in self.open_files.values()
-        )
+        state = self.inode_state.get(inode)
+        local_only = state is not None and state.dirty and not state.cached
 
         # Handle truncate
         if fields.update_size:
-            target_fh = fh
-            if target_fh is None:
-                for open_fh, data in self.open_files.items():
-                    if data["path"] == path:
-                        target_fh = open_fh
-                        break
-
-            if target_fh is not None and target_fh in self.open_files:
-                data = self.open_files[target_fh]
-                data["buffer"].truncate(attr.st_size)
-                data["dirty"] = True
+            if state is not None:
+                state.buffer.truncate(attr.st_size)
+                state.dirty = True
             else:
                 try:
                     with tempfile.NamedTemporaryFile(delete=False,
@@ -388,7 +546,19 @@ class FirecrestFS(pyfuse3.Operations):
     async def readdir(self, inode: int, start_id: int, token):
         """Read directory contents."""
         path = self._inode_to_path(inode)
-        logger.debug(f"readdir: {path}")
+        logger.debug(f"readdir: {path} start_id={start_id}")
+
+        # Fast path: serve from cached entries list (avoids rebuilding the
+        # full EntryAttributes list on every continuation call when
+        # pyfuse3's reply buffer fills up on large directories).
+        cached_entries = self.readdir_cache.get(inode)
+        if cached_entries is not None:
+            for i, (name_bytes, attr) in enumerate(cached_entries[start_id:], start_id):
+                if attr.st_ino == 0:
+                    continue
+                if not pyfuse3.readdir_reply(token, name_bytes, attr, i + 1):
+                    break
+            return
 
         try:
             files = await self._fc_list_files(path)
@@ -396,7 +566,7 @@ class FirecrestFS(pyfuse3.Operations):
             logger.error(f"readdir error for {path}: {e}")
             raise pyfuse3.FUSEError(errno.EIO)
 
-        entries = []
+        entries: list[tuple[bytes, pyfuse3.EntryAttributes]] = []
 
         # Add . and ..
         attr_dot = pyfuse3.EntryAttributes()
@@ -469,6 +639,10 @@ class FirecrestFS(pyfuse3.Operations):
 
             entries.append((name.encode("utf-8"), attr))
 
+        # Cache the fully-built entries list so continuation calls and
+        # subsequent readdirs within TTL don't rebuild it.
+        self.readdir_cache[inode] = entries
+
         # Send replies
         for i, (name_bytes, attr) in enumerate(entries[start_id:], start_id):
             if attr.st_ino == 0:
@@ -486,119 +660,169 @@ class FirecrestFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EROFS)
 
         path = self._inode_to_path(inode)
+        is_truncated = bool(flags & os.O_TRUNC)
+        write_intent = bool(flags & (os.O_WRONLY | os.O_RDWR))
+
+        # Soft warning for large write opens: the whole file will be
+        # downloaded, edited, and re-uploaded on flush. We don't refuse —
+        # users can still proceed — but they should know it'll be slow.
+        # O_TRUNC opens skip this since we don't download anything.
+        if write_intent and not is_truncated:
+            try:
+                fc_stat = await self._fc_stat(path)
+                size = int(
+                    fc_stat.get("size", 0)
+                    if isinstance(fc_stat, dict)
+                    else getattr(fc_stat, "size", 0)
+                )
+                if size > WRITE_WARN_SIZE:
+                    logger.warning(
+                        f"Opening {path} ({size / 1e6:.0f} MB) for write: "
+                        f"the full file will be downloaded, edited locally, "
+                        f"and re-uploaded on flush. This may take a while."
+                    )
+            except FirecrestException:
+                # File may not exist yet — let subsequent ops handle it.
+                pass
+
         fh = self.next_fh
         self.next_fh += 1
 
-        is_truncated = bool(flags & os.O_TRUNC)
-
-        self.open_files[fh] = {
-            "path": path,
-            "dirty": is_truncated,
-            "buffer": tempfile.NamedTemporaryFile(delete=False, dir=self.read_cache_dir),
-            "cached": False,
-        }
+        state = self.inode_state.get(inode)
+        if state is not None:
+            # Second (or later) open of this inode: share the buffer.
+            state.refcount += 1
+            state.fhs.add(fh)
+            self.fh_to_inode[fh] = inode
+            if is_truncated:
+                state.buffer.seek(0)
+                state.buffer.truncate(0)
+                state.dirty = True
+                state.cached = True
+        else:
+            buf = tempfile.NamedTemporaryFile(delete=False, dir=self.read_cache_dir)
+            state = _InodeOpenState(
+                path=path,
+                buffer=buf,
+                refcount=1,
+                dirty=is_truncated,
+                cached=is_truncated,  # O_TRUNC short-circuits download
+                fhs={fh},
+            )
+            self.inode_state[inode] = state
+            self.fh_to_inode[fh] = inode
 
         return pyfuse3.FileInfo(fh=fh, direct_io=True)
 
     async def read(self, fh: int, offset: int, length: int):
         """Read from a file."""
-        if fh not in self.open_files:
+        inode = self.fh_to_inode.get(fh)
+        if inode is None:
             raise pyfuse3.FUSEError(errno.EBADF)
+        state = self.inode_state[inode]
 
-        data = self.open_files[fh]
+        # Fast path: buffer already populated.
+        if state.dirty or state.cached:
+            state.buffer.seek(offset)
+            return state.buffer.read(length)
 
-        # If we have a dirty buffer, read from it
-        if data["dirty"] or data["cached"]:
-            f = data["buffer"]
-            f.seek(offset)
-            return f.read(length)
+        # Slow path: lazy first download. Serialized so two concurrent
+        # FUSE reads on the same inode don't both await client.download()
+        # into the same temp file.
+        async with state.download_lock:
+            # Double-check after acquiring the lock — another task may
+            # have completed the download while we were waiting.
+            if state.dirty or state.cached:
+                state.buffer.seek(offset)
+                return state.buffer.read(length)
 
-        # Download entire file to cache on first read
-        logger.debug(f"Downloading {data['path']} to cache")
+            logger.debug(f"Downloading {state.path} to cache")
+            try:
+                buf_name = state.buffer.name
+                await self.client.download(
+                    system_name=self.system,
+                    source_path=state.path,
+                    target_path=buf_name,
+                    account=self.account,
+                    blocking=True,
+                )
 
-        try:
-            await self.client.download(
-                system_name=self.system,
-                source_path=data["path"],
-                target_path=data["buffer"].name,
-                account=self.account,
-                blocking=True,
-            )
-            data["cached"] = True
+                # Reopen buffer for read+write (download replaced the file)
+                state.buffer.close()
+                state.buffer = open(buf_name, "rb+")
+                state.cached = True
+            except Exception as e:
+                logger.error(f"Read error: {e}")
+                raise pyfuse3.FUSEError(self._map_error(e))
 
-            # Reopen buffer for reading
-            data["buffer"].close()
-            data["buffer"] = open(data["buffer"].name, "rb+")
-
-            f = data["buffer"]
-            f.seek(offset)
-            return f.read(length)
-
-        except Exception as e:
-            logger.error(f"Read error: {e}")
-            raise pyfuse3.FUSEError(self._map_error(e))
+        state.buffer.seek(offset)
+        return state.buffer.read(length)
 
     async def write(self, fh: int, offset: int, buf: bytes):
         """Write to a file."""
         if self.read_only:
             raise pyfuse3.FUSEError(errno.EROFS)
 
-        if fh not in self.open_files:
+        inode = self.fh_to_inode.get(fh)
+        if inode is None:
             raise pyfuse3.FUSEError(errno.EBADF)
+        state = self.inode_state[inode]
 
-        data = self.open_files[fh]
+        # Lazy first-download path is serialized via download_lock to
+        # prevent two concurrent writes from both racing into
+        # client.download() against the same temp file.
+        if not state.dirty and not state.cached:
+            async with state.download_lock:
+                if not state.dirty and not state.cached:
+                    logger.debug(f"Downloading {state.path} before write")
+                    try:
+                        buf_name = state.buffer.name
+                        state.buffer.close()
 
-        # Download file first if not already dirty/cached
-        if not data["dirty"] and not data["cached"]:
-            logger.debug(f"Downloading {data['path']} before write")
-            try:
-                data["buffer"].close()
+                        await self.client.download(
+                            system_name=self.system,
+                            source_path=state.path,
+                            target_path=buf_name,
+                            account=self.account,
+                            blocking=True,
+                        )
 
-                await self.client.download(
-                    system_name=self.system,
-                    source_path=data["path"],
-                    target_path=data["buffer"].name,
-                    account=self.account,
-                    blocking=True,
-                )
+                        state.buffer = open(buf_name, "rb+")
+                        state.cached = True
+                    except Exception as e:
+                        logger.error(f"Download for write failed: {e}")
+                        raise pyfuse3.FUSEError(self._map_error(e))
 
-                data["buffer"] = open(data["buffer"].name, "rb+")
-            except Exception as e:
-                logger.error(f"Download for write failed: {e}")
-                raise pyfuse3.FUSEError(self._map_error(e))
-
-        f = data["buffer"]
-        f.seek(offset)
-        f.write(buf)
-        data["dirty"] = True
+        state.buffer.seek(offset)
+        state.buffer.write(buf)
+        state.dirty = True
 
         return len(buf)
 
     async def flush(self, fh: int):
         """Flush file to storage."""
-        if fh not in self.open_files:
+        inode = self.fh_to_inode.get(fh)
+        if inode is None:
+            return
+        state = self.inode_state[inode]
+        if not state.dirty:
             return
 
-        data = self.open_files[fh]
-        if not data["dirty"]:
-            return
-
-        logger.info(f"Uploading {data['path']}")
+        logger.info(f"Uploading {state.path}")
 
         try:
-            f = data["buffer"]
-            f.flush()
-            os.fsync(f.fileno())
+            state.buffer.flush()
+            os.fsync(state.buffer.fileno())
 
-            path = data["path"]
+            path = state.path
             target_dir = os.path.dirname(path)
             filename = os.path.basename(path)
 
-            data["dirty"] = False
+            state.dirty = False
 
             await self.client.upload(
                 system_name=self.system,
-                local_file=data["buffer"].name,
+                local_file=state.buffer.name,
                 directory=target_dir,
                 filename=filename,
                 account=self.account,
@@ -613,20 +837,30 @@ class FirecrestFS(pyfuse3.Operations):
 
         except Exception as e:
             logger.error(f"Upload failed: {e}")
-            data["dirty"] = True
+            state.dirty = True
             raise pyfuse3.FUSEError(self._map_error(e))
 
     async def release(self, fh: int):
         """Release file handle."""
-        if fh in self.open_files:
-            data = self.open_files[fh]
-            try:
-                data["buffer"].close()
-                if os.path.exists(data["buffer"].name):
-                    os.unlink(data["buffer"].name)
-            except Exception as e:
-                logger.warning(f"Error cleaning up fh {fh}: {e}")
-            del self.open_files[fh]
+        inode = self.fh_to_inode.pop(fh, None)
+        if inode is None:
+            return
+        state = self.inode_state.get(inode)
+        if state is None:
+            return
+        state.fhs.discard(fh)
+        state.refcount -= 1
+        if state.refcount > 0:
+            return
+        # Last handle on this inode: close and unlink the shared buffer
+        try:
+            buf_name = state.buffer.name
+            state.buffer.close()
+            if os.path.exists(buf_name):
+                os.unlink(buf_name)
+        except Exception as e:
+            logger.warning(f"Error cleaning up inode {inode}: {e}")
+        self.inode_state.pop(inode, None)
 
     async def mkdir(self, parent_inode: int, name: bytes, mode: int, ctx):
         """Create a directory."""
@@ -654,10 +888,10 @@ class FirecrestFS(pyfuse3.Operations):
             entry.st_mtime_ns = now_ns
             entry.st_ctime_ns = now_ns
 
-            # Invalidate parent dir cache
+            # Invalidate parent dir + readdir cache
             parent_path = self._inode_to_path(parent_inode)
-            if parent_path in self.dir_cache:
-                del self.dir_cache[parent_path]
+            self.dir_cache.pop(parent_path, None)
+            self.readdir_cache.pop(parent_inode, None)
 
             return entry
 
@@ -686,11 +920,10 @@ class FirecrestFS(pyfuse3.Operations):
                 self.inode_map.pop(inode, None)
 
             # Invalidate caches
-            if path in self.attr_cache:
-                del self.attr_cache[path]
+            self.attr_cache.pop(path, None)
             parent_path = self._inode_to_path(parent_inode)
-            if parent_path in self.dir_cache:
-                del self.dir_cache[parent_path]
+            self.dir_cache.pop(parent_path, None)
+            self.readdir_cache.pop(parent_inode, None)
 
         except Exception as e:
             logger.error(f"unlink failed: {e}")
@@ -727,13 +960,12 @@ class FirecrestFS(pyfuse3.Operations):
             if path in self.path_to_inode:
                 inode = self.path_to_inode.pop(path)
                 self.inode_map.pop(inode, None)
-            if path in self.attr_cache:
-                del self.attr_cache[path]
-            if path in self.dir_cache:
-                del self.dir_cache[path]
+                self.readdir_cache.pop(inode, None)
+            self.attr_cache.pop(path, None)
+            self.dir_cache.pop(path, None)
             parent_path = self._inode_to_path(parent_inode)
-            if parent_path in self.dir_cache:
-                del self.dir_cache[parent_path]
+            self.dir_cache.pop(parent_path, None)
+            self.readdir_cache.pop(parent_inode, None)
 
         except pyfuse3.FUSEError:
             raise
@@ -758,20 +990,39 @@ class FirecrestFS(pyfuse3.Operations):
                 account=self.account,
             )
 
-            # Update inode mappings for renamed path and all children
+            # Single-pass update of path_to_inode + inode_map + attr/dir/neg
+            # caches for the renamed path and all descendants. path_to_inode
+            # is the canonical registry — the attr/dir/negative caches are
+            # populated via paths that go through _get_inode, so iterating
+            # it once and clearing the side caches in the same loop is safe.
+            # A prefix-sorted structure (e.g. sortedcontainers.SortedDict)
+            # would enable O(log N + k) but isn't worth the dep today.
             old_prefix = old_path + "/"
-            for path in list(self.path_to_inode.keys()):
-                if path == old_path or path.startswith(old_prefix):
-                    inode = self.path_to_inode.pop(path)
-                    updated_path = new_path + path[len(old_path):]
-                    self.path_to_inode[updated_path] = inode
-                    self.inode_map[inode] = updated_path
+            affected = [
+                p for p in self.path_to_inode
+                if p == old_path or p.startswith(old_prefix)
+            ]
+            for path in affected:
+                inode = self.path_to_inode.pop(path)
+                updated_path = new_path + path[len(old_path):]
+                self.path_to_inode[updated_path] = inode
+                self.inode_map[inode] = updated_path
+                self.attr_cache.pop(path, None)
+                self.dir_cache.pop(path, None)
+                self.negative_cache.pop(path, None)
+            self.negative_cache.pop(new_path, None)
 
-            # Invalidate caches
-            for cache in [self.attr_cache, self.dir_cache]:
-                for key in list(cache.keys()):
-                    if key == old_path or key.startswith(old_prefix):
-                        del cache[key]
+            # Invalidate readdir cache entries for both parent dirs
+            old_parent_inode = self.path_to_inode.get(
+                os.path.dirname(old_path)
+            )
+            new_parent_inode = self.path_to_inode.get(
+                os.path.dirname(new_path)
+            )
+            if old_parent_inode is not None:
+                self.readdir_cache.pop(old_parent_inode, None)
+            if new_parent_inode is not None:
+                self.readdir_cache.pop(new_parent_inode, None)
 
         except Exception as e:
             logger.error(f"rename failed: {e}")
@@ -792,12 +1043,16 @@ class FirecrestFS(pyfuse3.Operations):
         self.next_fh += 1
         inode = self._get_inode(path)
 
-        self.open_files[fh] = {
-            "path": path,
-            "dirty": True,
-            "buffer": tempfile.NamedTemporaryFile(delete=False, dir=self.read_cache_dir),
-            "cached": False,
-        }
+        buf = tempfile.NamedTemporaryFile(delete=False, dir=self.read_cache_dir)
+        self.inode_state[inode] = _InodeOpenState(
+            path=path,
+            buffer=buf,
+            refcount=1,
+            dirty=True,
+            cached=True,  # new empty file — nothing to download
+            fhs={fh},
+        )
+        self.fh_to_inode[fh] = inode
 
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
@@ -815,10 +1070,10 @@ class FirecrestFS(pyfuse3.Operations):
         entry.st_mtime_ns = now_ns
         entry.st_ctime_ns = now_ns
 
-        # Invalidate parent dir cache
+        # Invalidate parent dir + readdir cache
         parent_path = self._inode_to_path(parent_inode)
-        if parent_path in self.dir_cache:
-            del self.dir_cache[parent_path]
+        self.dir_cache.pop(parent_path, None)
+        self.readdir_cache.pop(parent_inode, None)
 
         return (pyfuse3.FileInfo(fh=fh, direct_io=True), entry)
 
@@ -832,6 +1087,7 @@ def run_filesystem(
     read_only: bool = False,
     allow_other: bool = False,
     debug: bool = False,
+    statfs_partition: str | None = None,
 ):
     """Run the FUSE filesystem.
 
@@ -844,6 +1100,7 @@ def run_filesystem(
         read_only: Mount read-only
         allow_other: Allow other users to access mount
         debug: Enable debug logging
+        statfs_partition: SLURM partition to run ``stat -f`` on for real df
     """
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -864,6 +1121,7 @@ def run_filesystem(
         account=account,
         cache_ttl=cache_ttl,
         read_only=read_only,
+        statfs_partition=statfs_partition,
     )
 
     fuse_options = set(pyfuse3.default_options)
@@ -876,8 +1134,22 @@ def run_filesystem(
     pyfuse3.asyncio.enable()
     pyfuse3.init(fs, mountpoint, fuse_options)
 
+    async def _main() -> None:
+        try:
+            await pyfuse3.main()
+        finally:
+            # Cancel the background statfs task on the same loop it
+            # was created on, to avoid "Task was destroyed but it is
+            # pending" warnings on shutdown.
+            if fs.statfs_task is not None and not fs.statfs_task.done():
+                fs.statfs_task.cancel()
+                try:
+                    await fs.statfs_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
     try:
-        asyncio.run(pyfuse3.main())
+        asyncio.run(_main())
     except KeyboardInterrupt:
         pass
     finally:

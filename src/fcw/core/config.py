@@ -50,7 +50,7 @@ class ContainerConfig:
     file: str
     tag: str
     remote_path: Optional[str] = None
-    stage: Optional[str] = None
+    stage: Optional[str] = None  # FIXME: What is the purpose of this if we have local_stages and remote_stage?
     toml: Optional[str] = None
     platform: Optional[str] = None
     build_args: Optional[Dict[str, str]] = None
@@ -87,7 +87,7 @@ class JobConfig:
     script: str
     container: Optional[str] = None
     env: dict[str, str] = field(default_factory=dict)
-    time: Optional[str] = None
+    time: Optional[str] = None  # FIXME: all the 4 options below here are SBATCH options - why are they handled separately? Or asked differently, isn't there a generic recipe to capture SBATCH option overrides that carry over 1-to-1 without having to hardcode them in the config schema? Like what we do for gpus_per_node?
     nodes: Optional[int] = None
     gpus_per_node: Optional[int] = None
     cpus_per_task: Optional[int] = None
@@ -214,7 +214,7 @@ def expand_config_refs(value: str, config_data: dict[str, Any]) -> str:
 def process_value(value: Any, config_data: dict[str, Any]) -> Any:
     """Process a config value, expanding variables and references."""
     if isinstance(value, str):
-        # First expand env vars, then config refs
+        # First expand env vars, then config refs # FIXME: is this the right order? Isn't the config ref syntax indistinguishable from env vars (and so, config refs would be interpreted as env vars, getting expanded mostly as empty strings or similar)?
         value = expand_env_vars(value)
         value = expand_config_refs(value, config_data)
         return value
@@ -303,7 +303,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 file=cont_data.get("file", ""),
                 tag=cont_data.get("tag", ""),
                 remote_path=cont_data.get("remote_path"),
-                stage=cont_data.get("stage"),
+                stage=cont_data.get("stage"),  # FIXME: What is the purpose of this if we have local_stages and remote_stage?
                 toml=cont_data.get("toml"),
                 platform=cont_data.get("platform"),
                 build_args=cont_data.get("build_args"),
@@ -318,7 +318,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 script=job_data.get("script", ""),
                 container=job_data.get("container"),
                 env=job_data.get("env", {}),
-                time=job_data.get("time"),
+                time=job_data.get("time"),  # FIXME: all the 4 options below here are SBATCH options - why are they handled separately? Or asked differently, isn't there a generic recipe to capture SBATCH option overrides that carry over 1-to-1 without having to hardcode them in the config schema?
                 nodes=job_data.get("nodes"),
                 gpus_per_node=job_data.get("gpus_per_node"),
                 cpus_per_task=job_data.get("cpus_per_task"),
@@ -327,7 +327,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
     return config
 
 
-def generate_default_config() -> str:
+def generate_default_config() -> str:  # FIXME: is this a good default with all the concrete directories, containers and jobs? Users can already copy an example if needed, why would they need to generate it as a default? They can interactively add directories, containers and jobs. See also generate_interactive_config().
     """Generate a default fcw.yaml template."""
     return '''\
 # fcw configuration file
@@ -410,14 +410,14 @@ def add_container_to_config(
     # Find the containers: line
     containers_idx: Optional[int] = None
     for i, line in enumerate(lines):
-        if re.match(r'^containers:\s*$', line.rstrip()):
+        if re.match(r'^containers:\s*(#.*)?$', line.rstrip()):
             containers_idx = i
             break
     if containers_idx is None:
         raise ValueError("'containers:' block not found in config")
 
     # Check for duplicate name
-    name_pattern = re.compile(rf'^  {re.escape(name)}:\s*$')
+    name_pattern = re.compile(rf'^  {re.escape(name)}:\s*(#.*)?$')
     for line in lines[containers_idx + 1:]:
         if name_pattern.match(line.rstrip()):
             raise ValueError(f"Container '{name}' already exists in config")
@@ -601,7 +601,7 @@ def add_job_to_config(config_path: Path, name: str, job: JobConfig) -> None:
     entry["script"] = job.script
     if job.container is not None:
         entry["container"] = job.container
-    if job.time is not None:
+    if job.time is not None:  # FIXME: all the 4 options below here are SBATCH options - why are they handled separately? Or asked differently, isn't there a generic recipe to capture SBATCH option overrides that carry over 1-to-1 without having to hardcode them in the config schema?
         from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
         entry["time"] = DoubleQuotedScalarString(job.time)
@@ -631,7 +631,7 @@ def remove_job_from_config(config_path: Path, name: str) -> None:
     _save_yaml_roundtrip(config_path, ryaml, data)
 
 
-def generate_interactive_config(project: str, remote_workdir: str, local_workdir: str) -> str:
+def generate_interactive_config(project: str, remote_workdir: str, local_workdir: str) -> str:  # FIXME: is this a good default with all the concrete directories, containers and jobs? Users can already copy an example if needed, why would they need to generate it as a default? At most, I'd see commented out sections with ... placeholders where concrete items need to be filled in (but actually this would be more suitable for the non-interactive default config). See also generate_default_config().
     """Generate an fcw.yaml template with the given project settings.
 
     Follows the conventions from the basic example: ce-images/ for container

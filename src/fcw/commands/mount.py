@@ -44,6 +44,15 @@ def mount_filesystem(
     cache_ttl: int = typer.Option(5, "--cache-ttl", help="Cache TTL in seconds"),
     allow_other: bool = typer.Option(False, "--allow-other", help="Allow other users to access"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging"),
+    statfs_partition: Optional[str] = typer.Option(
+        "xfer",
+        "--statfs-partition",
+        help=(
+            "SLURM partition to run `stat -f` on for real `df` values. "
+            "If unset, df reports fallback numbers. Typically the xfer "
+            "partition (e.g. 'xfer' on clariden; varies per system)."
+        ),
+    ),
 ):
     """Mount remote FirecREST storage as local filesystem.
     
@@ -83,6 +92,7 @@ def mount_filesystem(
         read_only=read_only,
         allow_other=allow_other,
         debug=debug,
+        statfs_partition=statfs_partition,
     )
 
 
