@@ -18,16 +18,18 @@ Key workflows:
            --enroot --wait
 
 2. **Extract Code for Editing**:
-   
-   Extract code from the download image to edit locally:
-   
-       fcw container extract my-fcw-app:download /workspace/BrainBERT ./code
+
+   Extract code from a container stage to edit locally. Writes a sidecar
+   ``./code.meta.json`` recording stage + container_path for later use:
+
+       fcw container extract my-fcw-app /workspace/BrainBERT ./code
 
 3. **Quick Iteration (bind-mount, no rebuild)**:
-   
-   Upload patched code and generate TOML with bind-mount for srun:
-   
-       fcw container patch ./code /workspace/BrainBERT --toml env/container.toml
+
+   Upload patched code and add bind-mount entries to the container's TOML.
+   Mount target defaults to the sidecar's ``container_path``:
+
+       fcw container patch --container my-fcw-app ./code
        # Then use: srun --environment env/container.toml ...
 
 4. **Bake Changes (rebuild)**:
@@ -40,14 +42,16 @@ Key workflows:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import typer
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -306,6 +310,81 @@ def _derive_rebuilt_toml_path(original: Path, original_tag: str, new_tag: str) -
         stem = stem[: -(len(parent_suffix) + 1)]
     new_suffix = _sanitize_tag_suffix(new_tag)
     return original.with_name(f"{stem}-{new_suffix}{original.suffix}")
+
+
+# -----------------------------------------------------------------------------
+# Sidecar metadata for extracted code dumps
+# -----------------------------------------------------------------------------
+# An extracted dump at <local_dest> has a sidecar JSON at <local_dest>.meta.json
+# describing which stage/container path/image the code came from. `extract`
+# writes it; `patch` reads it to default the bind-mount target; `rebuild` uses
+# it to group patches by stage. `patch` never writes the sidecar.
+
+SIDECAR_SUFFIX = ".meta.json"
+
+
+def _sidecar_path(local_dest: str) -> Path:
+    p = Path(local_dest).resolve()
+    return p.with_name(p.name + SIDECAR_SUFFIX)
+
+
+def _read_sidecar(local_dest: str) -> Optional[dict]:
+    sp = _sidecar_path(local_dest)
+    if not sp.exists():
+        return None
+    try:
+        return json.loads(sp.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_sidecar(local_dest: str, *, stage: str, container_path: str, source_image: str) -> None:
+    sp = _sidecar_path(local_dest)
+    sp.write_text(json.dumps({
+        "stage": stage,
+        "container_path": container_path,
+        "source_image": source_image,
+        "extracted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }, indent=2) + "\n")
+
+
+def _resolve_container_config(config, name: str):
+    """Look up a container by config name, error with helpful listing otherwise."""
+    if name in config.containers:
+        return config.containers[name]
+    known = ", ".join(sorted(config.containers.keys())) or "(none)"
+    _console().print(
+        f"[red]Unknown container name: {name!r}[/red]\n"
+        f"[dim]Known containers in fcw.yaml: {known}[/dim]"
+    )
+    raise typer.Exit(1)
+
+
+def _resolve_extract_stage(container_cfg, requested: Optional[str]) -> str:
+    """Default stage for extract: requested > 'download' if present > first local stage."""
+    stages = container_cfg.get_local_stages()
+    if requested:
+        if requested not in stages and requested != container_cfg.get_remote_stage():
+            _console().print(
+                f"[yellow]Warning: stage {requested!r} not in configured stages "
+                f"{stages + [container_cfg.get_remote_stage()]}[/yellow]"
+            )
+        return requested
+    if "download" in stages:
+        return "download"
+    return stages[0]
+
+
+def _parse_patch_arg(arg: str, sidecar_dir: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """Parse ``<local-path>[:<container-path>]`` into (local, container_path_or_None).
+
+    Splits on the first ':' not inside the local path. Windows-style paths aren't
+    supported here (fcw is Linux-only at the CLI boundary).
+    """
+    if ":" in arg:
+        local, container_path = arg.split(":", 1)
+        return local, container_path
+    return arg, None
 
 
 def _build_one_stage(
@@ -1288,55 +1367,50 @@ exit 0
 @app.command("extract")
 def extract_from_image(
     ctx: typer.Context,
-    image: str = typer.Argument(..., help="Source image (e.g., my-fcw-app:download)"),
+    container_name: str = typer.Argument(..., help="Container config name (from fcw.yaml)"),
     container_path: str = typer.Argument(..., help="Path inside container (e.g., /workspace/BrainBERT)"),
     local_dest: str = typer.Argument(..., help="Local destination directory"),
+    stage: Optional[str] = typer.Option(
+        None, "--stage", help="Stage to extract from (default: 'download' if available, else first local stage)"
+    ),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for extraction to complete"),
 ):
-    """Extract files from a remote container image.
-    
-    This is the first step in the code iteration workflow. It extracts code
-    from an existing container image so you can edit it locally.
-    
-    The extraction runs as a job on the remote cluster:
-    1. Creates a container from the image (without running it)
-    2. Copies the specified path to a staging area
-    3. Creates a tar archive
-    
-    After the job completes, use ``fcw data download`` to fetch the archive.
-    
+    """Extract files from a container stage's image tarball on the remote cluster.
+
+    Resolves the container and stage from ``fcw.yaml`` (low-level raw image
+    tags are no longer accepted — use a container config name). After a
+    successful local extraction, writes a sidecar ``<local_dest>.meta.json``
+    recording the source stage, container path, and image. Later ``patch``
+    and ``rebuild`` use this sidecar to default the bind-mount target and
+    to group patches by stage.
+
+    The extraction runs as a remote job that loads the stage tar, creates a
+    container, ``podman cp``'s the requested path, and tars it up. The
+    archive is then downloaded and unpacked locally.
+
     Examples:
-        # Extract BrainBERT code from download stage
-        fcw container extract my-fcw-app:download /workspace/BrainBERT ./code
-        
-        # Extract to current directory
-        fcw container extract my-fcw-app:download /workspace/BrainBERT .
+        fcw container extract app /workspace/BrainBERT ./code
+        fcw container extract app /workspace/BrainBERT ./code --stage runtime-download
     """
     config, system, account = resolve_context(ctx)
 
-    # Staging path for extraction
-    staging_dir = config.resolve_path(".fcw/extract", remote=True)
+    container_cfg = _resolve_container_config(config, container_name)
+    resolved_stage = _resolve_extract_stage(container_cfg, stage)
+    stage_image = container_cfg.stage_tag(resolved_stage)
+
+    # Staging path for extraction (isolated per container/stage/timestamp so
+    # parallel extracts on the same remote workdir don't clobber each other).
+    staging_dir = _isolated_staging_dir(config, "extract", f"{container_name}-{resolved_stage}")
     archive_name = f"{os.path.basename(container_path.rstrip('/'))}.tar.gz"
     remote_archive = f"{staging_dir}/{archive_name}"
 
-    # Resolve the pushed tar path so the job can load it if needed.
-    # With the multistage deploy workflow, the pushed tar is the download
-    # stage (e.g., fcw-aux+latest-download.tar), not the final tag. Try both.
-    remote_tar = _resolve_remote_tar(image, config)
-    if ":" in image:  # FIXME: this applies download again even though the help message and examples already suggest to use the download tag. It would be simpler, if the user could just specify the stage and then the stage to tag mapping is done by fcw consistent with the deploy workflow. Also, it should be possible to refer to a container config and not need to specify the fully qualified image name (this is more sort of the legacy interface)
-        download_tag = f"{image}-download"
-    else:
-        download_tag = f"{image}:download"
-    remote_download_tar = _resolve_remote_tar(download_tag, config)
+    remote_tar = _resolve_remote_tar(stage_image, config)
 
-    q_image = shlex.quote(image)
+    q_stage_image = shlex.quote(stage_image)
     q_remote_tar = shlex.quote(remote_tar)
-    q_remote_download_tar = shlex.quote(remote_download_tar)
     q_container_path = shlex.quote(container_path)
     q_staging_dir = shlex.quote(staging_dir)
     q_remote_archive = shlex.quote(remote_archive)
-
-    q_download_tag = shlex.quote(download_tag)  # FIXME: extracting this directly can't work on the remote machine won't work as it has to first be loaded from a tar
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-extract
@@ -1348,42 +1422,29 @@ set -euxo pipefail
 
 {_podman_setup_block()}
 
-# Determine which image to use for extraction.
-# Prefer the download stage since extract operates on the download stage,
-# not the final build-offline image.
-EXTRACT_IMAGE=""
-if podman image exists {q_download_tag} 2>/dev/null; then
-    EXTRACT_IMAGE={q_download_tag}
-elif podman image exists {q_image} 2>/dev/null; then
-    EXTRACT_IMAGE={q_image}
-elif [ -f {q_remote_download_tar} ]; then
-    echo "Loading download image from {q_remote_download_tar}..."
-    podman load -i {q_remote_download_tar}
-    EXTRACT_IMAGE={q_download_tag}
+# Load the stage image from its pushed tar if not already in local storage.
+if podman image exists {q_stage_image} 2>/dev/null; then
+    EXTRACT_IMAGE={q_stage_image}
 elif [ -f {q_remote_tar} ]; then
     echo "Loading image from {q_remote_tar}..."
     podman load -i {q_remote_tar}
-    EXTRACT_IMAGE={q_image}
+    EXTRACT_IMAGE={q_stage_image}
 else
-    echo "Error: image not found and no tar at {q_remote_download_tar} or {q_remote_tar}"
+    echo "Error: image {q_stage_image} not in storage and no tar at {q_remote_tar}"
     exit 1
 fi
 
 echo "Extracting {q_container_path} from $EXTRACT_IMAGE..."
 
-# Create container from the download stage (don't run it)
 CID=$(podman create "$EXTRACT_IMAGE" /bin/true)
 echo "Created container: $CID"
 
-# Create staging directory
 mkdir -p {q_staging_dir}
 
-# Copy files out of container
 EXTRACT_TMP=$(mktemp -d)
 podman cp "$CID:{container_path}" "$EXTRACT_TMP/"
 podman rm "$CID"
 
-# Create archive
 cd "$EXTRACT_TMP"
 tar czf {q_remote_archive} *
 rm -rf "$EXTRACT_TMP"
@@ -1437,135 +1498,161 @@ exit 0
             subprocess.run(["tar", "xzf", local_archive, "-C", local_dest], check=True)
             os.unlink(local_archive)
 
+            _write_sidecar(
+                local_dest,
+                stage=resolved_stage,
+                container_path=container_path,
+                source_image=stage_image,
+            )
+
             _console().print(f"[green]Extracted to {local_dest}[/green]")
+            _console().print(f"[dim]Sidecar: {_sidecar_path(local_dest)}[/dim]")
         else:
             print(job_id)
             _console().print("[dim]After job completes, download with:[/dim]")
-            _console().print(f"  fcw data download .fcw/extract/{archive_name} {local_dest}")
+            _console().print(f"  fcw data download {remote_archive} {local_dest}")
+            _console().print(
+                "[yellow]Note: sidecar is only written after local extraction; "
+                "run `fcw container extract` with --wait to produce it.[/yellow]"
+            )
 
     finally:
         os.unlink(script_path)
 
 
+def _update_toml_bind_mount(toml_path: Path, bind_mount: str, container_path: str) -> None:
+    """Add/replace a bind-mount entry in an existing TOML file. Idempotent per container_path."""
+    content = toml_path.read_text()
+    old_mount_pattern = rf'"[^"]*:{re.escape(container_path)}"'
+    if re.search(old_mount_pattern, content):
+        content = re.sub(old_mount_pattern, f'"{bind_mount}"', content)
+    elif re.search(r'^mounts\s*=\s*\[', content, re.MULTILINE):
+        content = re.sub(r'(mounts\s*=\s*\[)', rf'\1\n    "{bind_mount}",', content)
+    else:
+        content += f'\nmounts = [\n    "{bind_mount}",\n]\n'
+    toml_path.write_text(content)
+
+
 @app.command("patch")
-def patch_container(  # FIXME: this is still only for the low-level interface, can't refer to container by config name/stage
+def patch_container(
     ctx: typer.Context,
-    local_path: str = typer.Argument(..., help="Local directory with patched code"),
-    container_path: str = typer.Argument(..., help="Target path inside container"),
-    toml: Optional[str] = typer.Option(None, "--toml", help="TOML file to update with bind-mount"),
-    create_toml: bool = typer.Option(False, "--create", help="Create new TOML file if it doesn't exist"),  # FIXME why would this be needed?
+    paths: List[str] = typer.Argument(
+        ...,
+        help="One or more local paths, each optionally with mount target: "
+             "'<local>' (reads sidecar for target) or '<local>:<container-path>' (override).",
+    ),
+    container_name: str = typer.Option(
+        ..., "--container", "-c", help="Container config name (from fcw.yaml). Its TOML is updated."
+    ),
 ):
-    """Upload patched code and configure bind-mount for quick iteration.
-    
-    This command uploads your modified code to the remote cluster and
-    optionally updates a container TOML file with a bind-mount configuration.
-    This allows fast iteration without rebuilding the container image.
-    
-    The patched code is uploaded to ``$WORKDIR/.patches/<dirname>`` and the
-    TOML file is updated to bind-mount this over the original container path.
-    
+    """Upload patched code dumps and add bind-mount entries to the container's TOML.
+
+    Primary purpose: enable quick iteration by mounting local code dumps over
+    directories in a deployed enroot image — no rebuild needed to test.
+
+    For each ``<local-path>``, if the mount target isn't given via
+    ``<local>:<container-path>``, it is read from the sidecar
+    ``<local>.meta.json`` written by ``fcw container extract``. The TOML file
+    resolved from ``containers.<container_name>.toml`` is updated in place
+    (bind-mount added/replaced per container_path) and uploaded to the remote.
+
+    ``patch`` never writes or modifies sidecars.
+
     Examples:
-        # Upload code and update TOML
-        fcw container patch ./code /workspace/BrainBERT --toml env/container.toml
-        
-        # Then run with the patched container:
-        # srun --environment env/container.toml python train.py
-        
-        # Just upload (no TOML update)
-        fcw container patch ./code /workspace/BrainBERT
+        # Target inferred from sidecar written by `extract`
+        fcw container patch --container app ./code
+
+        # Multiple dumps
+        fcw container patch -c app ./code ./configs
+
+        # Explicit override of the in-container target
+        fcw container patch -c app ./code:/opt/alt/path
     """
     config, system, account = resolve_context(ctx)
 
-    local_path = os.path.abspath(local_path)
-    if not os.path.isdir(local_path):
-        _console().print(f"[red]Not a directory: {local_path}[/red]")
+    container_cfg = _resolve_container_config(config, container_name)
+    if not container_cfg.toml:
+        _console().print(
+            f"[red]Container {container_name!r} has no `toml:` set in fcw.yaml[/red]\n"
+            "[dim]`patch` requires a TOML file to add bind-mount entries to.[/dim]"
+        )
         raise typer.Exit(1)
 
-    # Determine remote patch directory
-    patch_name = os.path.basename(local_path.rstrip("/"))
-    remote_patch_dir = config.resolve_path(f".patches/{patch_name}", remote=True)
+    toml_path = Path(container_cfg.toml)
+    if not toml_path.exists():
+        _console().print(f"[red]TOML file not found: {toml_path}[/red]")
+        raise typer.Exit(1)
 
-    # Upload the patched code
-    _console().print(f"[dim]Uploading {local_path} to {remote_patch_dir}...[/dim]")
+    # Resolve each (local_path, container_path) pair up-front; fail fast before uploading.
+    resolved: list[tuple[str, str]] = []
+    for arg in paths:
+        local_path, explicit_target = _parse_patch_arg(arg)
+        local_path = os.path.abspath(local_path)
+        if not os.path.isdir(local_path):
+            _console().print(f"[red]Not a directory: {local_path}[/red]")
+            raise typer.Exit(1)
 
-    async def do_upload():
-        from fcw.commands.data import _upload_directory
-        async_client = get_async_client()
-        await _upload_directory(async_client, system, account, local_path, remote_patch_dir)
-
-    asyncio.run(do_upload())
-    _console().print(f"[green]Uploaded to {remote_patch_dir}[/green]")
-
-    # Update TOML file if specified
-    bind_mount = f"{remote_patch_dir}:{container_path}"
-    if toml:
-        toml_path = Path(toml)
-        if not toml_path.exists():
-            if create_toml:
-                _console().print(f"[dim]Creating {toml}...[/dim]")
-                toml_content = f'''\
-# Container environment configuration
-# Generated by fcw container patch
-
-mounts = [
-    "{bind_mount}",
-]
-'''
-                toml_path.parent.mkdir(parents=True, exist_ok=True)
-                toml_path.write_text(toml_content)
-            else:
-                _console().print(f"[red]TOML file not found: {toml}[/red]")
-                _console().print("[dim]Use --create to create a new file[/dim]")
-                raise typer.Exit(1)
+        if explicit_target:
+            container_path = explicit_target
         else:
-            content = toml_path.read_text()
-
-            # Check if a mount to this container_path already exists
-            old_mount_pattern = rf'"[^"]*:{re.escape(container_path)}"'
-            if re.search(old_mount_pattern, content):
-                # Replace existing bind-mount entry
-                content = re.sub(old_mount_pattern, f'"{bind_mount}"', content)
-            elif re.search(r'^mounts\s*=\s*\[', content, re.MULTILINE):
-                # Append to existing mounts array
-                content = re.sub(
-                    r'(mounts\s*=\s*\[)',
-                    rf'\1\n    "{bind_mount}",',
-                    content,
+            meta = _read_sidecar(local_path)
+            if not meta or "container_path" not in meta:
+                _console().print(
+                    f"[red]No sidecar at {_sidecar_path(local_path)} and no explicit mount "
+                    f"target for {local_path!r}.[/red]\n"
+                    "[dim]Use '<local>:<container-path>' to override, or run "
+                    "`fcw container extract` to produce a sidecar.[/dim]"
                 )
-            else:
-                # No mounts array — add one
-                content += f'\nmounts = [\n    "{bind_mount}",\n]\n'
+                raise typer.Exit(1)
+            container_path = meta["container_path"]
 
-            toml_path.write_text(content)
+        resolved.append((local_path, container_path))
 
-        # Upload TOML to remote
-        remote_toml = config.resolve_path(toml, remote=True)
+    # Upload each dump and update the TOML.
+    from fcw.commands.data import _upload_directory
 
-        async def do_upload_toml():
-            async_client = get_async_client()
-            remote_toml_dir = os.path.dirname(remote_toml)
-            try:
-                await async_client.mkdir(
-                    system_name=system, path=remote_toml_dir, create_parents=True
-                )
-            except Exception:
-                pass
-            await async_client.upload(
-                system_name=system,
-                local_file=str(toml_path),
-                directory=remote_toml_dir,
-                filename=os.path.basename(remote_toml),
-                account=account,
-                blocking=True,
+    async def upload_all() -> list[str]:
+        async_client = get_async_client()
+        remote_dirs: list[str] = []
+        for local_path, _ in resolved:
+            patch_name = os.path.basename(local_path.rstrip("/"))
+            remote_patch_dir = config.resolve_path(f".patches/{patch_name}", remote=True)
+            _console().print(f"[dim]Uploading {local_path} -> {remote_patch_dir}...[/dim]")
+            await _upload_directory(async_client, system, account, local_path, remote_patch_dir)
+            remote_dirs.append(remote_patch_dir)
+        return remote_dirs
+
+    remote_patch_dirs = asyncio.run(upload_all())
+
+    for (local_path, container_path), remote_patch_dir in zip(resolved, remote_patch_dirs):
+        bind_mount = f"{remote_patch_dir}:{container_path}"
+        _update_toml_bind_mount(toml_path, bind_mount, container_path)
+        _console().print(f"[green]+ mount {remote_patch_dir} -> {container_path}[/green]")
+
+    # Upload the updated TOML to remote.
+    remote_toml = config.resolve_path(str(toml_path), remote=True)
+
+    async def do_upload_toml():
+        async_client = get_async_client()
+        remote_toml_dir = os.path.dirname(remote_toml)
+        try:
+            await async_client.mkdir(
+                system_name=system, path=remote_toml_dir, create_parents=True
             )
+        except Exception:
+            pass
+        await async_client.upload(
+            system_name=system,
+            local_file=str(toml_path),
+            directory=remote_toml_dir,
+            filename=os.path.basename(remote_toml),
+            account=account,
+            blocking=True,
+        )
 
-        asyncio.run(do_upload_toml())
-        _console().print(f"[green]Updated {toml} (local + remote)[/green]")
-        _console().print(f"[dim]Run with: srun --environment {remote_toml} ...[/dim]")
-    else:
-        _console().print("[dim]To use, add to your container TOML:[/dim]")
-        _console().print('  [mounts]')
-        _console().print(f'  "{remote_patch_dir}" = "{container_path}"')
+    asyncio.run(do_upload_toml())
+    _console().print(f"[green]Updated {toml_path} (local + remote)[/green]")
+    _console().print(f"[dim]Run with: srun --environment {remote_toml} ...[/dim]")
 
 
 @app.command("update", hidden=True, deprecated=True)

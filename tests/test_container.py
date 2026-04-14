@@ -16,11 +16,16 @@ from fcw.commands.container import (
     _generate_load_and_resolve_block,
     _isolated_staging_dir,
     _merge_build_args,
+    _parse_patch_arg,
     _parse_patch_mounts,
     _podman_setup_block,
+    _read_sidecar,
     _resolve_remote_tar,
+    _sidecar_path,
     _staging_cleanup_block,
     _stage_to_build_arg_name,
+    _update_toml_bind_mount,
+    _write_sidecar,
 )
 
 
@@ -385,6 +390,73 @@ class TestStageToBuildArgName:
 
     def test_simple_name(self):
         assert _stage_to_build_arg_name("base") == "BASE_IMAGE"
+
+
+class TestSidecar:
+    def test_path_is_sibling_with_suffix(self, tmp_path):
+        dump = tmp_path / "code"
+        dump.mkdir()
+        assert _sidecar_path(str(dump)) == dump.with_name("code.meta.json")
+
+    def test_write_then_read_roundtrip(self, tmp_path):
+        dump = tmp_path / "code"
+        dump.mkdir()
+        _write_sidecar(
+            str(dump),
+            stage="runtime-download",
+            container_path="/opt/BrainBERT",
+            source_image="app:v1-runtime-download",
+        )
+        meta = _read_sidecar(str(dump))
+        assert meta is not None
+        assert meta["stage"] == "runtime-download"
+        assert meta["container_path"] == "/opt/BrainBERT"
+        assert meta["source_image"] == "app:v1-runtime-download"
+        assert "extracted_at" in meta
+
+    def test_read_missing_returns_none(self, tmp_path):
+        assert _read_sidecar(str(tmp_path / "nothing")) is None
+
+    def test_read_corrupt_returns_none(self, tmp_path):
+        dump = tmp_path / "code"
+        dump.mkdir()
+        _sidecar_path(str(dump)).write_text("{not json")
+        assert _read_sidecar(str(dump)) is None
+
+
+class TestParsePatchArg:
+    def test_no_colon_returns_none_target(self):
+        assert _parse_patch_arg("./code") == ("./code", None)
+
+    def test_with_target(self):
+        assert _parse_patch_arg("./code:/opt/app") == ("./code", "/opt/app")
+
+    def test_splits_on_first_colon(self):
+        assert _parse_patch_arg("./code:/opt:sub") == ("./code", "/opt:sub")
+
+
+class TestUpdateTomlBindMount:
+    def test_appends_to_existing_mounts(self, tmp_path):
+        toml = tmp_path / "c.toml"
+        toml.write_text('image = "foo.sqsh"\nmounts = [\n    "${SCRATCH}:/data",\n]\n')
+        _update_toml_bind_mount(toml, "/scratch/.patches/code:/workspace", "/workspace")
+        content = toml.read_text()
+        assert '"/scratch/.patches/code:/workspace"' in content
+        assert '"${SCRATCH}:/data"' in content
+
+    def test_replaces_existing_mount_for_same_container_path(self, tmp_path):
+        toml = tmp_path / "c.toml"
+        toml.write_text('mounts = [\n    "/old:/workspace",\n]\n')
+        _update_toml_bind_mount(toml, "/new:/workspace", "/workspace")
+        content = toml.read_text()
+        assert '"/new:/workspace"' in content
+        assert "/old" not in content
+
+    def test_adds_mounts_array_when_absent(self, tmp_path):
+        toml = tmp_path / "c.toml"
+        toml.write_text('image = "foo.sqsh"\n')
+        _update_toml_bind_mount(toml, "/p:/w", "/w")
+        assert '"/p:/w"' in toml.read_text()
 
 
 class TestGenerateLoadAndResolveBlock:
