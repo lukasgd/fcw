@@ -1619,6 +1619,18 @@ def patch_container(
             remote_patch_dir = config.resolve_path(f".patches/{patch_name}", remote=True)
             _console().print(f"[dim]Uploading {local_path} -> {remote_patch_dir}...[/dim]")
             await _upload_directory(async_client, system, account, local_path, remote_patch_dir)
+            # Also mirror the sidecar to remote so `rebuild` can group patches by stage.
+            local_sidecar = _sidecar_path(local_path)
+            if local_sidecar.exists():
+                remote_patch_parent = os.path.dirname(remote_patch_dir)
+                await async_client.upload(
+                    system_name=system,
+                    local_file=str(local_sidecar),
+                    directory=remote_patch_parent,
+                    filename=local_sidecar.name,
+                    account=account,
+                    blocking=True,
+                )
             remote_dirs.append(remote_patch_dir)
         return remote_dirs
 
@@ -1679,9 +1691,13 @@ def rebuild_container(
     build_arg: Optional[List[str]] = typer.Option(
         None, "--build-arg", help="Build-time variables (KEY=VALUE)"
     ),
-    patch_stage: Optional[str] = typer.Option(
-        None, "--patch-stage", help="Stage to apply patches to (default: first local stage)"
+    default_stage: Optional[str] = typer.Option(
+        None, "--default-stage",
+        help="Stage assumed for patches missing a sidecar (otherwise an error).",
     ),
+    # Future: --target-stage <s> to stop rebuild at a non-final stage for users who
+    # want to skip the final build-offline. Deferred — correctness (always produce
+    # the final image) is preferred over performance by default.
     enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"),
     output: Optional[str] = typer.Option(
         None, "--output", "-o", help="Output path for enroot squashfs"
@@ -1745,38 +1761,106 @@ def rebuild_container(
     for host_path, container_path in patch_mounts:
         _console().print(f"  {host_path} → {container_path}")
 
-    # 3. Derive stage tag for the image to patch
-    target_stage = patch_stage or cont.get_local_stages()[0]  # FIXME: need a systematic way to map patches to the local stage they were extracted from, otherwise prefer to make patch_stage a required argument
-    stage_tag = cont.stage_tag(target_stage)
+    # 3. Group patches by local stage via remote sidecars
+    local_stages = cont.get_local_stages()
     remote_stage = cont.get_remote_stage()
+
+    async def fetch_stages() -> list[Optional[str]]:
+        async_client = get_async_client()
+        out: list[Optional[str]] = []
+        for host_path, _ in patch_mounts:
+            sidecar_remote = f"{host_path}{SIDECAR_SUFFIX}"
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+                local_tmp = tf.name
+            try:
+                await async_client.download(
+                    system_name=system,
+                    source_path=sidecar_remote,
+                    target_path=local_tmp,
+                    account=account,
+                    blocking=True,
+                )
+                meta = json.loads(Path(local_tmp).read_text())
+                out.append(meta.get("stage"))
+            except Exception:
+                out.append(None)
+            finally:
+                try:
+                    os.unlink(local_tmp)
+                except OSError:
+                    pass
+        return out
+
+    stages_for_patches = asyncio.run(fetch_stages())
+
+    patches_by_stage: dict[str, list[tuple[str, str]]] = {}
+    for (host_path, container_path), stage in zip(patch_mounts, stages_for_patches):
+        if stage is None:
+            if not default_stage:
+                _console().print(
+                    f"[red]No remote sidecar for {host_path} and no --default-stage given.[/red]\n"
+                    "[dim]Either re-run `fcw container patch` with a dump produced by "
+                    "`extract` (which writes a sidecar), or pass --default-stage.[/dim]"
+                )
+                raise typer.Exit(1)
+            stage = default_stage
+        if stage not in local_stages:
+            _console().print(
+                f"[red]Patch stage {stage!r} is not a local stage of container {name!r} "
+                f"({local_stages}).[/red]\n"
+                "[dim]Only local stages can be patched on the remote (they get loaded from "
+                "tars and committed). The remote stage is always rebuilt via podman build.[/dim]"
+            )
+            raise typer.Exit(1)
+        patches_by_stage.setdefault(stage, []).append((host_path, container_path))
+
+    _console().print(f"[bold]Patches grouped across {len(patches_by_stage)} stage(s):[/bold]")
+    for stage, entries in patches_by_stage.items():
+        _console().print(f"  [cyan]{stage}[/cyan]:")
+        for h, c in entries:
+            _console().print(f"    {h} -> {c}")
 
     # 4. Resolve paths
     images_dir = config.resolve_container_images_dir(cont)
-    remote_stage_tar = _resolve_remote_tar(stage_tag, config)
     staging_dir = _isolated_staging_dir(config, "rebuild", f"{name}-{tag}")
     dockerfile = cont.file
 
-    # 5. Generate SLURM script
+    # 5. Generate load block for ALL local stages (correctness: final build needs all
+    #    of them as build-args, patched or not).
+    stage_tag_pairs = [(s, cont.stage_tag(s)) for s in local_stages]
+    load_block, build_arg_lines = _generate_load_and_resolve_block(stage_tag_pairs, images_dir)
+
+    # Per-stage patch-and-commit block. Overwrites <STAGE>_IMAGE_ID with the
+    # patched image's ID so the final build-arg lines pick it up unchanged.
+    patch_commit_lines: list[str] = []
+    new_tag_suffix = _sanitize_tag_suffix(tag)
+    for stage, entries in patches_by_stage.items():
+        var = _stage_to_build_arg_name(stage).replace("-", "_")
+        patched_tag = f"{cont.stage_tag(stage)}-patched-{new_tag_suffix}"
+        q_patched_tag = shlex.quote(patched_tag)
+        cp_lines = "\n".join(
+            f'podman cp {shlex.quote(h)}/. "$CID:{c}"' for h, c in entries
+        )
+        patch_commit_lines.append(f"""
+echo "=== Patching stage '{stage}' ({len(entries)} mount(s)) ==="
+CID=$(podman create "${var}_ID" /bin/true)
+{cp_lines}
+podman commit "$CID" {q_patched_tag}
+podman rm "$CID"
+{var}_ID=$(podman image inspect --format '{{{{.Id}}}}' {q_patched_tag})
+echo "Committed patched stage '{stage}' as {patched_tag} (ID: ${var}_ID)"
+""")
+    patch_commit_block = "\n".join(patch_commit_lines)
+
     all_build_args = _merge_build_args(cont.build_args, build_arg)
     extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
     extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
 
-    q_stage_tag = shlex.quote(stage_tag)
-    q_remote_stage_tar = shlex.quote(remote_stage_tar)
     q_tag = shlex.quote(tag)
     q_staging_dir = shlex.quote(staging_dir)
     q_images_dir = shlex.quote(images_dir)
     global_sbatch = format_sbatch_lines(get_global_sbatch_options())
     setup_block = _podman_setup_block()
-
-    # Build podman cp lines for each patch
-    patch_cp_lines = []
-    for host_path, container_path in patch_mounts:
-        q_host = shlex.quote(host_path)
-        patch_cp_lines.append(f'podman cp {q_host}/. "$CID:{container_path}"')
-    patch_cp_block = "\n".join(patch_cp_lines)
-
-    build_arg_name = _stage_to_build_arg_name(target_stage)
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-rebuild
@@ -1789,33 +1873,16 @@ def rebuild_container(
 {setup_block}
 export CE_IMAGES_DIR={q_images_dir}
 
-# Load {target_stage} stage image from tar
-if ! podman image exists {q_stage_tag} 2>/dev/null; then
-    if [ -f {q_remote_stage_tar} ]; then
-        echo "Loading image from {q_remote_stage_tar}..."
-        podman load -i {q_remote_stage_tar}
-    else
-        echo "Error: image {q_stage_tag} not found and no tar at {q_remote_stage_tar}"
-        exit 1
-    fi
-fi
+# === Load all local stages ===
+{load_block}
 
-IMAGE_ID=$(podman image inspect --format '{{{{.Id}}}}' docker.io/library/{stage_tag} 2>/dev/null || podman image inspect --format '{{{{.Id}}}}' {stage_tag})
-echo "Resolved {target_stage} image ID: $IMAGE_ID"
-
-echo "=== Baking {len(patch_mounts)} patch(es) into {target_stage} image ==="
-CID=$(podman create $IMAGE_ID /bin/true)
-{patch_cp_block}
-PATCHED_IMAGE="{stage_tag}-patched"
-podman commit "$CID" "$PATCHED_IMAGE"
-podman rm "$CID"
-PATCHED_ID=$(podman image inspect --format '{{{{.Id}}}}' "$PATCHED_IMAGE")
-echo "Committed patched image: $PATCHED_IMAGE (ID: $PATCHED_ID)"
+# === Apply patches per stage (overrides the corresponding *_IMAGE_ID var) ===
+{patch_commit_block}
 
 echo "=== Rebuilding {remote_stage} stage ==="
 cd {q_staging_dir}
 podman build --target {shlex.quote(remote_stage)} \\
-    --build-arg {build_arg_name}=$PATCHED_ID \\
+{build_arg_lines}
 {extra_build_args_line}    -t {q_tag} \\
     -f Dockerfile .
 
