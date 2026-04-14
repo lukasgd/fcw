@@ -183,23 +183,50 @@ When the client and remote cluster have different CPU architectures
 For quick iteration without rebuilding the full container:
 
 ```bash
-# extract code from download container locally
+# extract code from a container stage locally
+# (stage defaults to 'download'; override with --stage)
 fcw container extract app-main /workspace/BrainBERT ./code
 ```
 
-Then edit the `./code` locally. Test with bind-mounting of patched code (no rebuild)
+`extract` also writes a sidecar `./code.meta.json` recording the stage and
+in-container path. Later commands use this to map patches back to the stage
+they came from.
+
+Edit `./code` locally. Test by bind-mounting the patched code (no rebuild):
 ```bash
-fcw container patch ./code /workspace/BrainBERT --toml env/container.toml
+fcw container patch --container app-main ./code
 ```
-Now run a test job with the patched container
+Mount target defaults to the sidecar's `container_path`; override with
+`./code:/some/other/path` if needed. The container's TOML
+(`containers.app-main.toml` in `fcw.yaml`) is updated in place and uploaded.
+Multiple dumps can be patched at once:
+```bash
+fcw container patch -c app-main ./code ./configs
+```
+
+Run a test job with the patched container:
 ```bash
 fcw job submit srun --environment env/container.toml python train.py
 ```
-This can be repeated several times until tests are successful. When satisfied, bake the accumulated patches into a new image:
+
+Repeat edit/patch/test until stable. Then bake the accumulated patches into
+a new image:
 ```bash
 fcw container rebuild app-main --tag app-main:v2 --enroot --wait
 ```
-`rebuild` reads all `.patches/` bind-mounts from the container's TOML, bakes them into the image via a SLURM job, writes a new TOML without the patch mounts, and registers the rebuilt container in `fcw.yaml` (e.g. as `app-main-v2`).
+`rebuild` reads the `.patches/` bind-mounts from the container's TOML,
+groups them by stage via the uploaded sidecars, applies each group to its
+stage's image on the remote (loading all local stages, `podman cp` + commit
+for patched ones), then rebuilds the remote stage. A new TOML without patch
+mounts is written next to the original, the rebuilt container is registered
+in `fcw.yaml` (e.g. `app-main-v2`), and per-stage tars are saved under the
+new tag so further rebuilds (`app-main:v2 -> app-main:v3`) work the same way.
+
+For rebuilds without a pre-existing TOML, pass dumps directly (Mode B):
+```bash
+fcw container rebuild app-main --tag app-main:v2 \
+    --dump ./code --dump ./configs --wait
+```
 
 Now you can re-run the same job against the rebuilt container image. The example script appended below automates this workflow.
 
@@ -266,17 +293,17 @@ kill $SYNC_PID
 #!/bin/bash
 # Fast iteration on code without rebuilding full container
 
-# One-time setup: extract code
-fcw container extract my-fcw-app:download /workspace/BrainBERT ./code
+# One-time setup: extract code (writes ./code.meta.json sidecar)
+fcw container extract my-fcw-app /workspace/BrainBERT ./code
 
 # Edit loop
 while true; do
     # Edit ./code locally with your favorite editor...
     read -p "Press Enter to test changes..."
-    
-    # Upload and configure bind-mount
-    fcw container patch ./code /workspace/BrainBERT --toml env/dev.toml
-    
+
+    # Upload and add bind-mount to containers.my-fcw-app.toml
+    fcw container patch --container my-fcw-app ./code
+
     # Run test job
     fcw job submit --time 00:30:00 -- slurm/test.sh
 done
