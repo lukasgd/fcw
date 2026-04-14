@@ -90,8 +90,8 @@ Tests the code iteration workflow: extract code from container, modify locally, 
 
 | Test | Command | Verifies |
 |------|---------|----------|
-| `test_container_extract` | `fcw container extract fcw-aux:latest /workspace/aux extracted-code --wait` | SLURM job: loads image, `podman cp`s `/workspace/aux` out, archives it. Downloads and extracts locally. |
-| `test_container_patch` | `fcw container patch extracted-code /workspace --toml env/container-patch.toml --create` | Uploads patched code, generates TOML with bind-mount entry for `/workspace`. |
+| `test_container_extract` | `fcw container extract aux /workspace/aux extracted-code --wait` | SLURM job: loads the stage image, `podman cp`s `/workspace/aux` out, archives it. Downloads and extracts locally. Writes sidecar `extracted-code.meta.json`. |
+| `test_container_patch` | `fcw container patch --container app extracted-code` (or `data/raw:/workspace`) | Uploads the dump; mount target comes from the sidecar or from `<local>:<container>` override. Adds a `.patches/` entry to `containers.app.toml`. |
 
 ### 6. Data Upload (4 tests)
 

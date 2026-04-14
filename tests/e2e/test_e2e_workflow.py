@@ -182,35 +182,46 @@ class TestContainerIterate:
     """Code iteration workflow: extract from container, patch with bind-mount."""
 
     def test_container_extract(self, runner, timed_step):
-        """Extract files from aux container to local directory."""
+        """Extract files from aux container stage to local directory.
+
+        Also verifies the sidecar `.meta.json` is written next to the dump.
+        """
         with timed_step("container-extract"):
             result = runner.invoke(app, [
                 "container", "extract",
-                "fcw-aux:latest", "/workspace/aux",
+                "aux", "/workspace/aux",
                 "extracted-code",
                 "--wait",
             ])
         assert result.exit_code == 0, result.output
         assert os.path.isdir("extracted-code")
+        # Sidecar should exist and record the stage + container_path.
+        sidecar = "extracted-code.meta.json"
+        assert os.path.exists(sidecar), result.output
+        import json
+        meta = json.loads(open(sidecar).read())
+        assert meta["container_path"] == "/workspace/aux"
+        assert "stage" in meta
 
     def test_container_patch(self, runner, timed_step):
-        """Upload patched code and create bind-mount TOML."""
-        # Use extracted code dir, or data/raw as fallback
-        patch_source = "extracted-code"
-        if not os.path.isdir(patch_source):
-            patch_source = "data/raw"
+        """Upload patched code and add bind-mount entry to container TOML."""
+        # Prefer the sidecar-annotated dump from `extract`; fall back to data/raw.
+        # When falling back, use '<local>:<container>' syntax since data/raw has no sidecar.
+        if os.path.isdir("extracted-code"):
+            path_arg = "extracted-code"  # sidecar supplies the target
+        else:
+            path_arg = "data/raw:/workspace"
 
         with timed_step("container-patch"):
             result = runner.invoke(app, [
                 "container", "patch",
-                patch_source, "/workspace",
-                "--toml", "env/container-patch.toml", "--create",
+                "--container", "app",
+                path_arg,
             ])
         assert result.exit_code == 0, result.output
-        # Verify TOML was created locally with bind-mount entry
-        assert os.path.exists("env/container-patch.toml")
-        content = open("env/container-patch.toml").read()
-        assert "/workspace" in content
+        # app's TOML should now contain a .patches/ bind-mount.
+        content = open("env/container.toml").read()
+        assert ".patches/" in content
 
 
 # ---------------------------------------------------------------------------
@@ -222,14 +233,12 @@ class TestContainerRebuild:
 
     def test_patch_app_container(self, runner):
         """Patch the app container so its TOML has .patches/ mounts for rebuild."""
-        patch_source = "extracted-code"
-        if not os.path.isdir(patch_source):
-            patch_source = "data/raw"
-
+        # Use the mount-syntax override so this works even if no sidecar is present.
+        patch_source = "extracted-code" if os.path.isdir("extracted-code") else "data/raw"
         result = runner.invoke(app, [
             "container", "patch",
-            patch_source, "/workspace/patched",
-            "--toml", "env/container.toml",
+            "--container", "app",
+            f"{patch_source}:/workspace/patched",
         ])
         assert result.exit_code == 0, result.output
         content = open("env/container.toml").read()
