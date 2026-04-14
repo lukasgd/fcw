@@ -14,10 +14,12 @@ from fcw.commands.container import (
     _detect_container_runtime,
     _find_container_config,
     _generate_load_and_resolve_block,
+    _isolated_staging_dir,
     _merge_build_args,
     _parse_patch_mounts,
     _podman_setup_block,
     _resolve_remote_tar,
+    _staging_cleanup_block,
     _stage_to_build_arg_name,
 )
 
@@ -281,6 +283,44 @@ class TestDeriveContainerName:
     def test_stem_not_stripped_when_no_match(self):
         """If original_name does not end with the parent tag suffix, keep it whole."""
         assert _derive_container_name("node-burn", "burn:v1", "burn:v2") == "node-burn-v2"
+
+
+class TestIsolatedStagingDir:
+    def test_shape(self, sample_config):
+        result = _isolated_staging_dir(sample_config, "rebuild", "app-v2")
+        # Under workdir.remote / .fcw/<base>/<key>-<ts>
+        assert ".fcw/rebuild/app-v2-" in result
+        # Timestamp suffix: YYYYMMDDTHHMMSS (15 chars)
+        tail = result.rsplit("-", 1)[-1]
+        assert len(tail) == 15 and "T" in tail
+
+    def test_sanitizes_special_chars(self, sample_config):
+        result = _isolated_staging_dir(sample_config, "deploy", "my/app:v2")
+        assert "my-app-v2" in result
+        assert ":" not in result.split("/")[-1]
+        assert "/" not in result.rsplit("/.fcw/", 1)[-1].split("/")[-1].split("-20")[0]
+
+    def test_empty_key_falls_back(self, sample_config):
+        result = _isolated_staging_dir(sample_config, "deploy", "")
+        assert "/.fcw/deploy/build-" in result
+
+
+class TestStagingCleanupBlock:
+    def test_contains_rm_and_trap(self):
+        block = _staging_cleanup_block("/scratch/.fcw/rebuild/app-v2-20260414T103000")
+        assert "rm -rf /scratch/.fcw/rebuild/app-v2-20260414T103000" in block
+        assert "trap" in block
+        assert "EXIT" in block
+
+    def test_quotes_path_with_special_chars(self):
+        """Paths with shell metacharacters must be shell-quoted."""
+        block = _staging_cleanup_block("/tmp/a b/x")
+        assert "'/tmp/a b/x'" in block
+
+    def test_preserves_on_failure(self):
+        """Cleanup must only run on successful exit, else debugging is impossible."""
+        block = _staging_cleanup_block("/tmp/x")
+        assert "$? -eq 0" in block
 
 
 class TestDeriveRebuiltTomlPath:

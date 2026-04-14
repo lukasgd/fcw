@@ -45,6 +45,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -255,6 +256,37 @@ def _derive_container_name(original_name: str, original_tag: str, new_tag: str) 
         stem = stem[: -(len(parent_suffix) + 1)]
     new_suffix = _sanitize_tag_suffix(new_tag)
     return f"{stem}-{new_suffix}"
+
+
+def _isolated_staging_dir(config, base: str, key: str) -> str:
+    """Return a unique remote staging subdir for a build/rebuild job.
+
+    Two concurrent jobs must never share a staging directory: the Dockerfile
+    and any stage tars uploaded there are named deterministically (e.g.
+    ``Dockerfile``), so a shared parent leads to one job clobbering the
+    other's inputs mid-flight.
+
+    The returned path has the form ``.fcw/<base>/<safe_key>-<YYYYMMDDTHHMMSS>``.
+    The embedded timestamp makes stale dirs easy to identify for later GC.
+    """
+    safe_key = re.sub(r'[^a-zA-Z0-9]', '-', key).strip('-') or "build"
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    return config.resolve_path(f".fcw/{base}/{safe_key}-{timestamp}", remote=True)
+
+
+def _staging_cleanup_block(staging_dir: str) -> str:
+    """Bash snippet that removes *staging_dir* on successful SLURM-script exit.
+
+    Registered via ``trap`` so it runs on the normal exit path but not when
+    the script aborts under ``set -e``, preserving the staging dir for
+    post-mortem inspection when a job fails.
+    """
+    q = shlex.quote(staging_dir)
+    return f"""
+# Clean up isolated staging dir on successful exit (preserved on failure for debugging)
+_fcw_staging_cleanup() {{ rm -rf {q} || true; }}
+trap '[ $? -eq 0 ] && _fcw_staging_cleanup' EXIT
+"""
 
 
 def _derive_rebuilt_toml_path(original: Path, original_tag: str, new_tag: str) -> Path:
@@ -913,7 +945,9 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
         _console().print(f"[red]Dockerfile not found: {resolved_dockerfile}[/red]")
         raise typer.Exit(1)
 
-    staging_dir = config.resolve_path(".fcw/build-remote", remote=True)
+    staging_dir = _isolated_staging_dir(
+        config, "build-remote", f"{image}-{resolved_tag}"
+    )
 
     if enroot:
         output_path = output or os.path.join(
@@ -966,7 +1000,7 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
 #SBATCH --error=fcw-container-build-remote-%j.out
 {format_sbatch_lines(get_global_sbatch_options())}
 set -euxo pipefail
-
+{_staging_cleanup_block(staging_dir)}
 {_podman_setup_block()}
 export CE_IMAGES_DIR={q_images_dir}
 
@@ -1142,7 +1176,9 @@ def deploy_image(
         f"[bold]Step 3: Building '{remote_stage}' stage on cluster ({final_tag})...[/bold]"
     )
 
-    staging_dir = config.resolve_path(".fcw/deploy", remote=True)  # FIXME: Don't all the Dockerfiles overwrite each other in the staging dir like this?
+    staging_dir = _isolated_staging_dir(
+        config, "deploy", f"{name or 'deploy'}-{final_tag}"
+    )
 
     async def do_upload_dockerfile():
         async_client = get_async_client()
@@ -1186,7 +1222,7 @@ def deploy_image(
 #SBATCH --error=fcw-container-deploy-%j.out
 {global_sbatch}
 set -euxo pipefail
-
+{_staging_cleanup_block(staging_dir)}
 {setup_block}
 export CE_IMAGES_DIR={q_images_dir}
 
@@ -1630,7 +1666,7 @@ def rebuild_container(
     # 4. Resolve paths
     images_dir = config.resolve_container_images_dir(cont)
     remote_stage_tar = _resolve_remote_tar(stage_tag, config)
-    staging_dir = config.resolve_path(".fcw/rebuild", remote=True)
+    staging_dir = _isolated_staging_dir(config, "rebuild", f"{name}-{tag}")
     dockerfile = cont.file
 
     # 5. Generate SLURM script
@@ -1662,7 +1698,7 @@ def rebuild_container(
 #SBATCH --output=fcw-container-rebuild-%j.out
 #SBATCH --error=fcw-container-rebuild-%j.out
 {global_sbatch}set -euxo pipefail
-
+{_staging_cleanup_block(staging_dir)}
 {setup_block}
 export CE_IMAGES_DIR={q_images_dir}
 
@@ -1744,7 +1780,7 @@ ls -lh {q_output_path}
                 system_name=system,
                 local_file=dockerfile,
                 directory=staging_dir,
-                filename="Dockerfile",  # FIXME: doesn't this cause conflicts if multiple containers are rebuilt at the same time?
+                filename="Dockerfile",
                 account=account,
                 blocking=True,
             )
