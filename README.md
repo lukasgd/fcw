@@ -195,24 +195,13 @@ Now run a test job with the patched container
 ```bash
 fcw job submit srun --environment env/container.toml python train.py
 ```
-This can be repeated several times until tests are successful. When satisfied, bake changes in with patch + rebuild
+This can be repeated several times until tests are successful. When satisfied, bake the accumulated patches into a new image:
 ```bash
-fcw container update ./code app-main:download /workspace/BrainBERT \
-    --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.multistage \
-    --build-arg BASE_IMAGE=ubuntu:24.04 --enroot --wait
+fcw container rebuild app-main --tag app-main:v2 --enroot --wait
 ```
+`rebuild` reads all `.patches/` bind-mounts from the container's TOML, bakes them into the image via a SLURM job, writes a new TOML without the patch mounts, and registers the rebuilt container in `fcw.yaml` (e.g. as `app-main-v2`).
 
-Now you can re-run the same job with the updated container image tag. The example script appended below automates this workflow
-
-
-#### Other Commands
-
-TODO: This seems to need fixing
-
-```bash
-# Rebuild from patched TOML (removes bind-mounts, rebuilds build-offline stage)
-fcw container rebuild app-main --wait
-```
+Now you can re-run the same job against the rebuilt container image. The example script appended below automates this workflow.
 
 ### FUSE Mount (experimental)
 
@@ -292,8 +281,6 @@ while true; do
     fcw job submit --time 00:30:00 -- slurm/test.sh
 done
 
-# When satisfied, bake changes into new image
-fcw container update ./code my-fcw-app:download /workspace/BrainBERT \
-    --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.prod-multistage \
-    --build-arg BASE_IMAGE=ubuntu:24.04 --enroot --wait
+# When satisfied, bake accumulated patches into a new image
+fcw container rebuild my-fcw-app --tag my-fcw-app:v2 --enroot --wait
 ```

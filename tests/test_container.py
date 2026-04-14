@@ -5,9 +5,12 @@ from unittest.mock import patch
 
 import pytest
 
+from pathlib import Path
+
 from fcw.commands.container import (
     _create_rebuilt_toml,
     _derive_container_name,
+    _derive_rebuilt_toml_path,
     _detect_container_runtime,
     _find_container_config,
     _generate_load_and_resolve_block,
@@ -260,16 +263,50 @@ mounts = [
 
 class TestDeriveContainerName:
     def test_simple_version(self):
-        assert _derive_container_name("app", "my-app:v2") == "app-v2"
+        assert _derive_container_name("app", "my-app:v1", "my-app:v2") == "app-v2"
 
     def test_dotted_version(self):
-        assert _derive_container_name("app", "my-app:24.04") == "app-24-04"
+        assert _derive_container_name("app", "my-app:v1", "my-app:24.04") == "app-24-04"
 
     def test_no_colon(self):
-        assert _derive_container_name("app", "latest") == "app-latest"
+        assert _derive_container_name("app", "latest", "rebuilt") == "app-rebuilt"
 
     def test_complex_suffix(self):
-        assert _derive_container_name("web", "img:v1.2-beta") == "web-v1-2-beta"
+        assert _derive_container_name("web", "img:v0", "img:v1.2-beta") == "web-v1-2-beta"
+
+    def test_idempotent_chain_v1_to_v2_to_v3(self):
+        """Repeated rebuilds should not stack suffixes."""
+        assert _derive_container_name("app-v2", "my-app:v2", "my-app:v3") == "app-v3"
+
+    def test_stem_not_stripped_when_no_match(self):
+        """If original_name does not end with the parent tag suffix, keep it whole."""
+        assert _derive_container_name("node-burn", "burn:v1", "burn:v2") == "node-burn-v2"
+
+
+class TestDeriveRebuiltTomlPath:
+    def test_simple_new_version(self):
+        result = _derive_rebuilt_toml_path(
+            Path("env/container.toml"), "app:v1", "app:v2"
+        )
+        assert result == Path("env/container-v2.toml")
+
+    def test_chain_replaces_parent_suffix(self):
+        result = _derive_rebuilt_toml_path(
+            Path("env/container-v2.toml"), "app:v2", "app:v3"
+        )
+        assert result == Path("env/container-v3.toml")
+
+    def test_preserves_non_standard_stem(self):
+        result = _derive_rebuilt_toml_path(
+            Path("env/node-burn.toml"), "app:v1", "app:v2"
+        )
+        assert result == Path("env/node-burn-v2.toml")
+
+    def test_sanitizes_dotted_tag(self):
+        result = _derive_rebuilt_toml_path(
+            Path("env/container.toml"), "app:latest", "app:24.04"
+        )
+        assert result == Path("env/container-24-04.toml")
 
 
 class TestMergeBuildArgs:

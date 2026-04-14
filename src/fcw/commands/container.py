@@ -31,11 +31,10 @@ Key workflows:
        # Then use: srun --environment env/container.toml ...
 
 4. **Bake Changes (rebuild)**:
-   
-   Patch the download image and rebuild build-offline: # FIXME: does this cover multipatch updates?
-   
-       fcw container update ./code my-fcw-app:download /workspace/BrainBERT \\
-           --tag my-fcw-app:v2 --rebuild --enroot --wait
+
+   Bake accumulated patches from the container TOML into a new image:
+
+       fcw container rebuild my-fcw-app --tag my-fcw-app:v2 --enroot --wait
 """
 
 from __future__ import annotations
@@ -233,17 +232,48 @@ def _create_rebuilt_toml(original_toml_path: str, new_toml_path: str) -> None:
     Path(new_toml_path).write_text(result)
 
 
-def _derive_container_name(original_name: str, new_tag: str) -> str:  # FIXME: check how different versions of an app accumulate in the config - is this sensible?
-    """Derive a new container config name from the original name and new tag.
+def _sanitize_tag_suffix(tag: str) -> str:
+    """Sanitize a tag's suffix (post-colon part) into an identifier fragment."""
+    suffix = tag.split(":")[-1] if ":" in tag else tag
+    return re.sub(r'[^a-zA-Z0-9]', '-', suffix).strip('-')
 
-    Examples::
 
-        _derive_container_name("app", "my-app:v2")   -> "app-v2"
-        _derive_container_name("app", "my-app:24.04") -> "app-24-04"
+def _derive_container_name(original_name: str, original_tag: str, new_tag: str) -> str:
+    """Derive a new container config name from the original entry and a new tag.
+
+    Idempotent across version chains: if *original_name* already ends with the
+    sanitized suffix of *original_tag*, that trailing suffix is replaced rather
+    than re-appended. This keeps v1 -> v2 -> v3 chains stable::
+
+        _derive_container_name("app", "my-app:v1", "my-app:v2") -> "app-v2"
+        _derive_container_name("app-v2", "my-app:v2", "my-app:v3") -> "app-v3"
+        _derive_container_name("app", "my-app:latest", "my-app:24.04") -> "app-24-04"
     """
-    tag_suffix = new_tag.split(":")[-1] if ":" in new_tag else new_tag
-    tag_suffix = re.sub(r'[^a-zA-Z0-9]', '-', tag_suffix).strip('-')
-    return f"{original_name}-{tag_suffix}"
+    parent_suffix = _sanitize_tag_suffix(original_tag)
+    stem = original_name
+    if parent_suffix and stem.endswith(f"-{parent_suffix}"):
+        stem = stem[: -(len(parent_suffix) + 1)]
+    new_suffix = _sanitize_tag_suffix(new_tag)
+    return f"{stem}-{new_suffix}"
+
+
+def _derive_rebuilt_toml_path(original: Path, original_tag: str, new_tag: str) -> Path:
+    """Derive the sibling TOML path for a rebuilt container version.
+
+    Mirrors ``_derive_container_name`` but operates on the original TOML path's
+    stem so the new file lives next to the original with a version-suffixed
+    name::
+
+        env/container.toml,    app:v1 -> app:v2  ->  env/container-v2.toml
+        env/container-v2.toml, app:v2 -> app:v3  ->  env/container-v3.toml
+        env/node-burn.toml,    app:v1 -> app:v2  ->  env/node-burn-v2.toml
+    """
+    parent_suffix = _sanitize_tag_suffix(original_tag)
+    stem = original.stem
+    if parent_suffix and stem.endswith(f"-{parent_suffix}"):
+        stem = stem[: -(len(parent_suffix) + 1)]
+    new_suffix = _sanitize_tag_suffix(new_tag)
+    return original.with_name(f"{stem}-{new_suffix}{original.suffix}")
 
 
 def _build_one_stage(
@@ -1502,274 +1532,15 @@ mounts = [
         _console().print(f'  "{remote_patch_dir}" = "{container_path}"')
 
 
-@app.command("update")
-def update_image(  # FIXME: this is still only for the low-level interface, can't refer to container by config name/stage
-    ctx: typer.Context,
-    local_path: str = typer.Argument(..., help="Local directory with patched code"),
-    image: str = typer.Argument(..., help="Base image to patch (e.g., my-fcw-app:download)"),
-    container_path: str = typer.Argument(..., help="Path inside container to replace"),
-    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Tag for patched image"),
-    rebuild: bool = typer.Option(False, "--rebuild", help="Rebuild build-offline stage from patched image"), # FIXME: why would skipping the rebuild be useful? How should the user make use of the patched image or even know where to find it? 
-    dockerfile: Optional[str] = typer.Option(None, "--file", "-f", help="Dockerfile for rebuild (required with --rebuild)"),
-    enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path for enroot squashfs"),
-    build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Set build-time variables for rebuild (KEY=VALUE)"),
-    wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for job completion"),
-):
-    """Patch a container image with updated code and optionally rebuild.
-    
-    This is the symmetric operation to ``extract``: it takes local code and
-    bakes it into a container image. The workflow is:
-    
-    1. Upload patched code to staging directory
-    2. Create container from base image, copy in patched code, commit as new image
-    3. Optionally rebuild the build-offline stage using the patched image
-    4. Optionally export to enroot squashfs
-    
-    Examples:
-        # Just patch the download image
-        fcw container update ./code my-fcw-app:download /workspace/BrainBERT --tag my-fcw-app:patched
-        
-        # Patch and rebuild build-offline stage
-        fcw container update ./code my-fcw-app:download /workspace/BrainBERT \\
-            --tag my-fcw-app:v2 --rebuild --file env/Dockerfile.prod-multistage
-        
-        # Full pipeline with enroot
-        fcw container update ./code my-fcw-app:download /workspace/BrainBERT \\
-            --tag my-fcw-app:v2 --rebuild -f env/Dockerfile.prod-multistage --enroot --wait
-    """
-    config, system, account = resolve_context(ctx)
-
-    if rebuild and not dockerfile:
-        _console().print("[red]--rebuild requires --file[/red]")
-        raise typer.Exit(1)
-
-    local_path = os.path.abspath(local_path)
-    if not os.path.isdir(local_path):
-        _console().print(f"[red]Not a directory: {local_path}[/red]")
-        raise typer.Exit(1)
-
-    # Generate tag if not provided
-    patched_tag = tag or f"{image.split(':')[0]}:patched"
-    final_tag = patched_tag
-
-    # Resolve images directory and container config if available
-    images_dir = config.resolve_path("ce-images/", remote=True)
-    matched_cont_config = None
-    for _name, cont_config in config.containers.items():
-        if cont_config.tag in (tag, image, patched_tag, final_tag):
-            images_dir = config.resolve_container_images_dir(cont_config)
-            matched_cont_config = cont_config
-            break
-
-    # Staging paths
-    patch_name = os.path.basename(local_path.rstrip("/"))
-    staging_dir = config.resolve_path(".fcw/update", remote=True)
-    remote_patch_path = f"{staging_dir}/{patch_name}"
-    remote_dockerfile = f"{staging_dir}/Dockerfile" if dockerfile else None
-
-    # Step 1: Upload patched code
-    _console().print("[bold]Step 1: Uploading patched code...[/bold]")
-
-    async def do_upload():
-        from fcw.commands.data import _upload_directory
-        async_client = get_async_client()
-
-        # Create staging directory
-        try:
-            await async_client.mkdir(
-                system_name=system, path=staging_dir, create_parents=True
-            )
-        except Exception:
-            pass
-
-        # Upload code (directory)
-        await _upload_directory(async_client, system, account, local_path, remote_patch_path)
-
-        # Upload Dockerfile if rebuilding
-        if dockerfile:
-            await async_client.upload(
-                system_name=system,
-                local_file=dockerfile,
-                directory=staging_dir,
-                filename="Dockerfile",
-                account=account,
-                blocking=True,
-            )
-
-    asyncio.run(do_upload())
-    _console().print(f"[green]Uploaded to {staging_dir}[/green]")
-
-    # Step 2: Build job script
-    _console().print("[bold]Step 2: Submitting build job...[/bold]")
-
-    # Resolve the pushed tar path so the job can load it if needed
-    remote_image_tar = _resolve_remote_tar(image, config)
-
-    # Extra build args for podman build
-    all_build_args = _merge_build_args(
-        matched_cont_config.build_args if matched_cont_config else None, build_arg
+@app.command("update", hidden=True, deprecated=True)
+def update_image(ctx: typer.Context) -> None:
+    """Removed: use ``patch`` + ``rebuild`` instead."""
+    _console().print(
+        "[red]`fcw container update` has been removed.[/red]\n"
+        "Use [bold]fcw container patch[/bold] to stage code changes and "
+        "[bold]fcw container rebuild[/bold] to bake them into a new image."
     )
-    extra_build_args = " ".join(f"--build-arg {shlex.quote(a)}" for a in all_build_args)
-    extra_build_args_line = f"    {extra_build_args} \\\n" if extra_build_args else ""
-
-    q_image = shlex.quote(image)
-    q_remote_image_tar = shlex.quote(remote_image_tar)
-    q_remote_patch_path = shlex.quote(remote_patch_path)
-    q_container_path = shlex.quote(container_path)
-    q_patched_tag = shlex.quote(patched_tag)
-    q_final_tag = shlex.quote(final_tag)
-    q_staging_dir = shlex.quote(staging_dir)
-    global_sbatch = format_sbatch_lines(get_global_sbatch_options())
-    setup_block = _podman_setup_block()
-
-    # Common: load base image from tar
-    load_image_block = f"""
-# Load image from tar if not already available
-if ! podman image exists {q_image} 2>/dev/null; then
-    if [ -f {q_remote_image_tar} ]; then
-        echo "Loading image from {q_remote_image_tar}..."
-        podman load -i {q_remote_image_tar}
-    else
-        echo "Error: image {q_image} not found and no tar at {q_remote_image_tar}"
-        exit 1
-    fi
-fi
-"""
-
-    # Build the job script
-    if rebuild:
-        # Full rebuild: patch + build-offline
-        if enroot:
-            output_path = output or os.path.join(images_dir, f"{final_tag.replace(':', '+')}.sqsh")
-
-        script = f"""#!/bin/bash -l
-#SBATCH --job-name=fcw-container-update
-#SBATCH --time=01:00:00
-#SBATCH --nodes=1
-#SBATCH --output=fcw-container-update-%j.out
-#SBATCH --error=fcw-container-update-%j.out
-{global_sbatch}
-set -euxo pipefail
-
-{setup_block}
-{load_image_block}
-
-echo "=== Step 1: Patching {q_image} ==="
-
-# Create container from base image
-CID=$(podman create {q_image} /bin/true)
-echo "Created container: $CID"
-
-# Copy patched code into container
-podman cp {q_remote_patch_path}/. "$CID:{container_path}"
-
-# Commit as patched image
-PATCHED_IMAGE="{patched_tag}-base"
-podman commit "$CID" "$PATCHED_IMAGE"
-podman rm "$CID"
-PATCHED_ID=$(podman image inspect --format '{{{{.Id}}}}' "$PATCHED_IMAGE")
-echo "Committed patched image: $PATCHED_IMAGE (ID: $PATCHED_ID)"
-
-echo "=== Step 2: Rebuilding build-offline stage ==="
-
-# Build build-offline stage from patched download image
-cd {q_staging_dir}
-podman build --target build-offline \\
-    --build-arg DOWNLOAD_IMAGE=$PATCHED_ID \\
-{extra_build_args_line}    -t {q_final_tag} \\
-    -f Dockerfile .
-
-echo "Built final image: {q_final_tag}"
-"""
-        if enroot:
-            q_output_path = shlex.quote(output_path)
-            script += f"""
-echo "=== Step 3: Exporting to enroot ==="
-mkdir -p $(dirname {q_output_path})
-rm -f {q_output_path}
-enroot import -x mount -o {q_output_path} podman://{final_tag} || true
-if [ ! -f {q_output_path} ]; then
-    echo "ERROR: enroot import failed - output not found: {q_output_path}"
-    exit 1
-fi
-echo "Exported to: {q_output_path}"
-ls -lh {q_output_path}
-"""
-        script += "\nexit 0\n"
-    else:
-        # Just patch, no rebuild
-        script = f"""#!/bin/bash -l
-#SBATCH --job-name=fcw-container-update
-#SBATCH --time=00:30:00
-#SBATCH --nodes=1
-#SBATCH --output=fcw-container-update-%j.out
-#SBATCH --error=fcw-container-update-%j.out
-{global_sbatch}
-set -euxo pipefail
-
-{setup_block}
-{load_image_block}
-
-echo "=== Patching {q_image} ==="
-
-# Create container from base image
-CID=$(podman create {q_image} /bin/true)
-echo "Created container: $CID"
-
-# Copy patched code into container
-podman cp {q_remote_patch_path}/. "$CID:{container_path}"
-
-# Commit as patched image
-podman commit "$CID" {q_patched_tag}
-podman rm "$CID"
-
-echo "Committed patched image: {q_patched_tag}"
-podman images | grep {shlex.quote(patched_tag.split(':')[0])}
-"""
-        if enroot:
-            output_path = output or os.path.join(images_dir, f"{patched_tag.replace(':', '+')}.sqsh")
-            q_output_path = shlex.quote(output_path)
-            script += f"""
-echo "=== Exporting to enroot ==="
-mkdir -p $(dirname {q_output_path})
-rm -f {q_output_path}
-enroot import -x mount -o {q_output_path} podman://{patched_tag} || true
-if [ ! -f {q_output_path} ]; then
-    echo "ERROR: enroot import failed - output not found: {q_output_path}"
-    exit 1
-fi
-echo "Exported to: {q_output_path}"
-ls -lh {q_output_path}
-"""
-        script += "\nexit 0\n"
-
-    client = get_client()
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-        f.write(script)
-        script_path = f.name
-
-    try:
-        result = client.submit(
-            system_name=system,
-            account=account,
-            working_dir=config.workdir.remote,
-            script_local_path=script_path,
-        )
-
-        job_id = extract_job_id(result)
-        print(job_id)
-        _console().print(f"[green]Submitted build job: {job_id}[/green]")
-
-        if wait:
-            _console().print("[dim]Waiting for build to complete...[/dim]")
-            _wait_and_check(client, system, job_id, "Build job")
-            _console().print(f"[green]Build complete: {final_tag}[/green]")
-            if enroot:
-                _console().print(f"[green]Enroot image: {output_path}[/green]")
-    finally:
-        os.unlink(script_path)
+    raise typer.Exit(2)
 
 
 # -----------------------------------------------------------------------------
@@ -1948,10 +1719,8 @@ ls -lh {q_output_path}
 
     # 6. Dry run: print and return (no remote operations)
     if dry_run:
-        new_name = _derive_container_name(name, tag)
-        toml_dir = toml_path.parent
-        new_toml_name = f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml" # FIXME: no hard-coding of toml path, just create a new toml based on the existing one and the name of the new version
-        new_toml_path = toml_dir / new_toml_name
+        new_name = _derive_container_name(name, cont.tag, tag)
+        new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
         _console().print("[bold]Generated SLURM script:[/bold]")
         _console().print(script)
         _console().print(f"\n[dim]Would create container entry '{new_name}' in fcw.yaml[/dim]")
@@ -2011,12 +1780,8 @@ ls -lh {q_output_path}
                 _console().print(f"[green]Enroot image: {output_path}[/green]")
 
             # Create new TOML (without patch mounts)
-            new_name = _derive_container_name(name, tag)
-            toml_dir = toml_path.parent
-            new_toml_name = (
-                f"container-{new_name.split('-', 1)[1] if '-' in new_name else new_name}.toml"  # FIXME: no hard-coding of toml path, just create a new toml based on the existing one and the name of the new version
-            )
-            new_toml_path = toml_dir / new_toml_name
+            new_name = _derive_container_name(name, cont.tag, tag)
+            new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
             _create_rebuilt_toml(str(toml_path), str(new_toml_path))
             _console().print(f"[green]Created TOML: {new_toml_path}[/green]")
 
