@@ -57,7 +57,7 @@ class TestConfigValidation:
 class TestRemoteSetup:
     def test_setup_remote_dirs(self, client, system, account, remote_workdir):
         """Create remote directory structure."""
-        for subdir in ["data/raw", "data/processed", "outputs", "logs", "env", "ce-images"]:
+        for subdir in ["data/raw", "data/processed", "outputs", "logs", "env", "ce-images"]:  # FIXME: none of these should be created explicitly, but as part of e2e workflow
             try:
                 client.mkdir(
                     system_name=system,
@@ -67,7 +67,7 @@ class TestRemoteSetup:
             except Exception:
                 pass  # May already exist
 
-    def test_upload_env(self, runner, timed_step):
+    def test_upload_env(self, runner, timed_step):  # FIXME: env is no longer a data dir (Dockerfiles should be uploaded as part of container build, container TOML as part of deploy/patch/rebuild and up-to-date checked in job submit/run). Data transfer, which is tested here, is already covered by seprarate tests.
         """Upload env/ directory."""
         with timed_step("upload-env"):
             result = runner.invoke(app, ["data", "upload", "env"])
@@ -87,7 +87,7 @@ class TestRemoteSetup:
 class TestContainerBuildDeploy:
     """Multi-stage container workflow: build locally, push, build-remote."""
 
-    def test_container_build_local(self, runner, timed_step, remote_platform):
+    def test_container_build_local(self, runner, timed_step, remote_platform):  # TODO: uses low-level CLI - should probably have a test that uses container config as well and make sure it builds local_stage
         """Build download stage locally."""
         cmd = [
             "container", "build", "--stage", "download",
@@ -116,7 +116,7 @@ class TestContainerBuildDeploy:
         assert os.path.exists("test-image.tar")
         os.unlink("test-image.tar")
 
-    def test_container_push(self, runner, timed_step, remote_platform):
+    def test_container_push(self, runner, timed_step, remote_platform):  # TODO: uses low-level CLI - should probably have a test that uses container config as well
         """Push image to remote."""
         cmd = ["container", "push"]
         if remote_platform:
@@ -127,7 +127,7 @@ class TestContainerBuildDeploy:
             result = runner.invoke(app, cmd)
         assert result.exit_code == 0, result.output
 
-    def test_container_build_remote(self, runner, timed_step):
+    def test_container_build_remote(self, runner, timed_step):  # TODO: uses low-level CLI - should probably have a test that uses container config as well
         """Build offline stage on cluster + enroot import."""
         with timed_step("container-build-remote"):
             result = runner.invoke(app, [
@@ -222,6 +222,31 @@ class TestContainerIterate:
         # app's TOML should now contain a .patches/ bind-mount.
         content = open("env/container.toml").read()
         assert ".patches/" in content
+
+    def test_auto_resync_on_submit(self, runner, timed_step):
+        """Edit the local dump *without* re-running `patch`, then submit a job.
+
+        The auto-resync hook in `fcw job submit` should incrementally upload
+        the new file to the remote .patches/ dir so the next job sees it.
+        """
+        if not os.path.isdir("extracted-code"):
+            pytest.skip("requires test_container_extract to have produced extracted-code")
+        import uuid
+        sentinel_value = uuid.uuid4().hex
+        sentinel = os.path.join("extracted-code", "fcw-resync-sentinel.txt")
+        with open(sentinel, "w") as f:
+            f.write(sentinel_value)
+
+        with timed_step("job-submit-auto-resync"):
+            result = runner.invoke(app, [
+                "job", "submit", "--remote-script", "--wait", "--",
+                "preprocess",
+            ])
+        assert result.exit_code == 0, result.output
+
+        ls = runner.invoke(app, ["data", "ls", ".patches/extracted-code", "-R"])
+        assert ls.exit_code == 0, ls.output
+        assert "fcw-resync-sentinel.txt" in ls.output
 
 
 # ---------------------------------------------------------------------------

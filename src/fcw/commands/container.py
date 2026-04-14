@@ -216,25 +216,38 @@ def _parse_patch_mounts(toml_content: str) -> list[tuple[str, str]]:
     return pattern.findall(toml_content)
 
 
-def _create_rebuilt_toml(original_toml_path: str, new_toml_path: str) -> None:
-    """Copy a container TOML, removing .patches/ bind-mount lines.
+def _create_rebuilt_toml(
+    original_toml_path: str,
+    new_toml_path: str,
+    new_image_path: Optional[str] = None,
+) -> None:
+    """Copy a container TOML, removing .patches/ bind-mounts and retargeting image.
 
-    The original file is not modified. The new file has all mount entries
-    containing ``/.patches/`` removed, with trailing-comma cleanup.
+    The original file is not modified. The new file has:
+    - all mount entries containing ``/.patches/`` removed (with trailing-comma
+      cleanup);
+    - its ``image = "..."`` line rewritten to *new_image_path* if given. Any
+      existing value (including an empty string) is replaced. If there is no
+      ``image =`` line, nothing is inserted.
     """
     content = Path(original_toml_path).read_text()
-    # Remove lines that are .patches/ mount entries
     lines = content.splitlines(keepends=True)
     filtered: list[str] = []
     for line in lines:
         if re.search(r'"[^"]*/.patches/[^"]*:[^"]*"', line):
             continue
         filtered.append(line)
-    # Clean up trailing commas before closing bracket: e.g., '    "x",\n]\n'
     result = "".join(filtered)
     result = re.sub(r',(\s*\])', r'\1', result)
-    # Clean up empty mounts array (only whitespace/newlines between brackets)
     result = re.sub(r'mounts\s*=\s*\[\s*\]', 'mounts = []', result)
+    if new_image_path is not None:
+        result = re.sub(
+            r'^(\s*image\s*=\s*)"[^"]*"',
+            lambda m: f'{m.group(1)}"{new_image_path}"',
+            result,
+            count=1,
+            flags=re.MULTILINE,
+        )
     Path(new_toml_path).write_text(result)
 
 
@@ -2169,23 +2182,27 @@ ls -lh {q_output_path}
             if enroot:
                 _console().print(f"[green]Enroot image: {output_path}[/green]")
 
-            # Create new TOML (without patch mounts) when there's one to derive from.
+            # Create new TOML (without patch mounts, image retargeted) when
+            # there's one to derive from.
             new_name = _derive_container_name(name, cont.tag, tag)
             new_toml_str: Optional[str] = None
-            if toml_path is not None:
-                new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
-                _create_rebuilt_toml(str(toml_path), str(new_toml_path))
-                new_toml_str = str(new_toml_path)
-                _console().print(f"[green]Created TOML: {new_toml_path}[/green]")
-
-            # Add new container entry to fcw.yaml
             new_cont = ContainerConfig(
                 file=cont.file,
                 tag=tag,
                 remote_path=cont.remote_path,
                 stage=cont.stage,
-                toml=new_toml_str,
+                toml=None,
             )
+            if toml_path is not None:
+                new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
+                _create_rebuilt_toml(
+                    str(toml_path),
+                    str(new_toml_path),
+                    config.resolve_container_image(new_cont),
+                )
+                new_toml_str = str(new_toml_path)
+                new_cont.toml = new_toml_str
+                _console().print(f"[green]Created TOML: {new_toml_path}[/green]")
             if config._config_path is None:
                 _console().print("[yellow]Warning: no config file path — skipping config update[/yellow]")
             else:

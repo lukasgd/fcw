@@ -18,9 +18,13 @@ from fcw.commands.container import (
     _merge_build_args,
     _parse_patch_arg,
     _parse_patch_mounts,
+    _patches_index_path,
     _podman_setup_block,
     _read_sidecar,
+    _record_patch_in_index,
     _resolve_remote_tar,
+    _resync_container_patches,
+    _scan_staging_dirs,
     _sidecar_path,
     _staging_cleanup_block,
     _stage_to_build_arg_name,
@@ -266,6 +270,223 @@ mounts = [
         new = tmp_path / "container-v2.toml"
         _create_rebuilt_toml(str(original), str(new))
         assert original.read_text() == original_content
+
+    def test_rewrites_image_path(self, tmp_path):
+        original = tmp_path / "container.toml"
+        original.write_text('''\
+image = "/scratch/old.sqsh"
+mounts = [
+    "/scratch/.patches/code:/workspace",
+]
+''')
+        new = tmp_path / "container-v2.toml"
+        _create_rebuilt_toml(str(original), str(new), "/scratch/new.sqsh")
+        content = new.read_text()
+        assert 'image = "/scratch/new.sqsh"' in content
+        assert "old.sqsh" not in content
+        assert ".patches" not in content
+
+    def test_rewrites_empty_image(self, tmp_path):
+        original = tmp_path / "container.toml"
+        original.write_text('image = ""\n')
+        new = tmp_path / "container-v2.toml"
+        _create_rebuilt_toml(str(original), str(new), "/scratch/new.sqsh")
+        assert new.read_text() == 'image = "/scratch/new.sqsh"\n'
+
+    def test_no_image_line_no_insert(self, tmp_path):
+        original = tmp_path / "container.toml"
+        original.write_text('writable = true\n')
+        new = tmp_path / "container-v2.toml"
+        _create_rebuilt_toml(str(original), str(new), "/scratch/new.sqsh")
+        assert 'image' not in new.read_text()
+
+
+class TestPatchesIndex:
+    def test_record_and_read_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        _record_patch_in_index("app", "code", str(tmp_path / "code"))
+        _record_patch_in_index("app", "configs", str(tmp_path / "configs"))
+        idx_path = _patches_index_path("app")
+        assert idx_path.exists()
+        assert idx_path.parent == Path(".fcw/patches")
+        import json
+        idx = json.loads(idx_path.read_text())
+        assert idx["code"] == str(tmp_path / "code")
+        assert idx["configs"] == str(tmp_path / "configs")
+
+    def test_missing_index_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        from fcw.commands.container import _read_patches_index
+        assert _read_patches_index("nope") == {}
+
+
+class TestResyncContainerPatches:
+    def _make_config(self, tmp_path, monkeypatch, *, toml_body: str):
+        """Write a minimal fcw.yaml + TOML, load and cd into tmp_path."""
+        import textwrap
+        from fcw.core.config import load_config
+        (tmp_path / "env").mkdir()
+        (tmp_path / "env" / "container.toml").write_text(toml_body)
+        (tmp_path / "fcw.yaml").write_text(textwrap.dedent("""\
+            project: p
+            workdir:
+              remote: /scratch/p
+              local: .
+            containers:
+              app:
+                file: ./Dockerfile
+                tag: app:latest
+                remote_path: ce-images/
+                toml: ./env/container.toml
+            """))
+        monkeypatch.chdir(tmp_path)
+        return load_config(str(tmp_path / "fcw.yaml"))
+
+    def test_noop_without_toml(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "fcw.commands.data._upload_incremental",
+            lambda *a, **kw: calls.append(a) or 0,
+        )
+        cfg = self._make_config(tmp_path, monkeypatch, toml_body='image = ""\n')
+        # Drop the toml reference on the container
+        cfg.containers["app"].toml = None
+        _resync_container_patches(cfg, "app", "sys", "acct")
+        assert calls == []
+
+    def test_noop_without_patch_mounts(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "fcw.commands.data._upload_incremental",
+            lambda *a, **kw: calls.append(a) or 0,
+        )
+        cfg = self._make_config(
+            tmp_path, monkeypatch, toml_body='image = ""\nmounts = []\n',
+        )
+        _resync_container_patches(cfg, "app", "sys", "acct")
+        assert calls == []
+
+    def test_noop_when_index_missing(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "fcw.commands.data._upload_incremental",
+            lambda *a, **kw: calls.append(a) or 0,
+        )
+        toml_body = (
+            'image = ""\n'
+            'mounts = [\n'
+            '    "/scratch/p/.patches/code:/workspace/code",\n'
+            ']\n'
+        )
+        cfg = self._make_config(tmp_path, monkeypatch, toml_body=toml_body)
+        _resync_container_patches(cfg, "app", "sys", "acct")
+        assert calls == []
+
+    def test_happy_path_calls_upload_incremental(self, tmp_path, monkeypatch):
+        dump = tmp_path / "code"
+        dump.mkdir()
+        (dump / "a.py").write_text("print('a')\n")
+        toml_body = (
+            'image = ""\n'
+            'mounts = [\n'
+            '    "/scratch/p/.patches/code:/workspace/code",\n'
+            ']\n'
+        )
+        cfg = self._make_config(tmp_path, monkeypatch, toml_body=toml_body)
+        _record_patch_in_index("app", "code", str(dump))
+
+        calls = []
+
+        async def fake_upload_incremental(client, system, account, local, remote):
+            calls.append(("up_inc", local, remote))
+            return 1
+
+        monkeypatch.setattr(
+            "fcw.commands.data._upload_incremental", fake_upload_incremental
+        )
+
+        uploads = []
+
+        class FakeClient:
+            async def upload(self, **kw):
+                uploads.append(kw)
+
+        monkeypatch.setattr(
+            "fcw.commands.container.get_async_client", lambda: FakeClient()
+        )
+
+        _resync_container_patches(cfg, "app", "sys", "acct")
+
+        assert len(calls) == 1
+        assert calls[0][1] == str(dump)
+        assert calls[0][2] == "/scratch/p/.patches/code"
+        # No sidecar on disk, so no upload call expected
+        assert uploads == []
+
+    def test_uploads_sidecar_when_present(self, tmp_path, monkeypatch):
+        dump = tmp_path / "code"
+        dump.mkdir()
+        (dump / "a.py").write_text("x\n")
+        sidecar = tmp_path / "code.meta.json"
+        sidecar.write_text('{"stage": "download", "container_path": "/opt"}')
+        toml_body = (
+            'image = ""\n'
+            'mounts = [\n'
+            '    "/scratch/p/.patches/code:/opt",\n'
+            ']\n'
+        )
+        cfg = self._make_config(tmp_path, monkeypatch, toml_body=toml_body)
+        _record_patch_in_index("app", "code", str(dump))
+
+        async def fake_upload_incremental(client, system, account, local, remote):
+            return 0
+
+        monkeypatch.setattr(
+            "fcw.commands.data._upload_incremental", fake_upload_incremental
+        )
+
+        uploads = []
+
+        class FakeClient:
+            async def upload(self, **kw):
+                uploads.append(kw)
+
+        monkeypatch.setattr(
+            "fcw.commands.container.get_async_client", lambda: FakeClient()
+        )
+
+        _resync_container_patches(cfg, "app", "sys", "acct")
+
+        assert len(uploads) == 1
+        assert uploads[0]["filename"] == "code.meta.json"
+        assert uploads[0]["directory"] == "/scratch/p/.patches"
+
+
+class TestScanStagingDirs:
+    async def test_parses_timestamps_and_skips_unsuffixed(self):
+        class FakeClient:
+            async def list_files(self, **kw):
+                return [
+                    {"name": "app-20260101T120000"},
+                    {"name": "app-20260414T000000"},
+                    {"name": "no-timestamp-here"},
+                ]
+
+        out = await _scan_staging_dirs(FakeClient(), "sys", "/anywhere")
+        names = [n for n, _ in out]
+        assert "app-20260101T120000" in names
+        assert "app-20260414T000000" in names
+        assert "no-timestamp-here" in names
+        by_name = dict(out)
+        assert by_name["app-20260101T120000"] is not None
+        assert by_name["no-timestamp-here"] is None
+
+    async def test_listing_failure_returns_empty(self):
+        class FakeClient:
+            async def list_files(self, **kw):
+                raise RuntimeError("boom")
+
+        assert await _scan_staging_dirs(FakeClient(), "sys", "/x") == []
 
 
 class TestDeriveContainerName:
