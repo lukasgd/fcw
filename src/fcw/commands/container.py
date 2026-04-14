@@ -49,9 +49,9 @@ import shlex
 import subprocess
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import typer
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -279,6 +279,38 @@ def _isolated_staging_dir(config, base: str, key: str) -> str:
     return config.resolve_path(f".fcw/{base}/{safe_key}-{timestamp}", remote=True)
 
 
+_STAGING_TS_RE = re.compile(r"-(\d{8}T\d{6})$")
+
+
+async def _scan_staging_dirs(
+    client: Any, system: str, base_path: str
+) -> list[tuple[str, Optional[datetime]]]:
+    """List ``.fcw/<base>/*`` entries, return (name, parsed_timestamp_or_None)."""
+    try:
+        entries = await client.list_files(
+            system_name=system, path=base_path, recursive=False
+        )
+    except Exception:
+        return []
+    out: list[tuple[str, Optional[datetime]]] = []
+    for entry in entries:
+        name = (
+            entry.get("name") if isinstance(entry, dict)
+            else getattr(entry, "name", None)
+        )
+        if not name:
+            continue
+        m = _STAGING_TS_RE.search(name)
+        ts: Optional[datetime] = None
+        if m:
+            try:
+                ts = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S")
+            except ValueError:
+                ts = None
+        out.append((name, ts))
+    return out
+
+
 def _staging_cleanup_block(staging_dir: str) -> str:
     """Bash snippet that removes *staging_dir* on successful SLURM-script exit.
 
@@ -348,6 +380,114 @@ def _write_sidecar(local_dest: str, *, stage: str, container_path: str, source_i
         "source_image": source_image,
         "extracted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }, indent=2) + "\n")
+
+
+# -----------------------------------------------------------------------------
+# Patch index: local map of remote patch-name -> local dump path
+# -----------------------------------------------------------------------------
+# `patch` uploads a local dump to `.patches/<basename>/` on the remote and
+# records the bind-mount in the container's TOML. On later `job submit` /
+# `container rebuild`, we want to re-sync any changes to that local dump
+# before the job runs. The bind-mount only stores the *remote* path, so we
+# keep a local index mapping patch-name -> absolute local path per container.
+# Survives renames/moves of the local dump because `patch` refreshes it.
+
+def _patches_index_path(container_name: str) -> Path:
+    return Path(".fcw") / "patches" / f"{container_name}.json"
+
+
+def _read_patches_index(container_name: str) -> dict:
+    p = _patches_index_path(container_name)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _record_patch_in_index(container_name: str, patch_name: str, local_path: str) -> None:
+    idx = _read_patches_index(container_name)
+    idx[patch_name] = os.path.abspath(local_path)
+    p = _patches_index_path(container_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(idx, indent=2, sort_keys=True) + "\n")
+
+
+def _resync_container_patches(config: Any, container_name: str, system: str, account: str) -> None:
+    """Incrementally re-upload patch dumps for a container before a job runs.
+
+    Looks up the container's TOML, parses ``.patches/`` bind-mount entries,
+    and for each one finds the local source via the patch index and re-uploads
+    only files changed since the last sync. No-op if the container has no
+    TOML, no patch mounts, or no index entry for a given mount.
+
+    Also refreshes the sidecar JSON next to each patch dir on the remote so
+    ``rebuild`` can still group patches by stage correctly.
+
+    Silent on missing index entries — a TOML mount without an index entry
+    means the patch was added out-of-band (e.g. manually edited TOML) and
+    we can't know where to re-sync from; the job still sees whatever is on
+    the remote.
+    """
+    if container_name not in config.containers:
+        return
+    cont = config.containers[container_name]
+    if not cont.toml:
+        return
+    toml_path = Path(cont.toml)
+    if not toml_path.exists():
+        return
+    mounts = _parse_patch_mounts(toml_path.read_text())
+    if not mounts:
+        return
+    idx = _read_patches_index(container_name)
+    if not idx:
+        return
+
+    from fcw.commands.data import _upload_incremental
+
+    async def sync_all() -> None:
+        async_client = get_async_client()
+        for remote_patch_dir, _container_path in mounts:
+            patch_name = os.path.basename(remote_patch_dir.rstrip("/"))
+            local_path = idx.get(patch_name)
+            if not local_path or not os.path.isdir(local_path):
+                continue
+            try:
+                count = await _upload_incremental(
+                    async_client, system, account, local_path, remote_patch_dir
+                )
+                if count:
+                    _console().print(
+                        f"[dim]Re-synced {count} changed file(s) "
+                        f"{local_path} -> {remote_patch_dir}[/dim]"
+                    )
+            except Exception as e:
+                _console().print(
+                    f"[yellow]Patch resync failed for {local_path}: {e}[/yellow]"
+                )
+                continue
+
+            sidecar = _sidecar_path(local_path)
+            if sidecar.exists():
+                try:
+                    await async_client.upload(
+                        system_name=system,
+                        local_file=str(sidecar),
+                        directory=os.path.dirname(remote_patch_dir),
+                        filename=sidecar.name,
+                        account=account,
+                        blocking=True,
+                    )
+                except Exception:
+                    pass
+
+    try:
+        asyncio.run(sync_all())
+    except Exception as e:
+        _console().print(f"[yellow]Patch resync skipped: {e}[/yellow]")
 
 
 def _resolve_container_config(config, name: str) -> ContainerConfig:
@@ -1641,6 +1781,8 @@ def patch_container(
     for (local_path, container_path), remote_patch_dir in zip(resolved, remote_patch_dirs):
         bind_mount = f"{remote_patch_dir}:{container_path}"
         _update_toml_bind_mount(toml_path, bind_mount, container_path)
+        patch_name = os.path.basename(remote_patch_dir.rstrip("/"))
+        _record_patch_in_index(container_name, patch_name, local_path)
         _console().print(f"[green]+ mount {remote_patch_dir} -> {container_path}[/green]")
 
     # Upload the updated TOML to remote.
@@ -1667,17 +1809,6 @@ def patch_container(
     asyncio.run(do_upload_toml())
     _console().print(f"[green]Updated {toml_path} (local + remote)[/green]")
     _console().print(f"[dim]Run with: srun --environment {remote_toml} ...[/dim]")
-
-
-@app.command("update", hidden=True, deprecated=True)
-def update_image(ctx: typer.Context) -> None:
-    """Removed: use ``patch`` + ``rebuild`` instead."""
-    _console().print(
-        "[red]`fcw container update` has been removed.[/red]\n"
-        "Use [bold]fcw container patch[/bold] to stage code changes and "
-        "[bold]fcw container rebuild[/bold] to bake them into a new image."
-    )
-    raise typer.Exit(2)
 
 
 # -----------------------------------------------------------------------------
@@ -1821,6 +1952,7 @@ def rebuild_container(
         if toml_path is None:
             _console().print(f"[red]Container '{name}' has no TOML file configured[/red]")
             raise typer.Exit(1)
+        _resync_container_patches(config, name, system, account)
         patch_mounts = _parse_patch_mounts(toml_path.read_text())
         if not patch_mounts:
             _console().print(
@@ -1828,33 +1960,19 @@ def rebuild_container(
             )
             raise typer.Exit(0)
 
-        async def fetch_stages() -> list[Optional[str]]:
-            async_client = get_async_client()
-            out: list[Optional[str]] = []
-            for host_path, _ in patch_mounts:
-                sidecar_remote = f"{host_path}{SIDECAR_SUFFIX}"
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
-                    local_tmp = tf.name
-                try:
-                    await async_client.download(
-                        system_name=system,
-                        source_path=sidecar_remote,
-                        target_path=local_tmp,
-                        account=account,
-                        blocking=True,
-                    )
-                    meta = json.loads(Path(local_tmp).read_text())
-                    out.append(meta.get("stage"))
-                except Exception:
-                    out.append(None)
-                finally:
-                    try:
-                        os.unlink(local_tmp)
-                    except OSError:
-                        pass
-            return out
-
-        stages_for_patches = asyncio.run(fetch_stages())
+        # _resync_container_patches just re-uploaded each local sidecar, so
+        # reading stages locally via the patch index is authoritative and
+        # skips N FirecREST round-trips.
+        idx = _read_patches_index(name)
+        stages_for_patches = []
+        for remote_patch_dir, _ in patch_mounts:
+            patch_name = os.path.basename(remote_patch_dir.rstrip("/"))
+            local_path = idx.get(patch_name)
+            if local_path and os.path.isdir(local_path):
+                meta = _read_sidecar(local_path)
+                stages_for_patches.append(meta.get("stage") if meta else None)
+            else:
+                stages_for_patches.append(None)
 
     _console().print(
         f"[bold]Resolved {len(patch_mounts)} patch mount(s) to bake:[/bold]"
@@ -2107,6 +2225,80 @@ ls -lh {q_output_path}
 # -----------------------------------------------------------------------------
 # Listing
 # -----------------------------------------------------------------------------
+
+@app.command("gc")
+def gc_staging(
+    ctx: typer.Context,
+    older_than: Optional[int] = typer.Option(
+        None, "--older-than",
+        help="Only consider dirs older than N days (parsed from dir name timestamp).",
+    ),
+    all_dirs: bool = typer.Option(
+        False, "--all", help="Consider every staging dir regardless of age."
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Actually delete. Without this flag, dry-run only."
+    ),
+) -> None:
+    """List or remove leftover ``.fcw/{rebuild,deploy,extract}`` staging dirs.
+
+    The SLURM cleanup trap only fires on successful job exit; crashed or
+    cancelled builds leave their staging dirs behind. This command lists
+    them (default) or removes them (with ``--force``).
+    """
+    config, system, account = resolve_context(ctx)
+    if older_than is None and not all_dirs:
+        # Default: show everything, no filter.
+        all_dirs = True
+    cutoff: Optional[datetime] = None
+    if older_than is not None:
+        cutoff = datetime.now() - timedelta(days=older_than)
+
+    bases = ["rebuild", "deploy", "extract"]
+
+    async def run() -> None:
+        client = get_async_client()
+        any_candidate = False
+        for base in bases:
+            base_path = config.resolve_path(f".fcw/{base}", remote=True)
+            entries = await _scan_staging_dirs(client, system, base_path)
+            if not entries:
+                continue
+            header_printed = False
+            for name, ts in entries:
+                if cutoff is not None:
+                    if ts is None or ts >= cutoff:
+                        continue
+                path = f"{base_path}/{name}"
+                age_str = (
+                    f"age {(datetime.now() - ts).days}d" if ts else "age unknown"
+                )
+                if not header_printed:
+                    _console().print(f"[bold].fcw/{base}/[/bold]")
+                    header_printed = True
+                any_candidate = True
+                if force:
+                    try:
+                        await client.rm(
+                            system_name=system, path=path, account=account,
+                            blocking=True,
+                        )
+                        _console().print(f"  [red]removed[/red] {name} ({age_str})")
+                    except Exception as e:
+                        _console().print(
+                            f"  [yellow]could not remove[/yellow] {name}: {e}"
+                        )
+                else:
+                    _console().print(f"  {name} ({age_str})")
+        if not any_candidate:
+            _console().print("[dim]No staging dirs matched.[/dim]")
+        elif not force:
+            _console().print(
+                "\n[dim]Dry-run. Re-run with --force to delete.[/dim]"
+            )
+
+    asyncio.run(run())
+
 
 @app.command("list")
 def list_images(

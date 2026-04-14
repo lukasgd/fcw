@@ -519,6 +519,8 @@ def submit_job(
             if len(toml_containers) == 1:
                 container_name = toml_containers[0]
     if container_name:
+        from fcw.commands.container import _resync_container_patches
+        _resync_container_patches(config, container_name, system, account)
         toml_content = _build_container_toml(config, container_name)
         script_content = _inject_container_toml(script_content, toml_content)
 
@@ -601,7 +603,7 @@ def submit_job(
         "ignore_unknown_options": True,
     },
 )
-def run_command( # FIXME: should probably enable running commands in a container from the config (e.g. with --container, possibly also overriding the TOML with --environment). Supporting containers here is not quite straightforward as they act on srun commands and one wouldn't want to user to write complicated srun-commands with --environment FCW_CONTAINER_TOML - maybe fcw can just inject the TOML if a container is specified (alternatively use special shorthand for srun with container)? Also note that submit has some more options - it seems especially --dry-run would be useful here as well. 
+def run_command( # FIXME: should probably enable running commands in a container from the config (e.g. with --container, possibly also overriding the TOML with --environment). Supporting containers here is not quite straightforward as they act on srun commands and one wouldn't want to user to write complicated srun-commands with --environment FCW_CONTAINER_TOML - maybe fcw can just inject the TOML if a container is specified (alternatively use special shorthand for srun with container)? Also note that submit has some more options - it seems especially --dry-run would be useful here as well. Another task would be to make it patch-aware - if a container is being used with patches, first make sure they're up to date on the remote staging dir
     ctx: typer.Context,
     time: str = typer.Option("00:30:00", "--time", "-t", help="Default time limit"),
     nodes: int = typer.Option(1, "--nodes", "-N", help="Default number of nodes"),
@@ -612,7 +614,7 @@ def run_command( # FIXME: should probably enable running commands in a container
 ):
     """Run an ad-hoc command as a SLURM job.
 
-    Similar to ``srun``, but submits as a batch job via FirecREST.
+    Similar to ``sbatch --wrap``, submitting a batch job via FirecREST.
     SBATCH options before ``--`` override the defaults.
 
     Examples:
