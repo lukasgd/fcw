@@ -58,6 +58,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from fcw.core import (
     SLURM_FAILED_STATES,
+    ContainerConfig,
     extract_job_id,
     format_sbatch_lines,
     get_async_client,
@@ -333,9 +334,10 @@ def _read_sidecar(local_dest: str) -> Optional[dict]:
     if not sp.exists():
         return None
     try:
-        return json.loads(sp.read_text())
+        data = json.loads(sp.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def _write_sidecar(local_dest: str, *, stage: str, container_path: str, source_image: str) -> None:
@@ -348,7 +350,7 @@ def _write_sidecar(local_dest: str, *, stage: str, container_path: str, source_i
     }, indent=2) + "\n")
 
 
-def _resolve_container_config(config, name: str):
+def _resolve_container_config(config, name: str) -> ContainerConfig:
     """Look up a container by config name, error with helpful listing otherwise."""
     if name in config.containers:
         return config.containers[name]
@@ -360,7 +362,7 @@ def _resolve_container_config(config, name: str):
     raise typer.Exit(1)
 
 
-def _resolve_extract_stage(container_cfg, requested: Optional[str]) -> str:
+def _resolve_extract_stage(container_cfg: ContainerConfig, requested: Optional[str]) -> str:
     """Default stage for extract: requested > 'download' if present > first local stage."""
     stages = container_cfg.get_local_stages()
     if requested:
@@ -1683,6 +1685,34 @@ def update_image(ctx: typer.Context) -> None:
 # -----------------------------------------------------------------------------
 
 
+def _stage_tar_persistence_block(
+    cont: ContainerConfig,
+    new_tag: str,
+    patches_by_stage: dict,
+    images_dir: str,
+) -> str:
+    """Bash: re-tag each local stage under <new_tag>-<stage> and `podman save` it."""
+    lines: list[str] = []
+    for stage in cont.get_local_stages():
+        var = _stage_to_build_arg_name(stage).replace("-", "_")
+        # new stage tag uses the new container tag as prefix so future extracts/rebuilds
+        # can find the tar at ce-images/<new_tag>+<stage>.tar (mirrors `push` convention).
+        if ":" in new_tag:
+            new_stage_tag = f"{new_tag}-{stage}"
+        else:
+            new_stage_tag = f"{new_tag}:{stage}"
+        tar_name = new_stage_tag.replace(":", "+").replace("/", "+") + ".tar"
+        q_new_tag = shlex.quote(new_stage_tag)
+        q_tar = shlex.quote(f"{images_dir}/{tar_name}")
+        lines.append(f"""
+echo "Persisting stage '{stage}' as {new_stage_tag}..."
+podman tag "${var}_ID" {q_new_tag}
+podman save -o {q_tar} {q_new_tag}
+ls -lh {q_tar}
+""")
+    return "\n".join(lines)
+
+
 @app.command("rebuild")
 def rebuild_container(
     ctx: typer.Context,
@@ -1694,6 +1724,11 @@ def rebuild_container(
     default_stage: Optional[str] = typer.Option(
         None, "--default-stage",
         help="Stage assumed for patches missing a sidecar (otherwise an error).",
+    ),
+    dump: Optional[List[str]] = typer.Option(
+        None, "--dump",
+        help="Mode B: rebuild from explicit local dump(s) '<local>[:<container>]'. "
+             "Bypasses the container TOML. Mutually exclusive with the default (Mode A).",
     ),
     # Future: --target-stage <s> to stop rebuild at a non-final stage for users who
     # want to skip the final build-offline. Deferred — correctness (always produce
@@ -1726,7 +1761,7 @@ def rebuild_container(
         # Full rebuild with enroot export
         fcw container rebuild app --tag my-app:v2 --enroot --wait
     """
-    from fcw.core import ContainerConfig, add_container_to_config
+    from fcw.core import add_container_to_config
 
     config, system, account = resolve_context(ctx)
 
@@ -1736,62 +1771,99 @@ def rebuild_container(
         raise typer.Exit(1)
     cont = config.containers[name]
 
-    if not cont.toml:
-        _console().print(f"[red]Container '{name}' has no TOML file configured[/red]")
-        raise typer.Exit(1)
     if not cont.file:
         _console().print(f"[red]Container '{name}' has no Dockerfile configured[/red]")
         raise typer.Exit(1)
 
-    toml_path = Path(cont.toml)
-    if not toml_path.exists():
-        _console().print(f"[red]TOML file not found: {cont.toml}[/red]")
-        raise typer.Exit(1)
+    mode_b = bool(dump)
+    toml_path: Optional[Path] = Path(cont.toml) if cont.toml else None
+    if toml_path is not None and not toml_path.exists():
+        # TOML referenced in config but missing on disk — only fatal in Mode A.
+        if not mode_b:
+            _console().print(f"[red]TOML file not found: {cont.toml}[/red]")
+            raise typer.Exit(1)
+        toml_path = None
 
-    # 2. Parse patch mounts
-    toml_content = toml_path.read_text()
-    patch_mounts = _parse_patch_mounts(toml_content)
-    if not patch_mounts:
-        _console().print("[yellow]No .patches/ mounts found in TOML — nothing to rebuild[/yellow]")
-        raise typer.Exit(0)
+    if mode_b:
+        # Mode B: patches come from --dump args. No TOML required.
+        patch_mounts: list[tuple[str, str]] = []
+        stages_for_patches: list[Optional[str]] = []
+        from fcw.commands.data import _upload_directory
+
+        async def upload_dumps() -> None:
+            async_client = get_async_client()
+            for arg in dump or []:
+                local_path, explicit_target = _parse_patch_arg(arg)
+                local_path = os.path.abspath(local_path)
+                if not os.path.isdir(local_path):
+                    _console().print(f"[red]Not a directory: {local_path}[/red]")
+                    raise typer.Exit(1)
+                meta = _read_sidecar(local_path)
+                target = explicit_target or (meta.get("container_path") if meta else None)
+                if not target:
+                    _console().print(
+                        f"[red]No sidecar and no explicit target for {local_path!r}. "
+                        "Use '<local>:<container-path>'.[/red]"
+                    )
+                    raise typer.Exit(1)
+                patch_name = os.path.basename(local_path.rstrip("/"))
+                remote_patch_dir = config.resolve_path(f".patches/{patch_name}", remote=True)
+                _console().print(f"[dim]Uploading {local_path} -> {remote_patch_dir}...[/dim]")
+                await _upload_directory(
+                    async_client, system, account, local_path, remote_patch_dir
+                )
+                patch_mounts.append((remote_patch_dir, target))
+                stages_for_patches.append(meta.get("stage") if meta else None)
+
+        asyncio.run(upload_dumps())
+    else:
+        # Mode A: read patches from the container's TOML.
+        if toml_path is None:
+            _console().print(f"[red]Container '{name}' has no TOML file configured[/red]")
+            raise typer.Exit(1)
+        patch_mounts = _parse_patch_mounts(toml_path.read_text())
+        if not patch_mounts:
+            _console().print(
+                "[yellow]No .patches/ mounts found in TOML — nothing to rebuild[/yellow]"
+            )
+            raise typer.Exit(0)
+
+        async def fetch_stages() -> list[Optional[str]]:
+            async_client = get_async_client()
+            out: list[Optional[str]] = []
+            for host_path, _ in patch_mounts:
+                sidecar_remote = f"{host_path}{SIDECAR_SUFFIX}"
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+                    local_tmp = tf.name
+                try:
+                    await async_client.download(
+                        system_name=system,
+                        source_path=sidecar_remote,
+                        target_path=local_tmp,
+                        account=account,
+                        blocking=True,
+                    )
+                    meta = json.loads(Path(local_tmp).read_text())
+                    out.append(meta.get("stage"))
+                except Exception:
+                    out.append(None)
+                finally:
+                    try:
+                        os.unlink(local_tmp)
+                    except OSError:
+                        pass
+            return out
+
+        stages_for_patches = asyncio.run(fetch_stages())
 
     _console().print(
-        f"[bold]Found {len(patch_mounts)} patch mount(s) to bake into image:[/bold]"
+        f"[bold]Resolved {len(patch_mounts)} patch mount(s) to bake:[/bold]"
     )
     for host_path, container_path in patch_mounts:
         _console().print(f"  {host_path} → {container_path}")
 
-    # 3. Group patches by local stage via remote sidecars
     local_stages = cont.get_local_stages()
     remote_stage = cont.get_remote_stage()
-
-    async def fetch_stages() -> list[Optional[str]]:
-        async_client = get_async_client()
-        out: list[Optional[str]] = []
-        for host_path, _ in patch_mounts:
-            sidecar_remote = f"{host_path}{SIDECAR_SUFFIX}"
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
-                local_tmp = tf.name
-            try:
-                await async_client.download(
-                    system_name=system,
-                    source_path=sidecar_remote,
-                    target_path=local_tmp,
-                    account=account,
-                    blocking=True,
-                )
-                meta = json.loads(Path(local_tmp).read_text())
-                out.append(meta.get("stage"))
-            except Exception:
-                out.append(None)
-            finally:
-                try:
-                    os.unlink(local_tmp)
-                except OSError:
-                    pass
-        return out
-
-    stages_for_patches = asyncio.run(fetch_stages())
 
     patches_by_stage: dict[str, list[tuple[str, str]]] = {}
     for (host_path, container_path), stage in zip(patch_mounts, stages_for_patches):
@@ -1887,6 +1959,13 @@ podman build --target {shlex.quote(remote_stage)} \\
     -f Dockerfile .
 
 echo "Built image: {q_tag}"
+
+# === Persist per-stage tars for the new version so future rebuilds can load them ===
+# For chain-rebuilds (v1 -> v2 -> v3) to work, every local stage of the new version
+# needs a tar at ce-images/<new-tag>+<stage>.tar. Patched stages save their committed
+# image; unpatched stages are retagged and saved so the naming is uniform.
+mkdir -p {q_images_dir}
+{_stage_tar_persistence_block(cont, tag, patches_by_stage, images_dir)}
 """
     if enroot:
         output_path = output or os.path.join(
@@ -1910,11 +1989,14 @@ ls -lh {q_output_path}
     # 6. Dry run: print and return (no remote operations)
     if dry_run:
         new_name = _derive_container_name(name, cont.tag, tag)
-        new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
         _console().print("[bold]Generated SLURM script:[/bold]")
         _console().print(script)
         _console().print(f"\n[dim]Would create container entry '{new_name}' in fcw.yaml[/dim]")
-        _console().print(f"[dim]Would create TOML: {new_toml_path}[/dim]")
+        if toml_path is not None:
+            new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
+            _console().print(f"[dim]Would create TOML: {new_toml_path}[/dim]")
+        else:
+            _console().print("[dim]No TOML derivation (Mode B without source TOML).[/dim]")
         return
 
     # 7. Upload Dockerfile to staging dir
@@ -1969,11 +2051,14 @@ ls -lh {q_output_path}
             if enroot:
                 _console().print(f"[green]Enroot image: {output_path}[/green]")
 
-            # Create new TOML (without patch mounts)
+            # Create new TOML (without patch mounts) when there's one to derive from.
             new_name = _derive_container_name(name, cont.tag, tag)
-            new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
-            _create_rebuilt_toml(str(toml_path), str(new_toml_path))
-            _console().print(f"[green]Created TOML: {new_toml_path}[/green]")
+            new_toml_str: Optional[str] = None
+            if toml_path is not None:
+                new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
+                _create_rebuilt_toml(str(toml_path), str(new_toml_path))
+                new_toml_str = str(new_toml_path)
+                _console().print(f"[green]Created TOML: {new_toml_path}[/green]")
 
             # Add new container entry to fcw.yaml
             new_cont = ContainerConfig(
@@ -1981,7 +2066,7 @@ ls -lh {q_output_path}
                 tag=tag,
                 remote_path=cont.remote_path,
                 stage=cont.stage,
-                toml=str(new_toml_path),
+                toml=new_toml_str,
             )
             if config._config_path is None:
                 _console().print("[yellow]Warning: no config file path — skipping config update[/yellow]")
