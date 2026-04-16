@@ -181,6 +181,26 @@ class TestContainerDeploy:
 class TestContainerIterate:
     """Code iteration workflow: extract from container, patch with bind-mount."""
 
+    def test_job_run_container(self, runner, timed_step):
+        """`fcw job run -c app -- 'csrun ...'` should inject the TOML + csrun
+        shorthand and execute the command inside the container."""
+        import uuid
+        sentinel = uuid.uuid4().hex
+        with timed_step("job-run-container"):
+            result = runner.invoke(app, [
+                "job", "run", "--remote-script",
+                "-c", "app",
+                "--", f"csrun echo RUN-SENTINEL-{sentinel}",
+            ])
+        assert result.exit_code == 0, result.output
+        job_id = result.stdout.strip().split("\n")[-1].split(" ")[-1]
+
+        wait = runner.invoke(app, ["job", "wait", job_id])
+        assert wait.exit_code == 0, wait.output
+        logs = runner.invoke(app, ["job", "logs", job_id])
+        assert logs.exit_code == 0, logs.output
+        assert f"RUN-SENTINEL-{sentinel}" in logs.output
+
     def test_container_extract(self, runner, timed_step):
         """Extract files from aux container stage to local directory.
 
@@ -223,30 +243,42 @@ class TestContainerIterate:
         content = open("env/container.toml").read()
         assert ".patches/" in content
 
-    def test_auto_resync_on_submit(self, runner, timed_step):
-        """Edit the local dump *without* re-running `patch`, then submit a job.
+    def test_auto_resync_on_run(self, runner, timed_step):  # TODO: could we have both a test with job run and one with job submit + wait, to verify auto-resync works in both cases and since they overwrite the same file a re-resync is covered as well?
+        """Edit the local dump *without* re-running `patch`, then run a job.
 
-        The auto-resync hook in `fcw job submit` should incrementally upload
+        The auto-resync hook in `fcw job run` should incrementally upload
         the new file to the remote .patches/ dir so the next job sees it.
         """
         if not os.path.isdir("extracted-code"):
             pytest.skip("requires test_container_extract to have produced extracted-code")
-        import uuid
-        sentinel_value = uuid.uuid4().hex
-        sentinel = os.path.join("extracted-code", "fcw-resync-sentinel.txt")
-        with open(sentinel, "w") as f:
-            f.write(sentinel_value)
+        
+        for round in range(2):
+            import uuid
+            sentinel_value = uuid.uuid4().hex
+            sentinel = os.path.join("extracted-code", "fcw-resync-sentinel.txt")
+            with open(sentinel, "w") as f:
+                f.write(sentinel_value)
 
-        with timed_step("job-submit-auto-resync"):
-            result = runner.invoke(app, [
-                "job", "submit", "--remote-script", "--wait", "--",
-                "preprocess",
-            ])
-        assert result.exit_code == 0, result.output
+            with timed_step("job-run-auto-resync"):
+                result = runner.invoke(app, [
+                    "job", "run", "--remote-script",
+                    "-c", "app",
+                    "--", "csrun cat /workspace/aux/fcw-resync-sentinel.txt",
+                ])
+            assert result.exit_code == 0, result.output
 
-        ls = runner.invoke(app, ["data", "ls", ".patches/extracted-code", "-R"])
-        assert ls.exit_code == 0, ls.output
-        assert "fcw-resync-sentinel.txt" in ls.output
+            ls = runner.invoke(app, ["data", "ls", ".patches/extracted-code", "-R"])
+            assert ls.exit_code == 0, ls.output
+            assert "fcw-resync-sentinel.txt" in ls.output
+
+            job_id = result.stdout.strip().split("\n")[-1].split(" ")[-1]
+
+            wait = runner.invoke(app, ["job", "wait", job_id])
+            assert wait.exit_code == 0, wait.output
+            logs = runner.invoke(app, ["job", "logs", job_id])
+            assert logs.exit_code == 0, logs.output
+
+            assert sentinel_value in logs.output, f"Sentinel value not found in logs: {logs.output}"
 
 
 # ---------------------------------------------------------------------------

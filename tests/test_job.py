@@ -488,3 +488,166 @@ class TestBuildContainerToml:
         from click.exceptions import Exit
         with pytest.raises(Exit):
             _build_container_toml(config_without_toml, "nonexistent")
+
+
+class TestRunContainerIntegration:
+    """`fcw job run` container support + patch-awareness."""
+
+    def _mk_config(self, tmp_path):
+        config = tmp_path / "fcw.yaml"
+        config.write_text(
+            "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
+            "containers:\n  app:\n    file: Dockerfile\n    tag: my-app:latest\n"
+            "    remote_path: ./ce-images/\n    toml: ./env/container.toml\n"
+        )
+        toml_dir = tmp_path / "env"
+        toml_dir.mkdir()
+        (toml_dir / "container.toml").write_text('image = "placeholder"\n')
+
+    def test_rejects_container_and_environment_together(self, tmp_path):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        self._mk_config(tmp_path)
+        env_toml = tmp_path / "other.toml"
+        env_toml.write_text('image = "other"\n')
+
+        runner = CliRunner()
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "run", "-c", "app", "-e", str(env_toml),
+                "--dry-run", "--", "echo hi",
+            ])
+        finally:
+            os.chdir(old)
+
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_dry_run_injects_container_toml_and_csrun(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        from fcw.commands import container as container_mod
+        import os
+
+        self._mk_config(tmp_path)
+        monkeypatch.setattr(container_mod, "_resync_container_patches",
+                            lambda *a, **kw: None)
+
+        runner = CliRunner()
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "run", "-c", "app", "--dry-run", "--", "csrun hostname",
+            ])
+        finally:
+            os.chdir(old)
+
+        assert result.exit_code == 0, result.output
+        assert "FCW_CONTAINER_TOML" in result.output
+        assert "FCWEOF" in result.output
+        assert "csrun()" in result.output
+        assert "csrun hostname" in result.output
+
+    def test_calls_resync_for_container(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        from fcw.commands import container as container_mod
+        import os
+
+        self._mk_config(tmp_path)
+        calls = []
+        monkeypatch.setattr(
+            container_mod, "_resync_container_patches",
+            lambda cfg, name, system, account: calls.append((name, system, account)),
+        )
+
+        runner = CliRunner()
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "run", "-c", "app", "--dry-run", "--", "echo hi",
+            ])
+        finally:
+            os.chdir(old)
+
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1
+        assert calls[0][0] == "app"
+
+    def test_environment_path_injects_verbatim(self, tmp_path):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        self._mk_config(tmp_path)
+        env_toml = tmp_path / "custom.toml"
+        sentinel = 'image = "/custom/path.sqsh"\n# SENTINEL-xyzzy\n'
+        env_toml.write_text(sentinel)
+
+        runner = CliRunner()
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "run", "-e", str(env_toml), "--dry-run", "--", "csrun hi",
+            ])
+        finally:
+            os.chdir(old)
+
+        assert result.exit_code == 0, result.output
+        assert "SENTINEL-xyzzy" in result.output
+        assert "/custom/path.sqsh" in result.output
+
+    def test_missing_environment_path_errors(self, tmp_path):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        self._mk_config(tmp_path)
+
+        runner = CliRunner()
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "run", "-e", str(tmp_path / "nope.toml"),
+                "--dry-run", "--", "echo hi",
+            ])
+        finally:
+            os.chdir(old)
+
+        assert result.exit_code == 1
+        assert "not found" in result.output
+
+    def test_dry_run_does_not_submit(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        from fcw.commands import job as job_mod
+        from fcw.commands import container as container_mod
+        import os
+
+        self._mk_config(tmp_path)
+        monkeypatch.setattr(container_mod, "_resync_container_patches",
+                            lambda *a, **kw: None)
+
+        def _boom(*a, **kw):
+            raise AssertionError("dry-run must not touch the client")
+        monkeypatch.setattr(job_mod, "get_client", _boom)
+
+        runner = CliRunner()
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = runner.invoke(app, [
+                "job", "run", "-c", "app", "--dry-run", "--", "echo hi",
+            ])
+        finally:
+            os.chdir(old)
+
+        assert result.exit_code == 0, result.output

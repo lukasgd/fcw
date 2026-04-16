@@ -408,6 +408,7 @@ def _validate_local(ctx: typer.Context, errors: list[str], warnings: list[str]):
         "FIRECREST_HOME",
         "FIRECREST_SCRATCH",
         "FIRECREST_RESERVATION",
+        "FIRECREST_PARTITION",
     ]
     for var in optional_vars:
         if os.environ.get(var):
@@ -584,6 +585,7 @@ def _validate_env_vars_remote(
         except Exception:
             _warn(warnings, "Could not check reservations on remote")
 
+    # TODO: FIRECREST_PARTITION — check partition exists
 
 def _validate_containers_remote(
     client, system: str, config, warnings: list[str]

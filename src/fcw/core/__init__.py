@@ -54,11 +54,15 @@ def get_global_sbatch_options() -> dict[str, str]:
 
     Currently supports:
         FIRECREST_RESERVATION -> --reservation
+        FIRECREST_PARTITION -> --partition
     """
     opts: dict[str, str] = {}
     reservation = os.environ.get("FIRECREST_RESERVATION")
+    partition = os.environ.get("FIRECREST_PARTITION")
     if reservation:
         opts["reservation"] = reservation
+    if partition:
+        opts["partition"] = partition
     return opts
 
 

@@ -274,7 +274,9 @@ def _inject_container_toml(script_content: str, toml_content: str) -> str:
         "cat > /dev/shm/fcw-container-${SLURM_JOB_ID}.toml << 'FCWEOF'\n"
         f"{toml_content.rstrip()}\n"
         "FCWEOF\n"
-        "export FCW_CONTAINER_TOML=/dev/shm/fcw-container-${SLURM_JOB_ID}.toml"
+        "export FCW_CONTAINER_TOML=/dev/shm/fcw-container-${SLURM_JOB_ID}.toml\n"
+        'csrun() { srun --environment="$FCW_CONTAINER_TOML" "$@"; }\n'
+        "export -f csrun"
     )
 
     lines = script_content.split("\n")
@@ -603,10 +605,22 @@ def submit_job(
         "ignore_unknown_options": True,
     },
 )
-def run_command( # FIXME: should probably enable running commands in a container from the config (e.g. with --container, possibly also overriding the TOML with --environment). Supporting containers here is not quite straightforward as they act on srun commands and one wouldn't want to user to write complicated srun-commands with --environment FCW_CONTAINER_TOML - maybe fcw can just inject the TOML if a container is specified (alternatively use special shorthand for srun with container)? Also note that submit has some more options - it seems especially --dry-run would be useful here as well. Another task would be to make it patch-aware - if a container is being used with patches, first make sure they're up to date on the remote staging dir
+def run_command(  # TODO: add --wait option similar to submit, additionally add an option that follows job logs in real time until completion, similar to running `srun`
     ctx: typer.Context,
     time: str = typer.Option("00:30:00", "--time", "-t", help="Default time limit"),
     nodes: int = typer.Option(1, "--nodes", "-N", help="Default number of nodes"),
+    container: Optional[str] = typer.Option(
+        None, "--container", "-c",
+        help="Container name from fcw.yaml to run the command in (defines csrun)"
+    ),
+    environment: Optional[str] = typer.Option(
+        None, "--environment", "-e",
+        help="Path to a TOML file to inline as the container env (mutually exclusive with --container)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Print the final script to stdout and exit without submitting"
+    ),
     remote_script: bool = typer.Option(
         False, "--remote-script",
         help="Upload script to remote before submitting (workaround for slurmrestd/pyxis segfault)"
@@ -624,10 +638,20 @@ def run_command( # FIXME: should probably enable running commands in a container
         # With SBATCH overrides
         fcw job run --time 01:00:00 --nodes 2 -- 'nvidia-smi'
 
-        # With dependency
-        fcw job run --dependency afterok:12345 -- 'python analyze.py'
-    """  # FIXME: the python example command should be run inside a suitable container
+        # In a container (csrun = srun --environment=$FCW_CONTAINER_TOML)
+        fcw job run -c mycont -- 'csrun python analyze.py'
+    """
     config, system, account = resolve_context(ctx)
+
+    if container and environment:
+        _console().print(
+            "[red]Error: --container and --environment are mutually exclusive[/red]"
+        )
+        raise typer.Exit(1)
+
+    if environment and not Path(environment).exists():
+        _console().print(f"[red]Environment TOML not found: {environment}[/red]")
+        raise typer.Exit(1)
 
     args = ctx.args
     sbatch_overrides, remaining = _parse_sbatch_args(args or [])
@@ -636,30 +660,43 @@ def run_command( # FIXME: should probably enable running commands in a container
         _console().print("[red]Error: No command provided[/red]")
         _console().print("[dim]Usage: fcw job run [SBATCH_OPTS]... -- <command>[/dim]")
         raise typer.Exit(1)
-    
+
     command = " ".join(remaining)
-    
+
     # Apply defaults, then overrides
     sbatch_defaults = {
         "job-name": "fcw-run",
         "time": time,
         "nodes": str(nodes),
-        "output": "fcw-run-%j.out",  # FIXME: consider using a dedicated output directory for fcw-related log files (be it from running commands, building containers, etc.) to avoid cluttering the user's working directory. This would also make it easier to find logs related to a specific job or command, and to manage them (e.g. cleanup old logs).
+        "output": "fcw-run-%j.out",
     }
     sbatch_final = {**sbatch_defaults, **get_global_sbatch_options(), **sbatch_overrides}
-    
+
     # Build script
     sbatch_lines = "\n".join(f"#SBATCH --{k}={v}" for k, v in sbatch_final.items())
-    
+
     script_content = f"""#!/bin/bash -l
 {sbatch_lines}
 
 {command}
 """
-    
+
+    if container:
+        from fcw.commands.container import _resync_container_patches
+        _resync_container_patches(config, container, system, account)
+        toml_content = _build_container_toml(config, container)
+        script_content = _inject_container_toml(script_content, toml_content)
+    elif environment:
+        toml_content = Path(environment).read_text()
+        script_content = _inject_container_toml(script_content, toml_content)
+
+    if dry_run:
+        _console().print(script_content)
+        return
+
     client = get_client()
     working_dir = config.workdir.remote
-    
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(script_content)
         script_path = f.name
