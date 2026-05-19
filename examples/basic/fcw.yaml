@@ -1,14 +1,11 @@
 # fcw configuration file
 project: test-fcw
 
-# Workdir mapping - all paths are relative to this
-workdir:
+workdir:  # Workdir mapping - all paths are relative to this
   remote: ${FIRECREST_SCRATCH}/fcw-basic-${FCW_BASIC_RUN_ID}
   local: .
 
-# Directory declarations with data flow type
-# type: in (upload only), out (download only), both (bidirectional)
-directories:
+directories:  # data dirs with data flow: in (upload only), out (download only), both
   data/raw:
     type: in
   data/processed:
@@ -18,8 +15,7 @@ directories:
   config:
     type: in
 
-# Container definitions
-containers:
+containers:  # Container definitions
   app:
     file: ./env/Dockerfile.app
     tag: ubuntu-fcw-basic:24.04
@@ -32,10 +28,9 @@ containers:
     remote_path: ./ce-images/
     platform: linux/arm64
 
-# Job definitions with environment
-# container: references a container from the containers section;
-# at submit time, fcw inlines the TOML and resolves the image path automatically
-jobs:
+jobs:  # Job definitions with environment
+       # container: references a container from the containers section;
+       # at submit time, fcw inlines the TOML and resolves the image path automatically
   preprocess:
     script: slurm/preprocess.sh
     container: app

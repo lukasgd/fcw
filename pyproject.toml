@@ -39,7 +39,6 @@ dependencies = [
 [project.optional-dependencies]
 fuse = [
     "pyfuse3>=3.3.0",
-    "trio>=0.22.0",
     "cachetools>=5.0.0",
 ]
 dev = [
