@@ -1,0 +1,8 @@
+# Default performance thresholds shared across all examples (seconds).
+# Example-specific thresholds in examples/<name>/e2e_perf_thresholds.yaml
+# override these values.
+
+default:
+  container-deploy: 900
+  container-push: 600
+  job-run-and-wait: 300

@@ -23,12 +23,20 @@ class TestSlurmFailedStates:
 class TestGetGlobalSbatchOptions:
     def test_empty_when_no_env(self, monkeypatch):
         monkeypatch.delenv("FIRECREST_RESERVATION", raising=False)
+        monkeypatch.delenv("FIRECREST_PARTITION", raising=False)
         assert get_global_sbatch_options() == {}
 
     def test_reservation_from_env(self, monkeypatch):
+        monkeypatch.delenv("FIRECREST_PARTITION", raising=False)
         monkeypatch.setenv("FIRECREST_RESERVATION", "my-reservation")
         opts = get_global_sbatch_options()
         assert opts == {"reservation": "my-reservation"}
+
+    def test_partition_from_env(self, monkeypatch):
+        monkeypatch.delenv("FIRECREST_RESERVATION", raising=False)
+        monkeypatch.setenv("FIRECREST_PARTITION", "debug")
+        opts = get_global_sbatch_options()
+        assert opts == {"partition": "debug"}
 
 
 class TestFormatSbatchLines:

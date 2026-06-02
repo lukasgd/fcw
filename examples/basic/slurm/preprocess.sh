@@ -1,7 +1,7 @@
 #!/bin/bash -l
 
 #SBATCH --job-name preprocess
-#SBATCH --time 12:00:00
+#SBATCH --time 00:15:00
 #SBATCH --output logs/%x-%j.out
 #SBATCH --nodes 1
 #SBATCH --ntasks-per-node 1

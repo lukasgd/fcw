@@ -12,7 +12,7 @@ A command-line tool for orchestrating HPC workflows via [FirecREST](https://gith
 ## Installation
 
 ```bash
-pip install fcw
+pip install fcw  # add [dev] to install with testing utilities (incl. performance)
 
 # With FUSE support (requires libfuse3-dev)
 pip install fcw[fuse]
@@ -79,8 +79,8 @@ containers:  # using multistage Dockerfiles (download and build-offline by defau
     file: ./env/Dockerfile.prep
     tag: my-fcw-app-prep:26.01
     remote_path: ce-images/
-    toml: ./env/container.toml  # optional, user-editable enroot environment
-    platform: linux/arm64  # optional, for cross-arch builds (auto-detect if omitted)
+    toml: ./env/container.toml
+    platform: linux/arm64
 
 jobs:  # Job definitions
        # at submit time, fcw inlines the TOML and resolves the image path automatically.
@@ -159,7 +159,7 @@ fcw job wait $JOB1
 
 #### Initial build and deploy
 
-The build process is distributed across machines - a download stage built on the client that collects the base image(s) and dependencies and a build-offline stage on the remote cluster to build the dependencies.
+The build process is distributed across machines - a download stage built on the client that collects the base image(s) and dependencies and a build-offline stage on the remote cluster to build the final image from the dependencies/base image(s).
 
 This can be run end-toend with the command `deploy`, which builds local stages, pushes them, and submits a remote build job according to config in `fcw.yaml`:
 ```bash
@@ -311,3 +311,82 @@ done
 # When satisfied, bake accumulated patches into a new image
 fcw container rebuild my-fcw-app --tag my-fcw-app:v2 --enroot --wait
 ```
+
+
+## Tests
+
+### Linting & type checking
+
+```bash
+ruff check src/
+mypy src/fcw/
+```
+
+### Unit tests
+
+```bash
+pytest
+pytest tests/test_job.py::TestApplySbatchOverrides -v   # single test
+```
+
+### End-to-end tests
+
+e2e tests require FirecREST credentials (`FIRECREST_URL`, `FIRECREST_CLIENT_ID`,
+`FIRECREST_CLIENT_SECRET`, `AUTH_TOKEN_URL`) and `FIRECREST_SCRATCH` to be set.
+
+```bash
+# Run e2e tests for a given example
+pytest tests/ --run-e2e --example basic --verbose       # default
+pytest tests/ --run-e2e --example node-burn --verbose
+pytest tests/ --run-e2e --example BrainBERT --verbose
+
+# Or via env var
+FCW_E2E=1 pytest tests/ --example BrainBERT
+```
+
+Each example has its own test file (`tests/e2e/test_e2e_<name>.py`) and performance thresholds (`examples/<name>/e2e_perf_thresholds.yaml`).
+
+Run a specific test class (in particular, NCCL tests without the full BrainBERT workflow):
+
+```bash
+pytest tests/e2e/test_e2e_brainbert.py::TestBrainBERTNcclTests --run-e2e --example BrainBERT
+```
+
+### Performance tests
+
+Every e2e step is timed and compared against per-system thresholds defined in
+`examples/<name>/e2e_perf_thresholds.yaml`. Timing results are always printed
+in the terminal summary. To **fail the test run** when thresholds are exceeded:
+
+```bash
+pytest tests/ --run-e2e --example BrainBERT --check-perf
+
+# Or via env var
+FCW_CHECK_PERF=1 pytest tests/ --run-e2e --example BrainBERT
+```
+
+To run only the performance-focused tests (training throughput, NCCL bandwidth,
+GPU GEMM benchmarks):
+
+```bash
+# BrainBERT: NCCL all-reduce bandwidth
+pytest tests/e2e/test_e2e_brainbert.py::TestBrainBERTNcclTests --run-e2e --example BrainBERT
+
+# BrainBERT: training throughput (train-benchy)
+pytest tests/e2e/test_e2e_brainbert.py::TestBrainBERTWorkflow -k "train_benchy" --run-e2e --example BrainBERT
+
+# node-burn: GPU GEMM benchmarks
+pytest tests/e2e/test_e2e_node_burn.py::TestNodeBurnJob --run-e2e --example node-burn
+```
+
+### Remote cleanup
+
+By default, remote workdirs are preserved after a run (useful for debugging).
+To clean up automatically after a successful run:
+
+```bash
+pytest tests/ --run-e2e --cleanup-remote
+```
+
+On failure, the test output prints the `FCW_<EXAMPLE>_RUN_ID` so you can re-run
+against the same remote directory without re-uploading data.

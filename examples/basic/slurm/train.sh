@@ -1,7 +1,7 @@
 #!/bin/bash -l
 
 #SBATCH --job-name train
-#SBATCH --time 12:00:00
+#SBATCH --time 00:20:00
 #SBATCH --output logs/%x-%j.out
 #SBATCH --nodes 2
 #SBATCH --ntasks-per-node 4

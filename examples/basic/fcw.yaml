@@ -41,7 +41,7 @@ jobs:  # Job definitions with environment
   train:
     script: slurm/train.sh
     container: app
-    time: "12:00:00"
+    time: "00:30:00"
     nodes: 1
     env:
       DATA_DIR: data/processed

@@ -31,7 +31,9 @@ def _get_auth() -> firecrest.ClientCredentialsAuth:
             "Set these variables or use 'fcw config validate' to check your setup."
         )
     
-    return firecrest.ClientCredentialsAuth(client_id, client_secret, token_uri)
+    return firecrest.ClientCredentialsAuth(
+        client_id, client_secret, token_uri, min_token_validity=60
+    )
 
 
 def _get_firecrest_url() -> str:

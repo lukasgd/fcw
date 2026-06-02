@@ -1,7 +1,7 @@
 project: node-burn
 
 workdir:
-  remote: ${FIRECREST_SCRATCH}/node-burn-${FCW_NODE_BURN_RUN_ID}
+  remote: ${FIRECREST_SCRATCH}/fcw-node-burn-${FCW_NODE_BURN_RUN_ID}
   local: .
 
 directories:

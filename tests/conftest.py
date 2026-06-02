@@ -81,10 +81,24 @@ def pytest_addoption(parser):
                      help="Fail e2e tests if step timings exceed thresholds")
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "example(name): select which example project this test targets")
+
+
 def pytest_collection_modifyitems(config, items):
-    if config.getoption("--run-e2e") or os.environ.get("FCW_E2E"):
+    if not (config.getoption("--run-e2e") or os.environ.get("FCW_E2E")):
+        skip_e2e = pytest.mark.skip(reason="need --run-e2e or FCW_E2E=1 to run")
+        for item in items:
+            if "e2e" in item.keywords:
+                item.add_marker(skip_e2e)
         return
-    skip_e2e = pytest.mark.skip(reason="need --run-e2e or FCW_E2E=1 to run")
+
+    selected_example = config.getoption("--example")
     for item in items:
-        if "e2e" in item.keywords:
-            item.add_marker(skip_e2e)
+        example_markers = list(item.iter_markers("example"))
+        if example_markers:
+            example_name = example_markers[0].args[0]
+            if example_name != selected_example:
+                item.add_marker(pytest.mark.skip(
+                    reason=f"example '{example_name}' not selected (--example {selected_example})"
+                ))

@@ -164,12 +164,21 @@ def perf_collector(request):
 
 
 @pytest.fixture(scope="session")
-def perf_thresholds(system):
-    """Load performance thresholds for the target system."""
-    config_path = os.path.join(os.path.dirname(__file__), "perf_thresholds.yaml")
-    if not os.path.exists(config_path):
-        return {}
-    return load_thresholds(config_path, system)
+def perf_thresholds(system, example_workdir):
+    """Load performance thresholds for the target system.
+
+    Looks for e2e_perf_thresholds.yaml in the example directory first,
+    then falls back to perf_thresholds_defaults.yaml in tests/e2e/.
+    """
+    example_path = os.path.join(str(example_workdir), "e2e_perf_thresholds.yaml")
+    defaults_path = os.path.join(os.path.dirname(__file__), "perf_thresholds_defaults.yaml")
+
+    thresholds = {}
+    if os.path.exists(defaults_path):
+        thresholds.update(load_thresholds(defaults_path, system))
+    if os.path.exists(example_path):
+        thresholds.update(load_thresholds(example_path, system))
+    return thresholds
 
 
 @pytest.fixture
