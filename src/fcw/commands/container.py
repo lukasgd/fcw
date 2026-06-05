@@ -672,7 +672,7 @@ def build_image(
         )
         # Save if requested
         if save:
-            _save_image(runtime, stage_tag, save)
+            _save_image(runtime, [stage_tag], save)
     elif cont_config and not tag:
         # Config name without --stage: build all local_stages
         local_stages = cont_config.get_local_stages()
@@ -689,8 +689,7 @@ def build_image(
                 context=build_context,
             )
         if save:
-            # Save the last built stage
-            _save_image(runtime, cont_config.stage_tag(local_stages[-1]), save)  # FIXME: need to save all of the built local_stages, not just the last one
+            _save_image(runtime, [cont_config.stage_tag(s) for s in local_stages], save)
     else:
         # No config or explicit --tag: single build (legacy behavior)
         _build_one_stage(
@@ -703,12 +702,15 @@ def build_image(
             context=build_context,
         )
         if save:
-            _save_image(runtime, resolved_tag, save)
+            _save_image(runtime, [resolved_tag], save)
 
 
-def _save_image(runtime: str, tag: str, path: str) -> None:
-    """Export a container image to a tar file."""
-    cmd = [runtime, "save", "-o", path, tag]
+def _save_image(runtime: str, tags: list[str], path: str) -> None:
+    """Export one or more container images to a single tar archive."""
+    cmd = [runtime, "save"]
+    if runtime == "podman" and len(tags) > 1:
+        cmd.append("--multi-image-archive")
+    cmd += ["-o", path, *tags]
     _console().print(f"[dim]Saving image to {path}...[/dim]")
     result = subprocess.run(cmd)
     if result.returncode != 0:

@@ -4,6 +4,7 @@ import subprocess
 from unittest.mock import patch
 
 import pytest
+import typer
 
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from fcw.commands.container import (
     _record_patch_in_index,
     _resolve_remote_tar,
     _resync_container_patches,
+    _save_image,
     _scan_staging_dirs,
     _sidecar_path,
     _staging_cleanup_block,
@@ -710,3 +712,34 @@ class TestGenerateLoadAndResolveBlock:
         load, args = _generate_load_and_resolve_block([], "/scratch")
         assert load == ""
         assert args == ""
+
+
+class TestSaveImage:
+    def test_save_single_tag(self):
+        with patch("fcw.commands.container.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 0)
+            _save_image("docker", ["a:1"], "out.tar")
+        assert mock_run.call_args.args[0] == ["docker", "save", "-o", "out.tar", "a:1"]
+
+    def test_save_multi_tag_docker(self):
+        with patch("fcw.commands.container.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 0)
+            _save_image("docker", ["a:1", "b:2"], "out.tar")
+        cmd = mock_run.call_args.args[0]
+        assert "--multi-image-archive" not in cmd
+        assert cmd[-2:] == ["a:1", "b:2"]
+
+    def test_save_multi_tag_podman(self):
+        # node-burn's [download, runtime-download] case under podman.
+        with patch("fcw.commands.container.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 0)
+            _save_image("podman", ["a:1", "b:2"], "out.tar")
+        cmd = mock_run.call_args.args[0]
+        assert "--multi-image-archive" in cmd
+        assert cmd[-2:] == ["a:1", "b:2"]
+
+    def test_save_failure_raises(self):
+        with patch("fcw.commands.container.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess([], 1)
+            with pytest.raises(typer.Exit):
+                _save_image("docker", ["a:1"], "out.tar")

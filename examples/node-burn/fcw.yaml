@@ -26,5 +26,5 @@ jobs:
   node-burn:
     script: slurm/submit-node-burn.sh
     container: node-burn
-    time: "1:00:00"
-    nodes: 4
+    time: "00:15:00"
+    nodes: 2

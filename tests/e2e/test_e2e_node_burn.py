@@ -7,9 +7,15 @@ Requires: --run-e2e flag or FCW_E2E=1 environment variable.
 Runs with: --example node-burn
 """
 
+import json
+import tarfile
+
 import pytest
 from helpers import (
+    assert_container_build,
+    assert_container_build_remote,
     assert_container_deploy,
+    assert_container_push,
     assert_job_submit,
     assert_ok,
     assert_sqsh_exists,
@@ -52,7 +58,46 @@ class TestContainerDeploy:
 
 
 # ---------------------------------------------------------------------------
-# 3. Job Submission + Performance Verification
+# 3. Container build/push/build-remote sequence (decomposed deploy)
+# ---------------------------------------------------------------------------
+
+class TestContainerBuildSequence:
+    """The decomposed build -> push -> build-remote path, config-driven.
+
+    Complements TestContainerDeploy (the all-in-one path): the `build --save`
+    step exercises the multi-stage `_save_image` archive on a real engine, which
+    `deploy` does not reach.
+    """
+
+    def test_build_save(self, runner, timed_step, remote_platform, fcw_config, tmp_path):
+        """Build all local stages and save them to a single tar archive."""
+        tar = tmp_path / "node-burn.tar"
+        assert_container_build(runner, timed_step, "node-burn",
+                               platform=remote_platform, save=str(tar))
+        # The multi-stage --save must write EVERY local stage to the tar, not
+        # just the last one (regression guard for the `build --save` fix).
+        cont = fcw_config.containers["node-burn"]
+        expected = {cont.stage_tag(s) for s in cont.get_local_stages()}
+        with tarfile.open(tar) as t:
+            manifest = json.load(t.extractfile("manifest.json"))
+        tags = {x for entry in manifest for x in (entry.get("RepoTags") or [])}
+        assert expected <= tags, (expected, tags)
+
+    def test_push(self, runner, timed_step, remote_platform):
+        """Push all local stages to remote."""
+        assert_container_push(runner, timed_step, "node-burn", platform=remote_platform)
+
+    def test_build_remote(self, runner, timed_step):
+        """Build offline stage on the cluster + enroot import."""
+        assert_container_build_remote(runner, timed_step, "node-burn")
+
+    def test_verify_sqsh(self, runner):
+        """Verify squashfs image exists on remote."""
+        assert_sqsh_exists(runner, "ce-images", "node-burn+12.4.1-runtime-ubuntu22.04.sqsh")
+
+
+# ---------------------------------------------------------------------------
+# 4. Job Submission + Performance Verification
 # ---------------------------------------------------------------------------
 
 class TestNodeBurnJob:
