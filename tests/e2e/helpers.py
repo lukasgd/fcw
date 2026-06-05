@@ -122,11 +122,13 @@ def assert_job_run(runner, timed_step, command, *, step_name="job-run",
     return invoke(runner, cmd, step_name, timed_step)
 
 
-def assert_data_upload(runner, timed_step, path, *, incremental=False):
+def assert_data_upload(runner, timed_step, path, *, incremental=False, follow_symlinks=False):
     """Upload a data directory."""
     cmd = ["data", "upload"]
     if incremental:
         cmd.append("--incremental")
+    if follow_symlinks:
+        cmd.append("--follow-symlinks")
     cmd.append(path)
     step = f"upload-{path}" if not incremental else f"upload-incremental-{path}"
     return invoke(runner, cmd, step, timed_step)

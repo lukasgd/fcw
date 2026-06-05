@@ -190,33 +190,41 @@ def expand_env_vars(value: str) -> str:
     return re.sub(r'\$\{([^}]+)\}', replace, value)
 
 
-def expand_config_refs(value: str, config_data: dict[str, Any]) -> str:
-    """Expand internal config references like ${workdir.remote}."""
+def expand_config_refs(value: str, config_data: dict[str, Any],
+                       _seen: frozenset[str] = frozenset()) -> str:
+    """Expand internal config references like ${workdir.remote}, including nested refs."""
     def replace(match: re.Match) -> str:
         ref_path = match.group(1)
+        if ref_path in _seen:  # cycle guard
+            return str(match.group(0))
         parts = ref_path.split(".")
-        
+
         # Navigate the config structure
         current = config_data
         for part in parts:
             if isinstance(current, dict) and part in current:
                 current = current[part]
             else:
-                return match.group(0)  # Keep original if not found
-        
+                return str(match.group(0))  # Keep original if not found
+
         if isinstance(current, str):
-            return current
-        return match.group(0)
-    
+            # Resolve any refs nested inside the target value.
+            return expand_config_refs(current, config_data, _seen | {ref_path})
+        return str(match.group(0))
+
     return re.sub(r'\$\{([a-zA-Z_][a-zA-Z0-9_.]*)\}', replace, value)
 
 
 def process_value(value: Any, config_data: dict[str, Any]) -> Any:
     """Process a config value, expanding variables and references."""
     if isinstance(value, str):
-        # First expand env vars, then config refs # FIXME: is this the right order? Isn't the config ref syntax indistinguishable from env vars (and so, config refs would be interpreted as env vars, getting expanded mostly as empty strings or similar)?
-        value = expand_env_vars(value)
+        # Resolve config refs first (incl. nested), then env vars — so env vars
+        # inside a ref target (e.g. workdir.remote = ${FIRECREST_SCRATCH}/app) expand.
+        # Single pass: a config ref arriving *via* an env var's value (e.g.
+        # FOO=${workdir.remote}, value ${FOO}) is not re-resolved; shipped configs
+        # don't rely on that.
         value = expand_config_refs(value, config_data)
+        value = expand_env_vars(value)
         return value
     elif isinstance(value, dict):
         return {k: process_value(v, config_data) for k, v in value.items()}

@@ -13,6 +13,7 @@ from fcw.commands.container import (
     _derive_container_name,
     _derive_rebuilt_toml_path,
     _detect_container_runtime,
+    _detect_remote_platform,
     _find_container_config,
     _generate_load_and_resolve_block,
     _isolated_staging_dir,
@@ -54,6 +55,56 @@ class TestDetectContainerRuntime:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             with pytest.raises(RuntimeError, match="No container runtime found"):
                 _detect_container_runtime()
+
+
+class _StubHeadClient:
+    """Minimal client stub exposing head() with canned output or an exception."""
+    def __init__(self, result=None, exc=None):
+        self._result = result
+        self._exc = exc
+        self.called = False
+
+    def head(self, system_name, path, num_lines):
+        self.called = True
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+
+def _flat(captured):
+    """Collapse rich's line-wrapping so phrase assertions are wrap-insensitive."""
+    import re
+    return re.sub(r"\s+", " ", captured)
+
+
+class TestDetectRemotePlatform:
+    def test_known_system_short_circuits(self, capsys):
+        client = _StubHeadClient(exc=AssertionError("head must not be called"))
+        assert _detect_remote_platform(client, "clariden") == "linux/arm64"
+        assert client.called is False
+        assert "Warning" not in capsys.readouterr().out
+
+    def test_head_detects_arm64(self, capsys):
+        client = _StubHeadClient(result={"content": "CPU part: aarch64 cores"})
+        assert _detect_remote_platform(client, "unknown-sys") == "linux/arm64"
+        assert "Warning" not in capsys.readouterr().out
+
+    def test_head_detects_amd64(self, capsys):
+        client = _StubHeadClient(result={"output": "model name: x86_64 GenuineIntel"})
+        assert _detect_remote_platform(client, "unknown-sys") == "linux/amd64"
+        assert "Warning" not in capsys.readouterr().out
+
+    def test_head_failure_warns(self, capsys):
+        client = _StubHeadClient(exc=RuntimeError("403 forbidden"))
+        assert _detect_remote_platform(client, "unknown-sys") is None
+        out = _flat(capsys.readouterr().out)
+        assert "could not auto-detect" in out
+        assert "403 forbidden" in out
+
+    def test_unrecognized_content_warns(self, capsys):
+        client = _StubHeadClient(result={"content": "nothing useful here"})
+        assert _detect_remote_platform(client, "unknown-sys") is None
+        assert "could not auto-detect" in _flat(capsys.readouterr().out)
 
 
 class TestFindContainerConfig:

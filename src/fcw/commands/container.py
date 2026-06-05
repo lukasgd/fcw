@@ -172,27 +172,35 @@ KNOWN_SYSTEMS = {
 }
 
 
-def _detect_remote_platform(client, system: str) -> Optional[str]:  # FIXME: This currently doesn't work (seems like a remote permission issue). Could it be alternatively solved with an fcw job run like approach? 
-    """Detect the remote system's platform by reading /proc/cpuinfo.
+def _detect_remote_platform(client, system: str) -> Optional[str]:
+    """Detect the remote system's platform via /proc/cpuinfo, or None (with a warning).
 
-    Returns a platform string like ``linux/arm64`` or ``linux/amd64``,
-    or None if detection fails.
+    Returns a platform string like ``linux/arm64`` or ``linux/amd64``. On failure
+    (e.g. the FirecREST head endpoint can't read the /proc/cpuinfo pseudo-file) it
+    warns and returns None so the caller falls back to --platform/config; the remote
+    build verifies architecture regardless.
     """
     if system in KNOWN_SYSTEMS:
         return KNOWN_SYSTEMS[system]
 
+    detail = ""
     try:
         result = client.head(system_name=system, path="/proc/cpuinfo", num_lines=20)
-        content = result.get("content") or result.get("output") or ""
-        if isinstance(result, str):
-            content = result
+        content = result if isinstance(result, str) else (
+            result.get("content") or result.get("output") or "")
         content_lower = content.lower()
         if "aarch64" in content_lower or "arm" in content_lower:
             return "linux/arm64"
         if "x86_64" in content_lower or "genuineintel" in content_lower or "authenticamd" in content_lower:
             return "linux/amd64"
-    except Exception:
-        pass
+    except Exception as e:
+        detail = f" ({e})"
+
+    _console().print(
+        f"[yellow]Warning: could not auto-detect remote platform for '{system}'{detail}. "
+        f"Pass --platform linux/arm64|amd64 or set 'platform' in fcw.yaml "
+        f"(the remote build will verify architecture).[/yellow]"
+    )
     return None
 
 
@@ -1571,6 +1579,7 @@ def extract_from_image(
     q_container_path = shlex.quote(container_path)
     q_staging_dir = shlex.quote(staging_dir)
     q_remote_archive = shlex.quote(remote_archive)
+    q_basename = shlex.quote(os.path.basename(container_path.rstrip("/")))
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-extract
@@ -1606,7 +1615,14 @@ podman cp "$CID:{container_path}" "$EXTRACT_TMP/"
 podman rm "$CID"
 
 cd "$EXTRACT_TMP"
-tar czf {q_remote_archive} *
+# Archive WITHOUT the basename wrapper podman cp creates: a directory's contents go
+# at the archive root (so the local dump root maps directly onto the container path,
+# which patch/rebuild require); a single file is kept as-is.
+if [ -d {q_basename} ]; then
+    tar czf {q_remote_archive} -C {q_basename} .
+else
+    tar czf {q_remote_archive} {q_basename}
+fi
 rm -rf "$EXTRACT_TMP"
 
 echo "Extracted to: {q_remote_archive}"

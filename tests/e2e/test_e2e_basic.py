@@ -189,6 +189,11 @@ class TestContainerIterate:
             "--wait",
         ], "container-extract", timed_step)
         assert os.path.isdir("extracted-code")
+        # Contents land de-nested: /workspace/aux/test.txt -> extracted-code/test.txt,
+        # not extracted-code/aux/test.txt (the basename wrapper must be gone, so the
+        # dump root maps directly onto the container path for patch/rebuild).
+        assert os.path.isfile("extracted-code/test.txt")
+        assert not os.path.exists("extracted-code/aux")
         sidecar = "extracted-code.meta.json"
         assert os.path.exists(sidecar)
         import json
@@ -435,10 +440,50 @@ class TestDataDownload:
     def test_download_outputs(self, runner, timed_step):
         """Download outputs directory."""
         assert_data_download(runner, timed_step, "outputs")
+        # Contents land directly in outputs/, not a nested outputs/outputs/.
+        assert os.path.isdir("outputs")
+        assert not os.path.isdir(os.path.join("outputs", "outputs"))
 
     def test_download_incremental(self, runner, timed_step):
         """Re-download with --incremental (should skip unchanged files)."""
         assert_data_download(runner, timed_step, "outputs", incremental=True)
+        # The incremental path must de-nest too (regression guard for bug #4).
+        assert not os.path.isdir(os.path.join("outputs", "outputs"))
+
+
+# ---------------------------------------------------------------------------
+# 8.5 Symlink + nested-file upload (bug #3)
+# ---------------------------------------------------------------------------
+
+class TestSymlinkAndNestedUpload:
+    """Symlinks are dereferenced only with -L; nested single-file uploads
+    create their remote parents. Fixtures are built at runtime (a committed
+    symlink wouldn't survive the example copytree)."""
+
+    def test_upload_symlinked_dir(self, runner, timed_step, tmp_path):
+        target = tmp_path / "real_target"
+        os.makedirs(target, exist_ok=True)
+        with open(os.path.join(target, "inner.txt"), "w") as f:
+            f.write("payload")
+        link = os.path.join("data", "raw", "linked")
+        if os.path.islink(link) or os.path.exists(link):
+            os.remove(link)
+        os.symlink(str(target), link)
+        try:
+            invoke(runner, ["data", "upload", "--follow-symlinks", "data/raw"],
+                   "upload-symlinked", timed_step)
+            assert_remote_ls_contains(runner, "data/raw/linked", "inner.txt")
+        finally:
+            os.remove(link)
+
+    def test_upload_nested_file_creates_parents(self, runner, timed_step):
+        nested = os.path.join("data", "raw", "newsub", "deep")
+        os.makedirs(nested, exist_ok=True)
+        with open(os.path.join(nested, "file.txt"), "w") as f:
+            f.write("x")
+        invoke(runner, ["data", "upload", os.path.join(nested, "file.txt")],
+               "upload-nested-file", timed_step)
+        assert_remote_ls_contains(runner, "data/raw/newsub/deep", "file.txt")
 
 
 # ---------------------------------------------------------------------------

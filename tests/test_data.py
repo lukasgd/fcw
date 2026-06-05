@@ -1,6 +1,7 @@
 """Tests for sync markers, file collection, and match patterns."""
 
 import os
+import tarfile
 import time
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from fcw.commands.data import (
     _build_emacs_match_pattern,
     _collect_local_files_since,
+    _extract_dir_archive,
     _get_sync_marker_path,
     _read_last_sync_timestamp,
     _write_last_sync_timestamp,
@@ -72,6 +74,30 @@ class TestCollectLocalFiles:
         rel_paths = [rel for _, rel in files]
         assert os.path.join("sub", "deep.txt") in rel_paths
 
+    def _setup_symlinked_subdir(self, tmp_path):
+        """Create local_dir/ with a real file and a symlinked subdir → external dir."""
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "linked.txt").write_text("payload")
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        (local_dir / "real.txt").write_text("real")
+        os.symlink(external, local_dir / "link")
+        return str(local_dir)
+
+    def test_skips_symlinked_subdir_by_default(self, tmp_path):
+        local_dir = self._setup_symlinked_subdir(tmp_path)
+        files = _collect_local_files_since(local_dir, 0)
+        rel_paths = [rel for _, rel in files]
+        assert "real.txt" in rel_paths
+        assert os.path.join("link", "linked.txt") not in rel_paths
+
+    def test_follows_symlinked_subdir_when_enabled(self, tmp_path):
+        local_dir = self._setup_symlinked_subdir(tmp_path)
+        files = _collect_local_files_since(local_dir, 0, follow_symlinks=True)
+        rel_paths = [rel for _, rel in files]
+        assert os.path.join("link", "linked.txt") in rel_paths
+
 
 class TestBuildEmacMatchPattern:
     def test_single_file(self):
@@ -93,3 +119,30 @@ class TestBuildEmacMatchPattern:
     def test_uses_source_basename(self):
         pattern = _build_emacs_match_pattern(["file.txt"], "/remote/mydir")
         assert "mydir" in pattern
+
+
+class TestExtractDirArchive:
+    def _make_archive(self, tmp_path, members):
+        """Build a gzip tar rooted at the dir basename (e.g. outputs/...)."""
+        src = tmp_path / "src"
+        archive = tmp_path / "archive.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            for name, content in members.items():
+                f = src / name
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(content)
+                tar.add(f, arcname=name)
+        return str(archive)
+
+    def test_extracts_contents_without_double_nesting(self, tmp_path):
+        archive = self._make_archive(tmp_path, {
+            "outputs/results.txt": "data",
+            "outputs/sub/x.txt": "nested",
+        })
+        local_dir = tmp_path / "outputs"
+        _extract_dir_archive(archive, str(local_dir))
+
+        assert (local_dir / "results.txt").read_text() == "data"
+        assert (local_dir / "sub" / "x.txt").read_text() == "nested"
+        # The bug: archive rooted at "outputs/" must not nest under local_dir again.
+        assert not (local_dir / "outputs").exists()

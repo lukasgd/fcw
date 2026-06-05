@@ -20,6 +20,7 @@ from fcw.core.config import (
     generate_default_config,
     generate_interactive_config,
     load_config,
+    process_value,
     remove_container_from_config,
     remove_directory_from_config,
     remove_job_from_config,
@@ -197,6 +198,39 @@ class TestConfigRefExpansion:
     def test_non_string_ref_unchanged(self):
         data = {"workdir": {"nodes": 4}}
         assert expand_config_refs("${workdir.nodes}", data) == "${workdir.nodes}"
+
+    def test_nested_ref_resolved(self):
+        data = {"a": "${b}", "b": "deep"}
+        assert expand_config_refs("${a}", data) == "deep"
+
+    def test_cyclic_ref_terminates(self):
+        data = {"a": "${b}", "b": "${a}"}
+        # Must not recurse infinitely; the cycle is left as a literal ref.
+        assert expand_config_refs("${a}", data) == "${a}"
+
+
+class TestProcessValue:
+    def test_env_var_inside_ref_target(self, monkeypatch):
+        # The bug: env var nested in a config-ref target must still expand.
+        monkeypatch.setenv("SCRATCH", "/real/scratch")
+        data = {"workdir": {"remote": "${SCRATCH}/app"}}
+        assert process_value("${workdir.remote}/x", data) == "/real/scratch/app/x"
+
+    def test_multilevel_ref_with_env(self, monkeypatch):
+        monkeypatch.setenv("SCRATCH", "/s")
+        data = {"x": "${y}/sub", "y": "${SCRATCH}/base"}
+        assert process_value("${x}/f", data) == "/s/base/sub/f"
+
+    def test_plain_env_only(self, monkeypatch):
+        monkeypatch.setenv("FOO", "bar")
+        assert process_value("${FOO}/baz", {}) == "bar/baz"
+
+    def test_plain_ref_only(self):
+        data = {"workdir": {"remote": "/scratch"}}
+        assert process_value("${workdir.remote}/data", data) == "/scratch/data"
+
+    def test_env_default_fallback(self):
+        assert process_value("${MISSING_VAR:-fallback}", {}) == "fallback"
 
 
 class TestResolvePath:

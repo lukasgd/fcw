@@ -58,8 +58,12 @@ class TestBrainBERTWorkflow:
     """Full BrainBERT pipeline: upload dataset, run job chain, download outputs."""
 
     def test_upload_dataset(self, runner, timed_step):
-        """Upload braintreebank dataset (CI subset)."""
-        assert_data_upload(runner, timed_step, "braintreebank.dev")
+        """Upload braintreebank dataset (CI subset).
+
+        The dataset is a symlinked tree, so -L is required to upload the real
+        files rather than the links.
+        """
+        assert_data_upload(runner, timed_step, "braintreebank.dev", follow_symlinks=True)
 
     def test_upload_conf(self, runner, timed_step):
         """Upload configuration directory."""

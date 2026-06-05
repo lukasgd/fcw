@@ -60,15 +60,17 @@ def _write_last_sync_timestamp(local_dir: str, direction: str, ts: float | None 
     marker_path.write_text(str(ts))
 
 
-def _collect_local_files_since(local_dir: str, since_ts: float) -> list[tuple[str, str]]:
+def _collect_local_files_since(
+    local_dir: str, since_ts: float, follow_symlinks: bool = False
+) -> list[tuple[str, str]]:
     """Collect local files modified since timestamp.
-    
+
     Returns list of (absolute_path, relative_path) tuples.
     """
     local_dir = os.path.abspath(local_dir)
     files = []
-    
-    for root, _dirs, filenames in os.walk(local_dir):
+
+    for root, _dirs, filenames in os.walk(local_dir, followlinks=follow_symlinks):
         for name in filenames:
             # Skip sync markers and hidden files
             if name.startswith(".fcw") or name.startswith(".firecrest"):
@@ -154,6 +156,7 @@ async def _upload_directory(
     account: str,
     local_dir: str,
     remote_dir: str,
+    follow_symlinks: bool = False,
 ) -> None:
     """Upload a local directory by tar → upload → extract on remote."""
     local_dir = os.path.abspath(local_dir)
@@ -168,7 +171,7 @@ async def _upload_directory(
     with tempfile.TemporaryDirectory() as tmpdir:
         archive_path = os.path.join(tmpdir, "fcw_upload.tar.gz")
 
-        with tarfile.open(archive_path, "w:gz") as tar:
+        with tarfile.open(archive_path, "w:gz", dereference=follow_symlinks) as tar:
             tar.add(local_dir, arcname=os.path.basename(local_dir.rstrip(os.sep)))
 
         remote_archive = extract_target.rstrip("/") + "/.fcw_upload.tar.gz"
@@ -193,6 +196,13 @@ async def _upload_directory(
             await client.rm(system_name=system, path=remote_archive, account=account, blocking=True)
         except Exception:
             pass
+
+
+def _extract_dir_archive(local_archive: str, local_dir: str) -> None:
+    """Unpack a directory archive (rooted at the dir basename) so its contents
+    land in local_dir, not a nested local_dir/<basename>/ subdir."""
+    with tarfile.open(local_archive, "r:gz") as tar:
+        tar.extractall(path=os.path.dirname(local_dir))
 
 
 async def _download_directory(
@@ -228,8 +238,7 @@ async def _download_directory(
             blocking=True,
         )
 
-        with tarfile.open(local_archive, "r:gz") as tar:
-            tar.extractall(path=os.path.dirname(local_dir))
+        _extract_dir_archive(local_archive, local_dir)
 
     try:
         await client.rm(system_name=system, path=remote_archive, account=account, blocking=True)
@@ -243,23 +252,24 @@ async def _upload_incremental(
     account: str,
     local_dir: str,
     remote_dir: str,
+    follow_symlinks: bool = False,
 ) -> int:
     """Upload only files changed since last sync.
-    
+
     Returns number of files uploaded.
     """
     local_dir = os.path.abspath(local_dir)
     last_sync = _read_last_sync_timestamp(local_dir, "push")
-    files = _collect_local_files_since(local_dir, last_sync)
+    files = _collect_local_files_since(local_dir, last_sync, follow_symlinks)
     
     if not files:
         return 0
     
     with tempfile.TemporaryDirectory() as tmpdir:
         archive_path = os.path.join(tmpdir, "fcw_sync.tar.gz")
-        
+
         # Create archive with relative paths (no root directory wrapper)
-        with tarfile.open(archive_path, "w:gz") as tar:
+        with tarfile.open(archive_path, "w:gz", dereference=follow_symlinks) as tar:
             for abs_path, rel_path in files:
                 tar.add(abs_path, arcname=rel_path)
 
@@ -348,8 +358,7 @@ async def _download_incremental(
         )
         
         # Extract locally
-        with tarfile.open(local_archive, "r:gz") as tar:
-            tar.extractall(path=local_dir)
+        _extract_dir_archive(local_archive, local_dir)
     
     # Cleanup remote archive
     try:
@@ -369,6 +378,9 @@ def upload(
     watch: bool = typer.Option(False, "--watch", "-w", help="Continuously watch for changes"),
     interval: int = typer.Option(10, "--interval", help="Watch interval in seconds"),
     force: bool = typer.Option(False, "--force", "-f", help="Override directory type restrictions"),
+    follow_symlinks: bool = typer.Option(
+        False, "--follow-symlinks", "-L",
+        help="Upload the real files behind symlinks instead of the links themselves"),
 ):
     """Upload local files/directories to remote storage."""
     config, system, account = resolve_context(ctx)
@@ -395,7 +407,8 @@ def upload(
                 if incremental and os.path.isdir(local_path):
                     with _spinner(f"Syncing {local_path}..."):
                         count = await _upload_incremental(
-                            client, system, account, local_path, remote_path
+                            client, system, account, local_path, remote_path,
+                            follow_symlinks,
                         )
                     if count > 0:
                         _console().print(f"[green]Uploaded {count} files to {remote_path}[/green]")
@@ -405,11 +418,20 @@ def upload(
                     # Directory upload via tar
                     with _spinner(f"Uploading {local_path}..."):
                         await _upload_directory(
-                            client, system, account, local_path, remote_path
+                            client, system, account, local_path, remote_path,
+                            follow_symlinks,
                         )
                     _console().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
                 else:
-                    # Direct file upload
+                    # Direct file upload — ensure the remote parent dir exists first
+                    try:
+                        await client.mkdir(
+                            system_name=system,
+                            path=os.path.dirname(remote_path),
+                            create_parents=True,
+                        )
+                    except Exception:
+                        pass  # May already exist
                     with _spinner(f"Uploading {local_path}..."):
                         await client.upload(
                             system_name=system,
