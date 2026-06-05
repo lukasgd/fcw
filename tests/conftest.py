@@ -79,6 +79,9 @@ def pytest_addoption(parser):
                      help="Delete remote workdir after successful e2e run")
     parser.addoption("--check-perf", action="store_true", default=False,
                      help="Fail e2e tests if step timings exceed thresholds")
+    parser.addoption("--max-node-hours", type=float, default=None,
+                     help="Cap each e2e job at this many node-hours (nodes x walltime) "
+                          "via SBATCH overrides; unset = use the job's configured walltime")
 
 
 def pytest_configure(config):

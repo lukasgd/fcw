@@ -138,6 +138,28 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture
+def submit_job(runner, timed_step, request, fcw_config):
+    """Submit a named job, auto-capped at --max-node-hours (nodes x walltime).
+
+    Node count comes from the job's fcw.yaml config; with no --max-node-hours flag,
+    no cap is applied and the job's configured walltime is used.
+    """
+    from helpers import assert_job_submit
+
+    budget = request.config.getoption("--max-node-hours")
+
+    def _submit(job_name, **kwargs):
+        if budget and job_name in fcw_config.jobs:
+            nodes = fcw_config.jobs[job_name].nodes or 1
+            minutes = max(1, int(budget / nodes * 60))
+            cap = ["--nodes", str(nodes), "--time", f"{minutes}:00"]
+            kwargs["extra_args"] = cap + list(kwargs.get("extra_args") or [])
+        return assert_job_submit(runner, timed_step, job_name, **kwargs)
+
+    return _submit
+
+
 @pytest.fixture(scope="session")
 def shared_state():
     """Session-scoped dict for sharing state (e.g. job IDs) between tests."""

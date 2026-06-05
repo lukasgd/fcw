@@ -16,7 +16,6 @@ from helpers import (
     assert_container_deploy,
     assert_data_download,
     assert_data_upload,
-    assert_job_submit,
     assert_ok,
     assert_remote_ls_contains,
     assert_remote_ls_not_contains,
@@ -339,25 +338,25 @@ class TestDataUpload:
 # ---------------------------------------------------------------------------
 
 class TestJobSubmission:
-    def test_submit_preprocess(self, runner, timed_step):
+    def test_submit_preprocess(self, submit_job):
         """Submit and wait for preprocess job."""
-        assert_job_submit(runner, timed_step, "preprocess")
+        submit_job("preprocess")
 
     def test_verify_preprocess(self, runner):
         """Verify preprocess output exists."""
         assert_remote_ls_contains(runner, "data/processed", "preprocessed_files.txt")
 
-    def test_submit_train(self, runner, timed_step):
+    def test_submit_train(self, submit_job):
         """Submit and wait for train job."""
-        assert_job_submit(runner, timed_step, "train")
+        submit_job("train")
 
     def test_verify_train(self, runner):
         """Verify train output files exist."""
         assert_remote_ls_contains(runner, "outputs", "train_output_")
 
-    def test_submit_evaluate(self, runner, timed_step):
+    def test_submit_evaluate(self, submit_job):
         """Submit and wait for evaluate job."""
-        assert_job_submit(runner, timed_step, "evaluate")
+        submit_job("evaluate")
 
     def test_verify_evaluate(self, runner):
         """Verify evaluate output exists."""

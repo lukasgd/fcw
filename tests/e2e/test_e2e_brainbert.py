@@ -14,7 +14,6 @@ from helpers import (
     assert_container_deploy,
     assert_data_download,
     assert_data_upload,
-    assert_job_submit,
     assert_ok,
     assert_sqsh_exists,
     extract_job_id,
@@ -69,26 +68,25 @@ class TestBrainBERTWorkflow:
         """Upload configuration directory."""
         assert_data_upload(runner, timed_step, "conf")
 
-    def test_submit_extract_raw(self, runner, timed_step):
+    def test_submit_extract_raw(self, submit_job):
         """Submit extract-raw job and wait for completion."""
-        assert_job_submit(runner, timed_step, "extract-raw")
+        submit_job("extract-raw")
 
-    def test_submit_preprocess(self, runner, timed_step):
+    def test_submit_preprocess(self, submit_job):
         """Submit preprocess job and wait for completion."""
-        assert_job_submit(runner, timed_step, "preprocess")
+        submit_job("preprocess")
 
-    def test_submit_train(self, runner, timed_step):
+    def test_submit_train(self, submit_job):
         """Submit train job and wait for completion."""
-        assert_job_submit(runner, timed_step, "train")
+        submit_job("train")
 
     def test_download_outputs(self, runner, timed_step):
         """Download outputs directory."""
         assert_data_download(runner, timed_step, "outputs")
 
-    def test_submit_train_benchy(self, runner, timed_step, shared_state):
-        """Submit train-benchy benchmark job with SBATCH overrides."""
-        result = assert_job_submit(runner, timed_step, "train-benchy",
-                                   extra_args=["--nodes", "2", "--time", "30:00"])
+    def test_submit_train_benchy(self, submit_job, shared_state):
+        """Submit train-benchy benchmark job."""
+        result = submit_job("train-benchy")
         job_id = extract_job_id(result.output)
         if job_id:
             shared_state["train_benchy_job_id"] = job_id
@@ -131,10 +129,9 @@ class TestBrainBERTNcclTests:
         pytest tests/e2e/test_e2e_brainbert.py::TestBrainBERTNcclTests --run-e2e
     """
 
-    def test_submit_nccl_tests(self, runner, timed_step):
-        """Submit nccl-tests job with SBATCH overrides for CI."""
-        assert_job_submit(runner, timed_step, "nccl-tests",
-                          extra_args=["--nodes", "2", "--time", "10:00"])
+    def test_submit_nccl_tests(self, submit_job):
+        """Submit nccl-tests job (walltime capped only under --max-node-hours)."""
+        submit_job("nccl-tests")
 
     def test_verify_nccl_performance(self, runner, shared_state):
         """Validate NCCL all-reduce bandwidth against reference thresholds.

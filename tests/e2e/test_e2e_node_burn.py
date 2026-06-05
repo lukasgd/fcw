@@ -16,7 +16,6 @@ from helpers import (
     assert_container_build_remote,
     assert_container_deploy,
     assert_container_push,
-    assert_job_submit,
     assert_ok,
     assert_sqsh_exists,
 )
@@ -101,9 +100,9 @@ class TestContainerBuildSequence:
 # ---------------------------------------------------------------------------
 
 class TestNodeBurnJob:
-    def test_submit_node_burn(self, runner, timed_step):
+    def test_submit_node_burn(self, submit_job):
         """Submit node-burn job and wait for completion."""
-        assert_job_submit(runner, timed_step, "node-burn")
+        submit_job("node-burn")
 
     def test_verify_performance(self, runner):
         """Verify node-burn output contains expected performance data.
