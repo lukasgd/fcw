@@ -126,7 +126,9 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
         else:
             insert_idx = 0
         
-        for directive in reversed(new_directives):  # FIXME: why reverse? Does this enforce some kind of precedence?
+        # Insert in reverse: each insert() at the same index pushes the
+        # previous one down, so reversing preserves new_directives' order.
+        for directive in reversed(new_directives):
             lines.insert(insert_idx, directive)
     
     return "\n".join(lines)

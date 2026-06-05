@@ -47,7 +47,7 @@ def _get_firecrest_url() -> str:
     return url
 
 
-@lru_cache(maxsize=1)  # TODO: how the client is reused across calls?
+@lru_cache(maxsize=1)  # process-wide singleton: all callers share one client
 def get_client() -> "Firecrest":
     """Get a synchronous FirecREST v2 client.
     
