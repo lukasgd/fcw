@@ -5,6 +5,7 @@ import pytest
 from fcw.commands.job import (
     _apply_sbatch_overrides,
     _build_container_toml,
+    _follow_stream,
     _inject_container_toml,
     _inject_env_vars,
     _parse_sbatch_args,
@@ -651,3 +652,116 @@ class TestRunContainerIntegration:
             os.chdir(old)
 
         assert result.exit_code == 0, result.output
+
+
+class _ScriptedClient:
+    """Async client stub for _follow_stream tests.
+
+    Each stat() call advances to the next (state, text) snapshot, simulating the
+    remote file and job state evolving over poll cycles. tail() serves byte ranges
+    of the current snapshot, mirroring the FirecREST ``tail -c +N`` semantics.
+    """
+
+    def __init__(self, snapshots):
+        self._snaps = list(snapshots)
+        self._i = -1
+        self._state = snapshots[0][0]
+        self._data = b""
+
+    async def job_info(self, system_name, jobid):
+        return [{"status": {"state": self._state}}]
+
+    async def stat(self, system_name, path):
+        if self._i + 1 < len(self._snaps):
+            self._i += 1
+        self._state, text = self._snaps[self._i]
+        self._data = text.encode("utf-8")
+        return {"size": len(self._data)}
+
+    async def tail(self, system_name, path, num_bytes=None, num_lines=None,
+                   exclude_beginning=False):
+        if exclude_beginning and num_bytes is not None:
+            text = self._data[num_bytes - 1:].decode("utf-8")  # tail -c +N
+            start = num_bytes
+        elif num_lines is not None:
+            text = "\n".join(self._data.decode("utf-8").split("\n")[-num_lines:])
+            start = 1
+        else:
+            text = self._data.decode("utf-8")
+            start = 1
+        # Mirror the real FirecREST tail payload shape (a dict, not a bare string).
+        return {"content": text, "contentType": "bytes",
+                "startPosition": start, "endPosition": -1}
+
+
+class TestFollowStream:
+    """Regression coverage for the offset-tracking tail -f follow loop."""
+
+    async def test_appends_each_chunk_exactly_once(self, capsys):
+        """An append-only growing file is streamed in full, with no drops or dups."""
+        snaps = [
+            ("RUNNING", "line1\nline2\n"),
+            ("RUNNING", "line1\nline2\nline3\n"),
+            ("RUNNING", "line1\nline2\nline3\nline4\nline5\nline6\n"),
+            ("COMPLETED", "line1\nline2\nline3\nline4\nline5\nline6\n"),
+        ]
+        client = _ScriptedClient(snaps)
+        await _follow_stream(client, "sys", "42", "/log.out",
+                             lines=10, tail_only=False, interval=0)
+        out = capsys.readouterr().out
+        assert out == "line1\nline2\nline3\nline4\nline5\nline6\n"
+
+    async def test_truncation_resets_offset(self, capsys):
+        """A shrinking file (rotation/truncation) resets the offset and re-reads."""
+        snaps = [
+            ("RUNNING", "aaaa"),
+            ("RUNNING", "bb"),      # truncated below current offset
+            ("RUNNING", "bbcc"),
+            ("COMPLETED", "bbcc"),
+        ]
+        client = _ScriptedClient(snaps)
+        await _follow_stream(client, "sys", "42", "/log.out",
+                             lines=10, tail_only=False, interval=0)
+        out = capsys.readouterr().out
+        assert out == "aaaabbcc"
+
+    async def test_prefix_applied_per_line(self, capsys):
+        """In `both` mode each emitted line carries the stream prefix."""
+        snaps = [
+            ("RUNNING", "a\nb\n"),
+            ("COMPLETED", "a\nb\n"),
+        ]
+        client = _ScriptedClient(snaps)
+        await _follow_stream(client, "sys", "42", "/log.err",
+                             lines=10, tail_only=False, interval=0,
+                             prefix="[stderr] ")
+        out = capsys.readouterr().out
+        assert out == "[stderr] a\n[stderr] b\n"
+
+    async def test_stops_after_terminal_state(self, capsys):
+        """The loop returns once the job is terminal (does not hang)."""
+        snaps = [("COMPLETED", "done\n")]
+        client = _ScriptedClient(snaps)
+        await _follow_stream(client, "sys", "42", "/log.out",
+                             lines=10, tail_only=False, interval=0)
+        assert "done" in capsys.readouterr().out
+
+    async def test_drains_output_flushed_after_terminal(self, capsys):
+        """Bytes flushed after the job is already terminal are still emitted.
+
+        Guards the post-terminal drain: SLURM marks a job COMPLETED before the
+        output file finishes flushing, so breaking on the first terminal poll
+        would drop the tail of the log. Here the file grows across snapshots
+        that are already COMPLETED.
+        """
+        snaps = [
+            ("RUNNING", "x\n"),
+            ("COMPLETED", "x\n"),
+            ("COMPLETED", "x\ny\n"),
+            ("COMPLETED", "x\ny\nz\n"),
+            ("COMPLETED", "x\ny\nz\n"),
+        ]
+        client = _ScriptedClient(snaps)
+        await _follow_stream(client, "sys", "42", "/log.out",
+                             lines=10, tail_only=False, interval=0)
+        assert capsys.readouterr().out == "x\ny\nz\n"

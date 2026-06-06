@@ -28,6 +28,7 @@ import asyncio
 import os
 import re
 import tempfile
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -52,6 +53,120 @@ from fcw.core import (
 
 app = typer.Typer(no_args_is_help=True)
 _console = get_console
+
+# SLURM states after which a job produces no further output (stop following).
+SLURM_TERMINAL_STATES = SLURM_FAILED_STATES | {"COMPLETED"}
+
+
+class LogStream(str, Enum):
+    """Which job output stream(s) `fcw job logs` operates on."""
+
+    stdout = "stdout"
+    stderr = "stderr"
+    both = "both"
+
+
+async def _job_is_terminal(client, system: str, job_id: str) -> bool:
+    """Return True once the job has reached a terminal SLURM state.
+
+    Lookup failures are treated as non-terminal so following continues.
+    """
+    try:
+        jobs = await client.job_info(system_name=system, jobid=job_id)
+        if not jobs:
+            return False
+        state = jobs[0].get("status", {}).get("state", "")
+        if isinstance(state, list):
+            state = ",".join(state)
+        return any(ts in str(state) for ts in SLURM_TERMINAL_STATES)
+    except Exception:
+        return False
+
+
+def _tail_content(result) -> str:
+    """Extract text from a FirecREST tail payload (dict) or a plain string."""
+    if isinstance(result, dict):
+        return result.get("content") or result.get("output") or ""
+    return result or ""
+
+
+def _emit(content: str, prefix: str = "") -> None:
+    """Write a log chunk to stdout, optionally prefixing each non-empty line."""
+    if not content:
+        return
+    if prefix:
+        # Preserve the chunk's own newlines; prefix only non-empty lines.
+        lines = content.split("\n")
+        out = "\n".join(f"{prefix}{ln}" if ln else ln for ln in lines)
+        print(out, end="")
+    else:
+        print(content, end="")
+
+
+async def _follow_stream(
+    client,
+    system: str,
+    job_id: str,
+    path: str,
+    *,
+    lines: int,
+    tail_only: bool,
+    interval: float,
+    prefix: str = "",
+) -> None:
+    """Stream a remote file like `tail -f`, until the job reaches a terminal state.
+
+    Tracks an absolute byte offset and reads only the appended delta each poll via
+    ``tail(num_bytes=offset+1, exclude_beginning=True)`` (FirecREST ``tail -c +N``),
+    advancing by the bytes actually read so no content is dropped if the file grows
+    between the ``stat`` and the ``tail``.
+    """
+    async def _size() -> int:
+        try:
+            return int((await client.stat(system_name=system, path=path)).get("size", 0))
+        except Exception:
+            return -1
+
+    if tail_only:
+        try:
+            _emit(_tail_content(
+                await client.tail(system_name=system, path=path, num_lines=lines)
+            ), prefix)
+        except Exception:
+            pass
+        offset = await _size()
+        if offset < 0:
+            offset = 0
+    else:
+        offset = 0  # first delta read prints the whole file so far
+
+    draining_polls = 0
+    while True:
+        terminal = await _job_is_terminal(client, system, job_id)
+        size = await _size()
+        if size < 0:
+            size = offset
+        if size < offset:  # file rotated/truncated
+            offset = 0
+        grew = size > offset
+        if grew:
+            try:
+                text = _tail_content(await client.tail(
+                    system_name=system, path=path,
+                    num_bytes=offset + 1, exclude_beginning=True,
+                ))
+                _emit(text, prefix)
+                offset += len(text.encode("utf-8"))
+            except Exception:
+                pass
+        if terminal:
+            # The output file can be flushed slightly after SLURM marks the job
+            # terminal; keep draining until a poll shows no new bytes (bounded so
+            # a persistent read error or endless-growth report can't hang us).
+            draining_polls += 1
+            if not grew or draining_polls >= 3:
+                break
+        await asyncio.sleep(interval)
 
 
 # -----------------------------------------------------------------------------
@@ -787,11 +902,16 @@ def job_status(
 
 
 @app.command("logs")
-def job_logs( # FIXME: this currently follows only stdout. Consider also supporting stderr (e.g. by checking job metadata for separate stderr path, or by allowing the user to specify which stream to follow). Furthermore, consider supporting the case where stdout and stderr are combined into a single file (e.g. by checking job metadata for a single output path and documenting that behavior).
+def job_logs(
     ctx: typer.Context,
     job_id: str = typer.Argument(..., help="Job ID"),
+    stream: LogStream = typer.Option(
+        LogStream.stdout, "--stream",
+        help="Which stream to operate on: stdout, stderr, or both",
+    ),
     tail: bool = typer.Option(False, "--tail", help="Show last lines only"),
-    follow: bool = typer.Option(False, "--follow", "-f", help="Follow output (poll)"),
+    follow: bool = typer.Option(False, "--follow", "-f",
+                                help="Follow output until the job finishes (like tail -f)"),
     download: bool = typer.Option(False, "--download", "-d", help="Download log file"),
     lines: int = typer.Option(50, "--lines", "-n", help="Number of lines for --tail"),
 ):
@@ -799,85 +919,98 @@ def job_logs( # FIXME: this currently follows only stdout. Consider also support
     config, system, account = resolve_context(ctx)
 
     client = get_client()
-    
-    # Get job metadata to find output file
+
+    # Get job metadata to find output file(s)
     try:
-        metadata_list = client.job_metadata(system_name=system, jobid=job_id)
-        if not metadata_list:
+        metadata = client.job_metadata(system_name=system, jobid=job_id)
+        if isinstance(metadata, list):
+            metadata = metadata[0] if metadata else None
+        if not metadata:
             _console().print(f"[red]No metadata found for job {job_id}[/red]")
             raise typer.Exit(1)
-        metadata = metadata_list[0]
-        stdout_path = (
-            metadata.get("standardOutput")
-            or metadata.get("stdout")
-            or metadata.get("StdOut")
-        )
-        
-        if not stdout_path:
-            _console().print("[red]Could not determine stdout path from job metadata[/red]")
-            raise typer.Exit(1)
-        
-        # Resolve %j to job_id if present
-        stdout_path = stdout_path.replace("%j", job_id)
-        
+
+        def _resolve(*keys: str) -> Optional[str]:
+            val = next((metadata.get(k) for k in keys if metadata.get(k)), None)
+            return val.replace("%j", job_id) if val else None
+
+        stdout_path = _resolve("standardOutput", "stdout", "StdOut")
+        stderr_path = _resolve("standardError", "stderr", "StdErr")
+    except typer.Exit:
+        raise
     except Exception as e:
         _console().print(f"[red]Error getting job metadata: {e}[/red]")
         raise typer.Exit(1)
-    
+
+    if not stdout_path:
+        _console().print("[red]Could not determine stdout path from job metadata[/red]")
+        raise typer.Exit(1)
+
+    # Build the selected (label, path, suffix) streams. Collapse to a single
+    # unprefixed stdout follower when stderr is absent or combined into stdout.
+    combined = (not stderr_path) or (stderr_path == stdout_path)
+    if stream is LogStream.stderr and not combined:
+        selected = [("stderr", stderr_path, "err")]
+    elif stream is LogStream.both and not combined:
+        selected = [("stdout", stdout_path, "out"), ("stderr", stderr_path, "err")]
+    else:
+        if stream is not LogStream.stdout and combined:
+            _console().print("[dim]stdout and stderr are combined; showing the single log.[/dim]")
+        selected = [("stdout", stdout_path, "out")]
+
+    multi = len(selected) > 1
+
     if download:
-        local_path = f"job-{job_id}.out"
-        
         async def do_download():
             async_client = get_async_client()
-            await async_client.download(
-                system_name=system,
-                source_path=stdout_path,
-                target_path=local_path,
-                account=account,
-                blocking=True,
-            )
-        
-        asyncio.run(do_download())
-        _console().print(f"[green]Downloaded to {local_path}[/green]")
-        return
-    
-    async def do_tail():
-        async_client = get_async_client()
-        seen_lines = 0
-        
-        while True:
-            try:
-                result = await async_client.tail(
+            for label, path, suffix in selected:
+                local_path = f"job-{job_id}.{suffix}"
+                await async_client.download(
                     system_name=system,
-                    path=stdout_path,
+                    source_path=path,
+                    target_path=local_path,
+                    account=account,
+                    blocking=True,
+                )
+                _console().print(f"[green]Downloaded {label} to {local_path}[/green]")
+
+        asyncio.run(do_download())
+        return
+
+    if follow:
+        async def do_follow():
+            async_client = get_async_client()
+            followers = [
+                _follow_stream(
+                    async_client, system, job_id, path,
+                    lines=lines, tail_only=tail, interval=2.0,
+                    prefix=f"[{label}] " if multi else "",
+                )
+                for label, path, _ in selected
+            ]
+            await asyncio.gather(*followers)
+
+        try:
+            asyncio.run(do_follow())
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # One-shot read.
+    async def do_read():
+        async_client = get_async_client()
+        for label, path, _ in selected:
+            if multi:
+                print(f"==> {label} <==")
+            try:
+                content = _tail_content(await async_client.tail(
+                    system_name=system, path=path,
                     num_lines=lines if tail else 1000,
-                )
-                
-                output = result if isinstance(result, str) else (
-                    result.get("content") or result.get("output") or ""
-                )
-                output_lines = output.split("\n")
-                
-                if follow:  # FIXME: this is faulty because seen_lines points into the current tail output, which gets reset every 2 seconds. To properly implement --follow (which should mimick tail -f in a shell on the remote system), would need to keep track of the file offset and use that for subsequent reads (polling on tail endpoint might not be suitable for this).
-                    # Only print new lines
-                    new_lines = output_lines[seen_lines:]
-                    if new_lines:
-                        for line in new_lines:
-                            print(line)
-                        seen_lines = len(output_lines)
-                    await asyncio.sleep(2)
-                else:
-                    print(output)
-                    break
-                    
+                ))
+                _emit(content)
             except Exception as e:
-                if follow:
-                    await asyncio.sleep(2)
-                    continue
-                _console().print(f"[red]Error: {e}[/red]")
-                break
-    
-    asyncio.run(do_tail())
+                _console().print(f"[red]Error reading {label}: {e}[/red]")
+
+    asyncio.run(do_read())
 
 
 @app.command("wait")

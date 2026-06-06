@@ -10,6 +10,7 @@ Runs with: --example basic (default).
 """
 
 import os
+import re
 
 import pytest
 from helpers import (
@@ -429,6 +430,80 @@ class TestJobManagement:
 
         result = runner.invoke(app, ["job", "cancel", job_id])
         assert_ok(result)
+
+
+# ---------------------------------------------------------------------------
+# 7.5 Job logs: stream selection + live follow
+# ---------------------------------------------------------------------------
+
+class TestJobLogsStreaming:
+    """Real-engine coverage for `job logs` stream selection and tail -f follow.
+
+    The unit tests (tests/test_job.py::TestFollowStream) exercise the offset
+    arithmetic against a stub; these confirm the assumptions that stub can't:
+    that FirecREST `tail(..., exclude_beginning=True)` is `tail -c +N`, that the
+    tail payload is a dict, and that job metadata exposes a distinct standardError
+    path. Both tests share one job (one scheduling wait); the stream-selection
+    test waits for completion itself, so neither depends on the other's order.
+    """
+
+    @pytest.fixture(scope="class")
+    def streaming_job(self):
+        """Submit one job that writes distinct stdout/stderr markers, then emits
+        a few lines over ~4s. Explicit --error keeps the two streams in separate
+        files (plain `fcw job run` only sets --output, combining them)."""
+        from typer.testing import CliRunner
+
+        r = CliRunner()
+        result = r.invoke(app, [
+            "job", "run", "--remote-script", "--error", "fcw-run-%j.err", "--",
+            "echo OUT_MARKER; echo ERR_MARKER >&2; "
+            "for i in 1 2 3 4; do echo follow-line-$i; sleep 1; done",
+        ])
+        assert_ok(result)
+        job_id = extract_job_id(result.output)
+        assert job_id, f"Could not extract job ID from: {result.output}"
+        return job_id
+
+    def test_logs_follow_incremental(self, runner, timed_step, streaming_job):
+        """--follow streams a growing file in full and in order, then exits.
+
+        Following must reproduce every line exactly once and in order — the
+        regression guard for the offset/tail-payload handling, validated against
+        the real tail/stat endpoints. Drains the job to completion.
+        """
+        with timed_step("job-logs-follow"):
+            result = runner.invoke(app, ["job", "logs", streaming_job, "--follow"])
+        assert_ok(result)
+
+        seen = re.findall(r"follow-line-\d+", result.output)
+        assert seen == [f"follow-line-{i}" for i in range(1, 5)], result.output
+
+    def test_logs_stream_selection(self, runner, streaming_job):
+        """stdout/stderr/both select the right stream.
+
+        Self-sufficient: waits for the job to finish first (a no-op when the
+        follow test already drained it), so it also passes run in isolation.
+        """
+        result = runner.invoke(app, ["job", "wait", streaming_job])
+        assert_ok(result)
+
+        # stdout only
+        result = runner.invoke(app, ["job", "logs", streaming_job])
+        assert_ok(result)
+        assert "OUT_MARKER" in result.output
+        assert "ERR_MARKER" not in result.output
+
+        # stderr only
+        result = runner.invoke(app, ["job", "logs", streaming_job, "--stream", "stderr"])
+        assert_ok(result)
+        assert "ERR_MARKER" in result.output
+
+        # both
+        result = runner.invoke(app, ["job", "logs", streaming_job, "--stream", "both"])
+        assert_ok(result)
+        assert "OUT_MARKER" in result.output
+        assert "ERR_MARKER" in result.output
 
 
 # ---------------------------------------------------------------------------
