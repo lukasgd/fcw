@@ -372,7 +372,9 @@ def submit_job(
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print job ID"),
     remote_script: bool = typer.Option(
         False, "--remote-script",
-        help="Upload script to remote before submitting (workaround for slurmrestd/pyxis segfault)"
+        help="Upload script to remote before submitting (workaround for slurmrestd/pyxis "
+             "segfault). Uses a fixed remote filename and is not safe for concurrent "
+             "submissions; submit serially. Scripts are not cleaned up remotely."
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show modified script without submitting"),
 ):
@@ -530,6 +532,13 @@ def submit_job(
 
     script_content = _inject_env_vars(script_content, env_vars)
 
+    if remote_script:
+        _console().print(
+            "[yellow]Warning:[/yellow] --remote-script uploads a fixed-name remote script "
+            "(.fcw/scripts/<name>.sh) and is not safe for concurrent submissions — submit "
+            "serially. Scripts are not cleaned up remotely."
+        )
+
     if dry_run:
         _console().print(f"[bold]Modified script ({script_path}):[/bold]")
         _console().print(script_content)
@@ -625,7 +634,9 @@ def run_command(  # TODO: add --wait option similar to submit, additionally add 
     ),
     remote_script: bool = typer.Option(
         False, "--remote-script",
-        help="Upload script to remote before submitting (workaround for slurmrestd/pyxis segfault)"
+        help="Upload script to remote before submitting (workaround for slurmrestd/pyxis "
+             "segfault). Uses a fixed remote filename and is not safe for concurrent "
+             "submissions; submit serially. Scripts are not cleaned up remotely."
     ),
 ):
     """Run an ad-hoc command as a SLURM job.
@@ -691,6 +702,13 @@ def run_command(  # TODO: add --wait option similar to submit, additionally add 
     elif environment:
         toml_content = Path(environment).read_text()
         script_content = _inject_container_toml(script_content, toml_content)
+
+    if remote_script:
+        _console().print(
+            "[yellow]Warning:[/yellow] --remote-script uploads a fixed-name remote script "
+            "(.fcw/scripts/<name>.sh) and is not safe for concurrent submissions — submit "
+            "serially. Scripts are not cleaned up remotely."
+        )
 
     if dry_run:
         _console().print(script_content)
