@@ -169,6 +169,45 @@ async def _follow_stream(
         await asyncio.sleep(interval)
 
 
+def _follow_streams(system: str, job_id: str, selected, *,
+                    tail: bool, lines: int, interval: float = 2.0) -> None:
+    """Follow one or more log streams (gathered) until the job is terminal.
+
+    ``selected`` is a list of ``(label, path, suffix)``; lines are prefixed with
+    ``[label] `` only when more than one stream is followed. Ctrl-C stops cleanly.
+    """
+    multi = len(selected) > 1
+
+    async def _run():
+        async_client = get_async_client()
+        await asyncio.gather(*[
+            _follow_stream(
+                async_client, system, job_id, path,
+                lines=lines, tail_only=tail, interval=interval,
+                prefix=f"[{label}] " if multi else "",
+            )
+            for label, path, _ in selected
+        ])
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+
+
+def _report_final_state(client, system: str, job_id: str) -> None:
+    """Block until the job finishes; print its state and exit 1 on failure."""
+    job_info = client.wait_for_job(system_name=system, job_id=job_id)
+    state = job_info[0]["status"]["state"]
+    if isinstance(state, list):
+        state = ",".join(state)
+    if any(fs in state for fs in SLURM_FAILED_STATES):
+        _console().print(f"[red]Job {job_id} finished with state: {state}[/red]")
+        _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
+        raise typer.Exit(1)
+    _console().print(f"[green]Job {job_id} completed ({state})[/green]")
+
+
 # -----------------------------------------------------------------------------
 # SBATCH Script Manipulation Helpers
 # -----------------------------------------------------------------------------
@@ -712,15 +751,7 @@ def submit_job(
 
     if wait:
         _console().print(f"[dim]Waiting for job {job_id}...[/dim]")
-        job_info = client.wait_for_job(system_name=system, job_id=job_id)
-        state = job_info[0]["status"]["state"]
-        if isinstance(state, list):
-            state = ",".join(state)
-        if any(fs in state for fs in SLURM_FAILED_STATES):
-            _console().print(f"[red]Job {job_id} finished with state: {state}[/red]")
-            _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
-            raise typer.Exit(1)
-        _console().print(f"[green]Job {job_id} completed ({state})[/green]")
+        _report_final_state(client, system, job_id)
 
 
 @app.command(
@@ -731,10 +762,13 @@ def submit_job(
         "ignore_unknown_options": True,
     },
 )
-def run_command(  # TODO: add --wait option similar to submit, additionally add an option that follows job logs in real time until completion, similar to running `srun`
+def run_command(
     ctx: typer.Context,
     time: str = typer.Option("00:30:00", "--time", "-t", help="Default time limit"),
     nodes: int = typer.Option(1, "--nodes", "-N", help="Default number of nodes"),
+    wait: bool = typer.Option(False, "--wait/--no-wait", "-w", help="Wait for job completion"),
+    follow: bool = typer.Option(False, "--follow", "-f",
+                                help="Stream job output until it finishes (implies --wait)"),
     container: Optional[str] = typer.Option(
         None, "--container", "-c",
         help="Container name from fcw.yaml to run the command in (defines csrun)"
@@ -768,6 +802,9 @@ def run_command(  # TODO: add --wait option similar to submit, additionally add 
 
         # In a container (csrun = srun --environment=$FCW_CONTAINER_TOML)
         fcw job run -c mycont -- 'csrun python analyze.py'
+
+        # Stream output live until the job finishes (like srun)
+        fcw job run --follow -- 'python train.py'
     """
     config, system, account = resolve_context(ctx)
 
@@ -870,6 +907,22 @@ def run_command(  # TODO: add --wait option similar to submit, additionally add 
     finally:
         os.unlink(script_path)
 
+    if follow:
+        # stdout/stderr are combined into the single --output file for run jobs.
+        # NOTE: SLURM filename patterns (%j, %x, %N, %A_%a, ...) are only handled
+        # best-effort here (%j). The FirecREST API returns these paths
+        # inconsistently / unexpanded — consistent expansion should be fixed
+        # upstream in the API, not worked around in fcw.
+        out = sbatch_final.get("output", "fcw-run-%j.out").replace("%j", job_id)
+        stdout_path = out if os.path.isabs(out) else f"{working_dir}/{out}"
+        _console().print(f"[dim]Following job {job_id} (Ctrl-C to stop)...[/dim]")
+        _follow_streams(system, job_id, [("stdout", stdout_path, "out")],
+                        tail=False, lines=50)
+        _report_final_state(client, system, job_id)
+    elif wait:
+        _console().print(f"[dim]Waiting for job {job_id}...[/dim]")
+        _report_final_state(client, system, job_id)
+
 
 @app.command("status")
 def job_status(
@@ -929,6 +982,10 @@ def job_logs(
             _console().print(f"[red]No metadata found for job {job_id}[/red]")
             raise typer.Exit(1)
 
+        # NOTE: SLURM filename patterns (%j, %x, %N, %A_%a, ...) are only handled
+        # best-effort here (%j). The FirecREST API returns these paths
+        # inconsistently / unexpanded — consistent expansion should be fixed
+        # upstream in the API, not worked around in fcw.
         def _resolve(*keys: str) -> Optional[str]:
             val = next((metadata.get(k) for k in keys if metadata.get(k)), None)
             return val.replace("%j", job_id) if val else None
@@ -977,22 +1034,7 @@ def job_logs(
         return
 
     if follow:
-        async def do_follow():
-            async_client = get_async_client()
-            followers = [
-                _follow_stream(
-                    async_client, system, job_id, path,
-                    lines=lines, tail_only=tail, interval=2.0,
-                    prefix=f"[{label}] " if multi else "",
-                )
-                for label, path, _ in selected
-            ]
-            await asyncio.gather(*followers)
-
-        try:
-            asyncio.run(do_follow())
-        except KeyboardInterrupt:
-            pass
+        _follow_streams(system, job_id, selected, tail=tail, lines=lines)
         return
 
     # One-shot read.

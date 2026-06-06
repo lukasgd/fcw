@@ -433,6 +433,36 @@ class TestJobManagement:
 
 
 # ---------------------------------------------------------------------------
+# 7.4 Job run: --wait and --follow
+# ---------------------------------------------------------------------------
+
+class TestJobRunWaitFollow:
+    """`fcw job run` blocking modes: --wait (report on completion) and --follow
+    (stream output live until the job finishes)."""
+
+    def test_run_wait(self, runner, timed_step):
+        """--wait blocks until completion and reports the final state."""
+        with timed_step("job-run-wait"):
+            result = runner.invoke(app, [
+                "job", "run", "--remote-script", "--wait", "--", "echo run-wait-ok",
+            ])
+        assert_ok(result)
+        assert "completed" in result.output.lower()
+
+    def test_run_follow(self, runner, timed_step):
+        """--follow streams the job's output live, then exits on completion."""
+        with timed_step("job-run-follow"):
+            result = runner.invoke(app, [
+                "job", "run", "--remote-script", "--follow",
+                "--", "echo run-A; sleep 1; echo run-B",
+            ])
+        assert_ok(result)
+        assert "run-A" in result.output
+        assert "run-B" in result.output
+        assert "completed" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
 # 7.5 Job logs: stream selection + live follow
 # ---------------------------------------------------------------------------
 

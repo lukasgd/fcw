@@ -6,9 +6,11 @@ from fcw.commands.job import (
     _apply_sbatch_overrides,
     _build_container_toml,
     _follow_stream,
+    _follow_streams,
     _inject_container_toml,
     _inject_env_vars,
     _parse_sbatch_args,
+    _report_final_state,
     _resolve_job_env,
 )
 from fcw.core.config import ContainerConfig, FcwConfig, JobConfig, WorkdirConfig
@@ -765,3 +767,68 @@ class TestFollowStream:
         await _follow_stream(client, "sys", "42", "/log.out",
                              lines=10, tail_only=False, interval=0)
         assert capsys.readouterr().out == "x\ny\nz\n"
+
+
+class _WaitClient:
+    """Sync client stub exposing only wait_for_job, for _report_final_state."""
+
+    def __init__(self, state):
+        self._state = state
+
+    def wait_for_job(self, system_name, job_id):
+        return [{"status": {"state": self._state}}]
+
+
+class TestReportFinalState:
+    """The shared wait/report path used by `job submit --wait` and `job run`."""
+
+    def test_completed_does_not_raise(self):
+        _report_final_state(_WaitClient("COMPLETED"), "sys", "42")
+
+    def test_state_list_is_normalized(self):
+        _report_final_state(_WaitClient(["COMPLETED"]), "sys", "42")
+
+    @pytest.mark.parametrize("state", ["FAILED", "TIMEOUT", "OUT_OF_MEMORY"])
+    def test_failure_exits_nonzero(self, state):
+        import typer
+
+        with pytest.raises(typer.Exit) as exc:
+            _report_final_state(_WaitClient(state), "sys", "42")
+        assert exc.value.exit_code == 1
+
+
+class TestFollowStreams:
+    """Thin orchestration over _follow_stream (which is covered separately)."""
+
+    def test_single_stream_passes_through(self, capsys, monkeypatch):
+        from fcw.commands import job as job_mod
+
+        client = _ScriptedClient([("RUNNING", "a\n"), ("COMPLETED", "a\nb\n")])
+        monkeypatch.setattr(job_mod, "get_async_client", lambda: client)
+        _follow_streams("sys", "42", [("stdout", "/log.out", "out")],
+                        tail=False, lines=10, interval=0)
+        assert capsys.readouterr().out == "a\nb\n"
+
+    def test_multi_stream_prefixes_lines(self, capsys, monkeypatch):
+        from fcw.commands import job as job_mod
+
+        # Stateless stub (the two concurrent followers share one client, so it
+        # must not carry per-path state): a tiny already-complete 2-byte file.
+        class _OneShot:
+            async def job_info(self, system_name, jobid):
+                return [{"status": {"state": "COMPLETED"}}]
+
+            async def stat(self, system_name, path):
+                return {"size": 2}
+
+            async def tail(self, system_name, path, num_bytes=None,
+                           num_lines=None, exclude_beginning=False):
+                return {"content": "x\n", "startPosition": 1, "endPosition": -1}
+
+        monkeypatch.setattr(job_mod, "get_async_client", _OneShot)
+        _follow_streams("sys", "42",
+                        [("stdout", "/o", "out"), ("stderr", "/e", "err")],
+                        tail=False, lines=10, interval=0)
+        out = capsys.readouterr().out
+        assert "[stdout] x" in out
+        assert "[stderr] x" in out
