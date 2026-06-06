@@ -2,9 +2,14 @@
 
 import pytest
 
+from collections import Counter
+
 from fcw.commands.job import (
     _apply_sbatch_overrides,
     _build_container_toml,
+    _build_jobs_table,
+    _fmt_duration,
+    _fmt_epoch,
     _follow_stream,
     _follow_streams,
     _inject_container_toml,
@@ -832,3 +837,132 @@ class TestFollowStreams:
         out = capsys.readouterr().out
         assert "[stdout] x" in out
         assert "[stderr] x" in out
+
+
+def _completed_job(job_id, elapsed):
+    """A real-shaped (v2) completed job, modeled on an actual job_info dump."""
+    return {
+        "jobId": job_id,
+        "name": "fcw-run",
+        "status": {"state": "COMPLETED", "stateReason": "None", "exitCode": 0},
+        "time": {"elapsed": elapsed, "start": 1780704385, "end": 1780704394,
+                 "suspended": 0, "limit": 1800},
+        "account": "csstaff",
+        "allocationNodes": 1,
+        "nodes": "nid007658",
+        "partition": "debug",
+        "user": "lukasd",
+        "priority": 781149,
+    }
+
+
+def _table_cols(table):
+    """Map a Rich table to {header: [cell, ...]}."""
+    return {col.header: list(col.cells) for col in table.columns}
+
+
+class TestFmtHelpers:
+    def test_fmt_duration(self):
+        assert _fmt_duration(9) == "0:00:09"
+        assert _fmt_duration(1800) == "0:30:00"
+        assert _fmt_duration(90061) == "1-1:01:01"
+        assert _fmt_duration(None) == ""
+        assert _fmt_duration("") == ""
+        assert _fmt_duration(-5) == ""
+
+    def test_fmt_epoch(self):
+        assert _fmt_epoch(0) == ""
+        assert _fmt_epoch(None) == ""
+        out = _fmt_epoch(1780704385)
+        assert out and "-" in out and ":" in out
+
+
+class TestBuildJobsTable:
+    def _jobs(self):
+        return [_completed_job("2478513", 9), _completed_job("2478514", 12)]
+
+    def test_default_columns_and_values(self):
+        table, counts = _build_jobs_table(self._jobs())
+        cols = _table_cols(table)
+        assert cols["Job ID"] == ["2478513", "2478514"]
+        assert cols["User"] == ["lukasd", "lukasd"]
+        assert cols["Partition"] == ["debug", "debug"]
+        assert cols["State"] == ["COMPLETED", "COMPLETED"]
+        assert cols["Nodes"] == ["1", "1"]
+        assert cols["Elapsed"] == ["0:00:09", "0:00:12"]
+        # Reason (both "None") and Time Left (terminal) are empty -> hidden.
+        assert "Reason" not in cols
+        assert "Time Left" not in cols
+        assert counts == Counter({"COMPLETED": 2})
+
+    def test_long_adds_columns(self):
+        table, _ = _build_jobs_table(self._jobs(), long=True)
+        cols = _table_cols(table)
+        assert cols["Account"] == ["csstaff", "csstaff"]
+        assert cols["Nodelist"] == ["nid007658", "nid007658"]
+        assert cols["Time Limit"] == ["0:30:00", "0:30:00"]
+        assert all(cols["Start"]) and all(cols["End"])
+        assert cols["Priority"] == ["781149", "781149"]
+
+    def test_state_filter(self):
+        _, counts = _build_jobs_table(self._jobs(), state="completed")
+        assert counts == Counter({"COMPLETED": 2})
+        table, counts = _build_jobs_table(self._jobs(), state="running")
+        assert _table_cols(table)["Job ID"] == []
+        assert counts == Counter()
+
+    def test_partition_and_user_filters(self):
+        assert _build_jobs_table(self._jobs(), partition="debug")[1].total() == 2
+        assert _build_jobs_table(self._jobs(), partition="gpu")[1].total() == 0
+        assert _build_jobs_table(self._jobs(), user="lukasd")[1].total() == 2
+        assert _build_jobs_table(self._jobs(), user="other")[1].total() == 0
+
+    def test_pending_shows_reason_blank_start(self):
+        pending = _completed_job("99", 0)
+        pending["status"] = {"state": "PENDING", "stateReason": "Resources"}
+        pending["time"] = {"elapsed": 0, "start": 0, "end": 0, "limit": 1800}
+        table, _ = _build_jobs_table([pending], long=True)
+        cols = _table_cols(table)
+        assert cols["Reason"] == ["Resources"]   # shown now (non-empty)
+        assert "Start" not in cols               # epoch 0 -> blank -> hidden
+
+    def test_running_shows_time_left(self):
+        running = _completed_job("100", 600)
+        running["status"] = {"state": "RUNNING", "stateReason": None}
+        running["time"] = {"elapsed": 600, "start": 1780704385, "end": 0, "limit": 1800}
+        cols = _table_cols(_build_jobs_table([running])[0])
+        assert cols["Time Left"] == ["0:20:00"]   # 1800 - 600
+
+
+class TestJobListAllUsersError:
+    """The all-users path (allusers=True → cluster-wide sacct) fails gracefully."""
+
+    def _runner(self, monkeypatch, boom_on_allusers):
+        from fcw.commands import job as job_mod
+
+        class _Stub:
+            def job_info(self, system_name, **kw):
+                if boom_on_allusers and kw.get("allusers"):
+                    raise RuntimeError("last request: 500 Error executing Slurm command")
+                return []
+
+        monkeypatch.setattr(job_mod, "get_system", lambda *a, **k: "sys")
+        monkeypatch.setattr(job_mod, "get_client", lambda: _Stub())
+        from typer.testing import CliRunner
+        return CliRunner()
+
+    def test_all_users_failure_is_friendly(self, monkeypatch):
+        from fcw.cli import app
+
+        runner = self._runner(monkeypatch, boom_on_allusers=True)
+        result = runner.invoke(app, ["job", "list", "--all-users"])
+        assert result.exit_code != 0
+        assert "all users" in result.output.lower()
+        assert "500" in result.output  # underlying error surfaced, not swallowed
+
+    def test_plain_list_unaffected(self, monkeypatch):
+        from fcw.cli import app
+
+        runner = self._runner(monkeypatch, boom_on_allusers=True)
+        result = runner.invoke(app, ["job", "list"])
+        assert result.exit_code == 0

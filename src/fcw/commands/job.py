@@ -28,6 +28,8 @@ import asyncio
 import os
 import re
 import tempfile
+from collections import Counter
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -206,6 +208,136 @@ def _report_final_state(client, system: str, job_id: str) -> None:
         _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
         raise typer.Exit(1)
     _console().print(f"[green]Job {job_id} completed ({state})[/green]")
+
+
+# -----------------------------------------------------------------------------
+# Job listing helpers
+# -----------------------------------------------------------------------------
+
+def _dig(obj, path: str):
+    """Return the value at a dotted path (``a.b.c``) within nested dicts, or None."""
+    cur = obj
+    for key in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _fmt_duration(seconds) -> str:
+    """Format a duration in seconds as ``[D-]H:MM:SS``; falsy/invalid -> ''."""
+    if seconds is None or seconds == "":
+        return ""
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if total < 0:
+        return ""
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    base = f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{days}-{base}" if days else base
+
+
+def _fmt_epoch(ts) -> str:
+    """Format a Unix timestamp as ``YYYY-MM-DD HH:MM``; falsy/invalid -> ''."""
+    try:
+        if not ts:
+            return ""
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _job_state(job: dict) -> str:
+    """Normalize ``status.state`` (string or list) to a single string."""
+    state = _dig(job, "status.state")
+    if isinstance(state, list):
+        return ",".join(state)
+    return str(state) if state else ""
+
+
+def _is_terminal_state(state: str) -> bool:
+    return any(ts in state for ts in SLURM_TERMINAL_STATES)
+
+
+def _job_reason(job: dict) -> str:
+    reason = _dig(job, "status.stateReason")
+    return "" if reason in (None, "None", "") else str(reason)
+
+
+def _job_time_left(job: dict) -> str:
+    """Remaining walltime (limit - elapsed) for active jobs; '' once terminal."""
+    if _is_terminal_state(_job_state(job)):
+        return ""
+    limit, elapsed = _dig(job, "time.limit"), _dig(job, "time.elapsed")
+    if limit is None:
+        return ""
+    try:
+        return _fmt_duration(int(limit) - int(elapsed or 0))
+    except (TypeError, ValueError):
+        return ""
+
+
+# Column specs: (header, render_fn, optional). Optional columns are hidden when
+# empty for every displayed row. `long` columns are only considered with --long.
+_CORE_COLUMNS = [
+    ("Job ID", lambda j: str(extract_job_id(j) or ""), False),
+    ("Name", lambda j: str(j.get("name") or ""), False),
+    ("User", lambda j: str(j.get("user") or ""), True),
+    ("Partition", lambda j: str(j.get("partition") or ""), True),
+    ("State", _job_state, False),
+    ("Reason", _job_reason, True),
+    ("Nodes", lambda j: str(j.get("allocationNodes") or ""), True),
+    ("Elapsed", lambda j: _fmt_duration(_dig(j, "time.elapsed")), True),
+    ("Time Left", _job_time_left, True),
+]
+_LONG_COLUMNS = [
+    ("Account", lambda j: str(j.get("account") or ""), True),
+    ("Nodelist", lambda j: str(j.get("nodes") or ""), True),
+    ("Start", lambda j: _fmt_epoch(_dig(j, "time.start")), True),
+    ("End", lambda j: _fmt_epoch(_dig(j, "time.end")), True),
+    ("Time Limit", lambda j: _fmt_duration(_dig(j, "time.limit")), True),
+    ("Priority", lambda j: str(j.get("priority") or ""), True),
+]
+
+
+def _build_jobs_table(jobs, *, long: bool = False, state: Optional[str] = None,
+                      user: Optional[str] = None, partition: Optional[str] = None):
+    """Build the `job list` Rich table and a per-state Counter from job dicts.
+
+    Filters client-side by state (substring), user (exact), and partition (exact);
+    optional columns with no data across the kept rows are hidden.
+    """
+    kept = []
+    for job in jobs:
+        if state and state.lower() not in _job_state(job).lower():
+            continue
+        if user and str(job.get("user") or "") != user:
+            continue
+        if partition and str(job.get("partition") or "") != partition:
+            continue
+        kept.append(job)
+
+    specs = _CORE_COLUMNS + (_LONG_COLUMNS if long else [])
+    # Precompute every cell once, then drop optional all-empty columns.
+    rendered = [[render(job) for _, render, _ in specs] for job in kept]
+    visible = []
+    for idx, (header, _, optional) in enumerate(specs):
+        if optional and not any(row[idx] for row in rendered):
+            continue
+        visible.append((idx, header))
+
+    table = Table(title="Jobs")
+    for _, header in visible:
+        table.add_column(header)
+    for row in rendered:
+        table.add_row(*(row[idx] for idx, _ in visible))
+
+    counts = Counter(_job_state(job) for job in kept)
+    return table, counts
 
 
 # -----------------------------------------------------------------------------
@@ -1107,44 +1239,56 @@ def cancel_jobs(
 def list_jobs(
     ctx: typer.Context,
     state: Optional[str] = typer.Option(None, "--state", "-s", help="Filter by state"),
+    user: Optional[str] = typer.Option(None, "--user", "-u",
+                                        help="Filter by user (implies --all-users; "
+                                             "may be slow/unsupported on busy systems)"),
+    all_users: bool = typer.Option(False, "--all-users", "-a",
+                                   help="Show all users' jobs (runs a cluster-wide sacct; "
+                                        "may be slow or unsupported on busy systems)"),
+    account: Optional[str] = typer.Option(None, "--account", help="Filter by account"),
+    partition: Optional[str] = typer.Option(None, "--partition", "-p",
+                                            help="Filter by partition"),
+    long: bool = typer.Option(False, "--long", "-l", help="Show additional columns"),
 ):
     """List jobs on the cluster."""
     system = get_system((ctx.obj or {}).get("system"))
 
     client = get_client()
-    
+
     try:
-        jobs = client.job_info(system_name=system)
-
-        table = Table(title="Jobs")  # FIXME: usually, on the cluster squeue --me displays all of: JOBID, USER, ACCOUNT, PARTITION, NAME,  EXEC_HOST, ST, REASON, START_TIME, END_TIME, TIME_LEFT, NODES, PRIORITY. A --long/-l version displays NODELIST in addition. Consider adding more of these fields to the table, and also supporting filtering by user (e.g. --user) and other criteria (e.g. partition, time range, etc.). Furthermore, consider adding a summary line with counts of jobs in each state (e.g. RUNNING: 5, PENDING: 3, etc.).
-        table.add_column("Job ID")
-        table.add_column("Name")
-        table.add_column("State")
-        table.add_column("Time")
-
-        for job in jobs:
-            # State may be in status.state (list or string)
-            status = job.get("status", {})
-            job_state = status.get("state", "") if isinstance(status, dict) else job.get("state", "")
-            if isinstance(job_state, list):
-                job_state = ",".join(job_state)
-            job_state = str(job_state)
-
-            if state and state.lower() not in job_state.lower():
-                continue
-
-            # Time limit may be nested under limits
-            limits = job.get("limits", {})
-            time_str = limits.get("time", "") if isinstance(limits, dict) else job.get("time", "")
-
-            table.add_row(
-                str(extract_job_id(job)),
-                str(job.get("name", "")),
-                job_state,
-                str(time_str),
+        want_all = all_users or bool(user)
+        kwargs = {"allusers": want_all}
+        if account:
+            kwargs["account"] = account
+        try:
+            jobs = client.job_info(system_name=system, **kwargs)
+        except firecrest.NotImplementedOnAPIversion as e:
+            _console().print(f"[yellow]Warning: {e} Ignoring --all-users/--account.[/yellow]")
+            jobs = client.job_info(system_name=system)
+        except Exception as e:
+            # The only multi-user mechanism is allusers=True, which makes FirecREST
+            # run a cluster-wide `sacct` — often very slow / 500s on busy systems.
+            if not want_all:
+                raise
+            _console().print(
+                "[red]Listing all users' jobs failed.[/red] The FirecREST all-users query "
+                "runs a cluster-wide `sacct` that is often very slow and can time out on "
+                "busy systems. Retry without --all-users/--user, or narrow with --account."
             )
+            _console().print(f"[dim]Underlying error: {e}[/dim]")
+            raise typer.Exit(1)
 
+        table, counts = _build_jobs_table(
+            jobs, long=long, state=state, user=user, partition=partition,
+        )
         _console().print(table)
+
+        if counts:
+            total = sum(counts.values())
+            parts = "  ".join(f"{s}: {n}" for s, n in sorted(counts.items()))
+            _console().print(f"[dim]Total: {total} · {parts}[/dim]", highlight=False)
+    except typer.Exit:
+        raise
     except Exception as e:
         _console().print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1)

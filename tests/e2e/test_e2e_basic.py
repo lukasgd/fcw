@@ -382,9 +382,19 @@ class TestJobManagement:
     """Job lifecycle: list, run, status, logs, cancel."""
 
     def test_job_list(self, runner):
-        """List recent jobs on the cluster."""
+        """List recent jobs on the cluster (default + --long), with summary."""
         result = runner.invoke(app, ["job", "list"])
         assert_ok(result)
+        # Assert on the plainly-printed summary line, not column headers: Rich
+        # truncates wide-table headers to ~80 cols under CliRunner (e.g.
+        # "Partition" -> "Partiti…"), so header text is not a reliable signal.
+        assert "Total:" in result.output
+
+        result = runner.invoke(app, ["job", "list", "--long"])
+        assert_ok(result)
+        # NB: --all-users is intentionally not exercised here — it runs a
+        # cluster-wide sacct that is slow / 500s on busy systems (handled
+        # gracefully by the command, covered hermetically instead).
 
     def test_job_run_and_wait(self, runner, shared_state, timed_step):
         """Run ad-hoc command, then wait for it with 'job wait'."""
