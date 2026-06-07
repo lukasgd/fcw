@@ -97,6 +97,35 @@ class TestLoadConfig:
     def test_build_args_none_when_absent(self, sample_config):
         assert sample_config.containers["app"].build_args is None
 
+    def test_job_sbatch_catchall_parsed(self, tmp_path):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(textwrap.dedent("""\
+            project: test
+            workdir:
+              remote: /tmp/test
+              local: .
+            jobs:
+              big:
+                script: slurm/big.sh
+                nodes: 2
+                sbatch:
+                  partition: debug
+                  mem: 32G
+                  exclusive: true
+        """))
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            cfg = load_config(str(config_path))
+        finally:
+            os.chdir(old_cwd)
+        assert cfg.jobs["big"].sbatch == {
+            "partition": "debug", "mem": "32G", "exclusive": True,
+        }
+
+    def test_job_sbatch_empty_when_absent(self, sample_config):
+        assert sample_config.jobs["train"].sbatch == {}
+
     def test_platform_parsed(self, tmp_path):
         config_path = tmp_path / "fcw.yaml"
         config_path.write_text(textwrap.dedent("""\
@@ -646,6 +675,28 @@ class TestAddJobToConfig:
         assert config.jobs["benchmark"].time == "1:00:00"
         assert config.jobs["benchmark"].nodes == 2
         assert config.jobs["benchmark"].env == {"DATA": "data/raw"}
+
+    def test_sbatch_catchall_round_trips(self, tmp_path, sample_config_yaml):
+        config_path = tmp_path / "fcw.yaml"
+        config_path.write_text(sample_config_yaml)
+        add_job_to_config(
+            config_path,
+            "big",
+            JobConfig(
+                script="slurm/big.sh",
+                nodes=2,
+                sbatch={"partition": "debug", "mem": "32G", "exclusive": True},
+            ),
+        )
+        config = load_config(str(config_path))
+        assert config.jobs["big"].sbatch == {
+            "partition": "debug", "mem": "32G", "exclusive": True,
+        }
+        opts = config.jobs["big"].sbatch_options()
+        assert opts["partition"] == "debug"
+        assert opts["mem"] == "32G"
+        assert opts["exclusive"] == ""   # flag
+        assert opts["nodes"] == "2"      # typed field still present
 
     def test_duplicate_raises(self, tmp_path, sample_config_yaml):
         config_path = tmp_path / "fcw.yaml"

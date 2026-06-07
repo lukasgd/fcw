@@ -67,6 +67,17 @@ class TestApplySbatchOverrides:
         assert "#SBATCH --time=12:00:00" in result
         assert "#SBATCH --nodes=4" in result
 
+    def test_flag_renders_bare(self):
+        """An empty-string value is a valueless flag: `#SBATCH --exclusive` (no '=')."""
+        result = _apply_sbatch_overrides(SAMPLE_SCRIPT, {"exclusive": ""})
+        assert "#SBATCH --exclusive" in result
+        assert "#SBATCH --exclusive=" not in result
+
+    def test_flag_not_duplicated_when_present(self):
+        script = "#!/bin/bash\n#SBATCH --exclusive\necho hi\n"
+        result = _apply_sbatch_overrides(script, {"exclusive": ""})
+        assert result.count("#SBATCH --exclusive") == 1
+
     def test_same_value_no_warning(self, capsys):
         """No warning when override matches existing script value."""
         _apply_sbatch_overrides(SAMPLE_SCRIPT, {"nodes": "1"})
@@ -105,7 +116,30 @@ class TestJobConfigSbatchOptions:
         assert "script" not in opts
         assert "container" not in opts
         assert "env" not in opts
-        assert opts == {"time": "1:00:00"}
+
+    def test_sbatch_catchall_passthrough(self):
+        job = JobConfig(script="train.sh", sbatch={"mem": "32G", "qos": "normal"})
+        opts = job.sbatch_options()
+        assert opts == {"mem": "32G", "qos": "normal"}
+
+    def test_sbatch_catchall_kebab_and_stringify(self):
+        job = JobConfig(script="train.sh", sbatch={"mem_per_gpu": "8G", "threads_per_core": 2})
+        opts = job.sbatch_options()
+        assert opts == {"mem-per-gpu": "8G", "threads-per-core": "2"}
+
+    def test_sbatch_boolean_flags(self):
+        job = JobConfig(script="train.sh", sbatch={"exclusive": True, "requeue": False})
+        opts = job.sbatch_options()
+        assert opts["exclusive"] == ""   # valueless flag
+        assert "requeue" not in opts     # False -> omitted
+
+    def test_typed_field_wins_over_catchall(self):
+        job = JobConfig(script="train.sh", nodes=4, sbatch={"nodes": 8})
+        assert job.sbatch_options()["nodes"] == "4"
+
+    def test_empty_sbatch_is_noop(self):
+        job = JobConfig(script="train.sh", time="1:00:00")
+        assert job.sbatch_options() == {"time": "1:00:00"}
 
     def test_empty_when_no_sbatch_fields(self):
         job = JobConfig(script="train.sh")
@@ -165,6 +199,19 @@ class TestParseSbatchArgs:
         overrides, remaining = _parse_sbatch_args([])
         assert overrides == {}
         assert remaining == []
+
+    def test_bare_flag(self):
+        """A value-less flag parses to an empty-string value (CLI flag support)."""
+        overrides, remaining = _parse_sbatch_args(["--exclusive", "--", "train.sh"])
+        assert overrides == {"exclusive": ""}
+        assert remaining == ["train.sh"]
+
+    def test_flag_interleaved_with_valued(self):
+        overrides, remaining = _parse_sbatch_args(
+            ["--exclusive", "--nodes", "4", "--", "train.sh"]
+        )
+        assert overrides == {"exclusive": "", "nodes": "4"}
+        assert remaining == ["train.sh"]
 
 
 class TestSbatchOverridesCLI:

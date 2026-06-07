@@ -353,7 +353,9 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
     Args:
         script_content: Original script content.
         overrides: Dict of SBATCH options to set (key -> value).
-                   Keys should NOT include the leading ``--``.
+                   Keys should NOT include the leading ``--``. An empty-string
+                   value denotes a valueless flag, rendered as a bare
+                   ``#SBATCH --key`` (e.g. ``{"exclusive": ""}``).
     
     Returns:
         Modified script content with overrides applied.
@@ -380,9 +382,18 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
         if stripped.startswith("#SBATCH"):
             last_sbatch_idx = i
             
-            # Parse the SBATCH option from this line
-            # Handles: #SBATCH --key=value, #SBATCH --key value, #SBATCH -k value
-            for key, value in overrides.items(): # FIXME: does this handle (or error on) multiple SBATCH options on the same line? Furthermore, where is #SBATCH -k value handled? Or should we let SLURM just report an error if the user uses inconsistent overrides (maybe easier)?
+            # Parse the SBATCH option from this line.
+            # Handles: #SBATCH --key=value, #SBATCH --key value, and valueless
+            # flags (value == "") rendered as a bare #SBATCH --key.
+            # NOTE: multiple options on one line and the short `-k value` form are
+            # not reconciled here — SLURM rejects inconsistent overrides.
+            for key, value in overrides.items():
+                if value == "":
+                    # Flag: treat an existing bare `#SBATCH --key` as already set.
+                    if re.match(rf'^\s*#SBATCH\s+--{re.escape(key)}\s*$', line):
+                        modified_keys.add(key)
+                        break
+                    continue
                 # Match both --key=... and --key ...
                 pattern = rf'^\s*#SBATCH\s+--{re.escape(key)}(?:=|\s+)(\S+)'
                 match = re.match(pattern, line)
@@ -401,7 +412,8 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
     new_directives = []
     for key, value in overrides.items():
         if key not in modified_keys:
-            new_directives.append(f"#SBATCH --{key}={value}")
+            directive = f"#SBATCH --{key}" if value == "" else f"#SBATCH --{key}={value}"
+            new_directives.append(directive)
     
     if new_directives:
         # Insert after last #SBATCH line, or after shebang if no SBATCH found

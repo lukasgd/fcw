@@ -83,27 +83,41 @@ class JobConfig:
         nodes: SBATCH node count (applied as override, CLI takes precedence).
         gpus_per_node: SBATCH GPUs per node (applied as override, CLI takes precedence).
         cpus_per_task: SBATCH CPUs per task (applied as override, CLI takes precedence).
+        sbatch: Catch-all for any other SBATCH option, carried through 1-to-1.
+            Keys are SBATCH long-option names (snake_case or kebab-case, e.g.
+            ``mem``, ``qos``, ``mem_per_gpu``); a ``true`` value means a valueless
+            flag (``exclusive: true`` -> ``#SBATCH --exclusive``). Quote time-like
+            values (e.g. ``"1:00:00"``) to avoid YAML base-60 parsing; for walltime
+            prefer the typed ``time`` field. A typed field above wins over the same
+            key set here.
     """
     script: str
     container: Optional[str] = None
     env: dict[str, str] = field(default_factory=dict)
-    time: Optional[str] = None  # FIXME: all the 4 options below here are SBATCH options - why are they handled separately? Or asked differently, isn't there a generic recipe to capture SBATCH option overrides that carry over 1-to-1 without having to hardcode them in the config schema? Like what we do for gpus_per_node?
+    time: Optional[str] = None
     nodes: Optional[int] = None
     gpus_per_node: Optional[int] = None
     cpus_per_task: Optional[int] = None
+    sbatch: dict[str, Any] = field(default_factory=dict)
 
     # Fields that are not SBATCH options
     _NON_SBATCH_FIELDS: ClassVar[frozenset[str]] = frozenset({"script", "container", "env"})
 
     def sbatch_options(self) -> dict[str, str]:
-        """Return non-None SBATCH fields as a dict suitable for overrides.
+        """Return SBATCH options as a dict suitable for overrides.
 
-        Field names are converted from snake_case to kebab-case
-        (e.g. ``gpus_per_node`` -> ``gpus-per-node``).
+        Merges the ``sbatch`` catch-all (booleans encode valueless flags: ``True``
+        -> ``""``, ``False`` -> omitted) with the typed fields, which take
+        precedence on overlap. Field/key names are converted from snake_case to
+        kebab-case (e.g. ``gpus_per_node`` -> ``gpus-per-node``).
         """
         opts: dict[str, str] = {}
+        for k, v in self.sbatch.items():
+            if v is False:
+                continue
+            opts[k.replace("_", "-")] = "" if v is True else str(v)
         for f in fields(self):
-            if f.name in self._NON_SBATCH_FIELDS or f.name.startswith("_"):
+            if f.name in self._NON_SBATCH_FIELDS or f.name.startswith("_") or f.name == "sbatch":
                 continue
             val = getattr(self, f.name)
             if val is not None:
@@ -326,10 +340,11 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 script=job_data.get("script", ""),
                 container=job_data.get("container"),
                 env=job_data.get("env", {}),
-                time=job_data.get("time"),  # FIXME: all the 4 options below here are SBATCH options - why are they handled separately? Or asked differently, isn't there a generic recipe to capture SBATCH option overrides that carry over 1-to-1 without having to hardcode them in the config schema?
+                time=job_data.get("time"),
                 nodes=job_data.get("nodes"),
                 gpus_per_node=job_data.get("gpus_per_node"),
                 cpus_per_task=job_data.get("cpus_per_task"),
+                sbatch=job_data.get("sbatch") or {},
             )
     
     return config
@@ -609,7 +624,7 @@ def add_job_to_config(config_path: Path, name: str, job: JobConfig) -> None:
     entry["script"] = job.script
     if job.container is not None:
         entry["container"] = job.container
-    if job.time is not None:  # FIXME: all the 4 options below here are SBATCH options - why are they handled separately? Or asked differently, isn't there a generic recipe to capture SBATCH option overrides that carry over 1-to-1 without having to hardcode them in the config schema?
+    if job.time is not None:
         from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
         entry["time"] = DoubleQuotedScalarString(job.time)
@@ -619,6 +634,8 @@ def add_job_to_config(config_path: Path, name: str, job: JobConfig) -> None:
         entry["gpus_per_node"] = job.gpus_per_node
     if job.cpus_per_task is not None:
         entry["cpus_per_task"] = job.cpus_per_task
+    if job.sbatch:
+        entry["sbatch"] = dict(job.sbatch)
     if job.env:
         entry["env"] = dict(job.env)
     jobs[name] = entry
