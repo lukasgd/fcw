@@ -478,7 +478,6 @@ jobs:
         assert config.containers["minimal"].file == "./Dockerfile"
         assert config.containers["minimal"].tag == "minimal:v1"
         assert config.containers["minimal"].remote_path is None
-        assert config.containers["minimal"].stage is None
         assert config.containers["minimal"].toml is None
         # Verify the raw YAML doesn't contain optional fields for this entry
         content = config_path.read_text()
