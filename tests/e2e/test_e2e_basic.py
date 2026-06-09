@@ -158,14 +158,14 @@ class TestContainerIterate:
     """Code iteration workflow: extract from container, patch with bind-mount."""
 
     def test_job_run_container(self, runner, timed_step):
-        """`fcw job run -c app -- 'csrun ...'` should inject the TOML + csrun
+        """`fcw job run --container app -- 'csrun ...'` should inject the TOML + csrun
         shorthand and execute the command inside the container."""
         import uuid
         sentinel = uuid.uuid4().hex
         with timed_step("job-run-container"):
             result = runner.invoke(app, [
                 "job", "run", "--remote-script",
-                "-c", "app",
+                "--container", "app",
                 "--", f"csrun echo RUN-SENTINEL-{sentinel}",
             ])
         assert_ok(result)
@@ -235,7 +235,7 @@ class TestContainerIterate:
             with timed_step("job-run-auto-resync"):
                 result = runner.invoke(app, [
                     "job", "run", "--remote-script",
-                    "-c", "app",
+                    "--container", "app",
                     "--", "csrun cat /workspace/aux/fcw-resync-sentinel.txt",
                 ])
             assert_ok(result)
@@ -469,6 +469,24 @@ class TestJobRunWaitFollow:
         assert_ok(result)
         assert "run-A" in result.output
         assert "run-B" in result.output
+        assert "completed" in result.output.lower()
+
+    def test_submit_follow(self, runner, timed_step, tmp_path):
+        """`job submit --follow` resolves the output path from job metadata,
+        streams the script's output live, then exits on completion."""
+        script = tmp_path / "submit_follow.sh"
+        script.write_text(
+            "#!/bin/bash -l\n#SBATCH --time 00:05:00\n"
+            "echo submit-A; sleep 1; echo submit-B\n"
+        )
+        with timed_step("job-submit-follow"):
+            result = runner.invoke(app, [
+                "job", "submit", "--remote-script", "--follow",
+                "--", str(script),
+            ])
+        assert_ok(result)
+        assert "submit-A" in result.output
+        assert "submit-B" in result.output
         assert "completed" in result.output.lower()
 
 

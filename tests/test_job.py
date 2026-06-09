@@ -14,9 +14,12 @@ from fcw.commands.job import (
     _follow_streams,
     _inject_container_toml,
     _inject_env_vars,
+    _job_stream_paths,
     _parse_sbatch_args,
     _report_final_state,
     _resolve_job_env,
+    _rewrite_environment_path,
+    _warn_env_bindings,
 )
 from fcw.core.config import ContainerConfig, FcwConfig, JobConfig, WorkdirConfig
 
@@ -214,6 +217,60 @@ class TestParseSbatchArgs:
         assert remaining == ["train.sh"]
 
 
+class TestRewriteEnvironmentPath:
+    def test_rewrites_matching_path(self):
+        script = "srun --environment ./env/foo.toml bash -c x\n"
+        out = _rewrite_environment_path(script, "./env/foo.toml")
+        assert "--environment ${FCW_CONTAINER_TOML}" in out
+        assert "foo.toml" not in out
+
+    def test_matches_modulo_leading_dotslash(self):
+        script = "srun --environment=env/foo.toml app\n"
+        out = _rewrite_environment_path(script, "./env/foo.toml")
+        assert "--environment=${FCW_CONTAINER_TOML}" in out
+
+    def test_leaves_other_paths_alone(self):
+        script = "srun --environment ./env/other.toml app\n"
+        out = _rewrite_environment_path(script, "./env/foo.toml")
+        assert out == script
+
+    def test_leaves_fcw_var_untouched(self):
+        script = "srun --environment ${FCW_CONTAINER_TOML} app\n"
+        out = _rewrite_environment_path(script, "./env/foo.toml")
+        assert out == script
+
+
+class TestWarnEnvBindings:
+    # Warnings are diagnostics -> emitted on stderr.
+    def test_managed_var_no_warning(self, capsys):
+        _warn_env_bindings("srun --environment ${FCW_CONTAINER_TOML} x\n",
+                           "./env/foo.toml", bound=True)
+        assert capsys.readouterr().err == ""
+
+    def test_managed_path_no_warning(self, capsys):
+        _warn_env_bindings("srun --environment ./env/foo.toml x\n",
+                           "./env/foo.toml", bound=True)
+        assert capsys.readouterr().err == ""
+
+    def test_foreign_environment_warns(self, capsys):
+        _warn_env_bindings("srun --environment ./env/other.toml x\n",
+                           "./env/foo.toml", bound=True)
+        assert "outside the" in capsys.readouterr().err
+
+    def test_bound_but_no_reference_warns(self, capsys):
+        _warn_env_bindings("srun echo hi\n", "./env/foo.toml", bound=True)
+        assert "no effect" in capsys.readouterr().err
+
+    def test_reference_without_binding_warns(self, capsys):
+        _warn_env_bindings("srun --environment ${FCW_CONTAINER_TOML} x\n",
+                           None, bound=False)
+        assert "none is bound" in capsys.readouterr().err
+
+    def test_no_binding_no_reference_silent(self, capsys):
+        _warn_env_bindings("srun echo hi\n", None, bound=False)
+        assert capsys.readouterr().err == ""
+
+
 class TestSbatchOverridesCLI:
     """Integration tests: verify SBATCH overrides pass through Typer/Click."""
 
@@ -249,12 +306,7 @@ class TestSbatchOverridesCLI:
         assert "--time=12:00:00" in result.output or "--time 12:00:00" in result.output
         assert "--nodes=4" in result.output or "--nodes 4" in result.output
 
-    def test_submit_raw_script_infers_container(self, tmp_path):
-        """Submitting a raw script that uses FCW_CONTAINER_TOML infers the container."""
-        from typer.testing import CliRunner
-        from fcw.cli import app
-        import os
-
+    def _write_container_config(self, tmp_path):
         config = tmp_path / "fcw.yaml"
         config.write_text(
             "project: test\nworkdir:\n  remote: /tmp/test\n  local: .\n"
@@ -263,7 +315,15 @@ class TestSbatchOverridesCLI:
         )
         toml_dir = tmp_path / "env"
         toml_dir.mkdir()
-        (toml_dir / "container.toml").write_text('[container]\nimage = "placeholder"\n')
+        (toml_dir / "container.toml").write_text('image = "placeholder"\n')
+
+    def test_submit_raw_script_no_inference(self, tmp_path):
+        """A raw script is NOT auto-bound: it warns and injects nothing."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        self._write_container_config(tmp_path)
         script = tmp_path / "train.sh"
         script.write_text(
             "#!/bin/bash\n#SBATCH --job-name test\n"
@@ -279,8 +339,89 @@ class TestSbatchOverridesCLI:
             os.chdir(old_cwd)
 
         assert result.exit_code == 0, result.output
-        assert "FCW_CONTAINER_TOML" in result.output
-        assert "FCWEOF" in result.output  # heredoc was injected
+        assert "FCWEOF" not in result.output       # no heredoc injected
+        assert "none is bound" in result.output    # warned instead
+
+    def test_submit_raw_script_explicit_container(self, tmp_path):
+        """--container binds a raw script's env explicitly (heredoc injected)."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        from fcw.commands import container as container_mod
+        import os
+
+        self._write_container_config(tmp_path)
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\n"
+            "srun --environment ${FCW_CONTAINER_TOML} echo hi\n"
+        )
+
+        runner = CliRunner()
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            import unittest.mock as mock
+            with mock.patch.object(container_mod, "_resync_container_patches", lambda *a, **k: None):
+                result = runner.invoke(
+                    app, ["job", "submit", "--container", "app", "--dry-run", str(script)]
+                )
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        assert "FCWEOF" in result.output  # heredoc injected via explicit binding
+
+    def test_submit_rewrites_hardcoded_environment_path(self, tmp_path):
+        """A script's hardcoded --environment <configured toml> is redirected."""
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        from fcw.commands import container as container_mod
+        import os
+        import unittest.mock as mock
+
+        self._write_container_config(tmp_path)
+        script = tmp_path / "train.sh"
+        script.write_text(
+            "#!/bin/bash\n#SBATCH --job-name test\n"
+            "srun --environment ./env/container.toml echo hi\n"
+        )
+
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with mock.patch.object(container_mod, "_resync_container_patches", lambda *a, **k: None):
+                result = CliRunner().invoke(
+                    app, ["job", "submit", "--container", "app", "--dry-run", str(script)]
+                )
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        assert "--environment ${FCW_CONTAINER_TOML}" in result.output
+        assert "--environment ./env/container.toml" not in result.output
+
+    def test_submit_container_environment_mutually_exclusive(self, tmp_path):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+        import os
+
+        self._write_container_config(tmp_path)
+        script = tmp_path / "train.sh"
+        script.write_text("#!/bin/bash\n#SBATCH --job-name test\necho hi\n")
+        (tmp_path / "env" / "alt.toml").write_text('image = "x"\n')
+
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            result = CliRunner().invoke(app, [
+                "job", "submit", "--container", "app",
+                "--environment", "./env/alt.toml", "--dry-run", str(script),
+            ])
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
 
     def test_submit_without_separator(self, tmp_path):
         """Without --, args are treated as script name (no overrides)."""
@@ -573,7 +714,7 @@ class TestRunContainerIntegration:
         os.chdir(tmp_path)
         try:
             result = runner.invoke(app, [
-                "job", "run", "-c", "app", "-e", str(env_toml),
+                "job", "run", "--container", "app", "--environment", str(env_toml),
                 "--dry-run", "--", "echo hi",
             ])
         finally:
@@ -597,7 +738,7 @@ class TestRunContainerIntegration:
         os.chdir(tmp_path)
         try:
             result = runner.invoke(app, [
-                "job", "run", "-c", "app", "--dry-run", "--", "csrun hostname",
+                "job", "run", "--container", "app", "--dry-run", "--", "csrun hostname",
             ])
         finally:
             os.chdir(old)
@@ -626,7 +767,7 @@ class TestRunContainerIntegration:
         os.chdir(tmp_path)
         try:
             result = runner.invoke(app, [
-                "job", "run", "-c", "app", "--dry-run", "--", "echo hi",
+                "job", "run", "--container", "app", "--dry-run", "--", "echo hi",
             ])
         finally:
             os.chdir(old)
@@ -650,7 +791,7 @@ class TestRunContainerIntegration:
         os.chdir(tmp_path)
         try:
             result = runner.invoke(app, [
-                "job", "run", "-e", str(env_toml), "--dry-run", "--", "csrun hi",
+                "job", "run", "--environment", str(env_toml), "--dry-run", "--", "csrun hi",
             ])
         finally:
             os.chdir(old)
@@ -671,7 +812,7 @@ class TestRunContainerIntegration:
         os.chdir(tmp_path)
         try:
             result = runner.invoke(app, [
-                "job", "run", "-e", str(tmp_path / "nope.toml"),
+                "job", "run", "--environment", str(tmp_path / "nope.toml"),
                 "--dry-run", "--", "echo hi",
             ])
         finally:
@@ -700,7 +841,7 @@ class TestRunContainerIntegration:
         os.chdir(tmp_path)
         try:
             result = runner.invoke(app, [
-                "job", "run", "-c", "app", "--dry-run", "--", "echo hi",
+                "job", "run", "--container", "app", "--dry-run", "--", "echo hi",
             ])
         finally:
             os.chdir(old)
@@ -847,6 +988,38 @@ class TestReportFinalState:
         with pytest.raises(typer.Exit) as exc:
             _report_final_state(_WaitClient(state), "sys", "42")
         assert exc.value.exit_code == 1
+
+
+class _MetadataClient:
+    """Sync client stub exposing only job_metadata, for _job_stream_paths."""
+
+    def __init__(self, metadata):
+        self._metadata = metadata
+
+    def job_metadata(self, system_name, jobid):
+        return self._metadata
+
+
+class TestJobStreamPaths:
+    """Metadata-based stdout/stderr resolution shared by `job logs` and
+    `job submit --follow`."""
+
+    def test_resolves_and_expands_both_streams(self):
+        client = _MetadataClient({
+            "standardOutput": "/scratch/out-%j.log",
+            "standardError": "/scratch/err-%j.log",
+        })
+        assert _job_stream_paths(client, "sys", "42") == (
+            "/scratch/out-42.log", "/scratch/err-42.log",
+        )
+
+    def test_unwraps_list_metadata(self):
+        client = _MetadataClient([{"standardOutput": "/o-%j.out"}])
+        assert _job_stream_paths(client, "sys", "7") == ("/o-7.out", None)
+
+    def test_empty_metadata_returns_none_pair(self):
+        assert _job_stream_paths(_MetadataClient(None), "sys", "1") == (None, None)
+        assert _job_stream_paths(_MetadataClient([]), "sys", "1") == (None, None)
 
 
 class TestFollowStreams:

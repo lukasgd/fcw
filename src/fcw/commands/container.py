@@ -63,15 +63,17 @@ from fcw.core import (
     format_sbatch_lines,
     get_async_client,
     get_client,
-    get_console,
+    get_error_console,
     get_global_sbatch_options,
+    get_output_console,
     get_system,
     load_config,
     resolve_context,
 )
 
 app = typer.Typer(no_args_is_help=True)
-_console = get_console
+_error = get_error_console
+_output = get_output_console
 
 
 def _wait_and_check(client, system: str, job_id: str, label: str = "Job") -> None:
@@ -81,8 +83,8 @@ def _wait_and_check(client, system: str, job_id: str, label: str = "Job") -> Non
     if isinstance(state, list):
         state = ",".join(state)
     if any(fs in state for fs in SLURM_FAILED_STATES):
-        _console().print(f"[red]{label} {job_id} finished with state: {state}[/red]")
-        _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
+        _error().print(f"[red]{label} {job_id} finished with state: {state}[/red]")
+        _error().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
         raise typer.Exit(1)
 
 
@@ -196,7 +198,7 @@ def _detect_remote_platform(client, system: str) -> Optional[str]:
     except Exception as e:
         detail = f" ({e})"
 
-    _console().print(
+    _error().print(
         f"[yellow]Warning: could not auto-detect remote platform for '{system}'{detail}. "
         f"Pass --platform linux/arm64|amd64 or set 'platform' in fcw.yaml "
         f"(the remote build will verify architecture).[/yellow]"
@@ -482,12 +484,12 @@ def _resync_container_patches(config: Any, container_name: str, system: str, acc
                     async_client, system, account, local_path, remote_patch_dir
                 )
                 if count:
-                    _console().print(
+                    _error().print(
                         f"[dim]Re-synced {count} changed file(s) "
                         f"{local_path} -> {remote_patch_dir}[/dim]"
                     )
             except Exception as e:
-                _console().print(
+                _error().print(
                     f"[yellow]Patch resync failed for {local_path}: {e}[/yellow]"
                 )
                 continue
@@ -509,7 +511,7 @@ def _resync_container_patches(config: Any, container_name: str, system: str, acc
     try:
         asyncio.run(sync_all())
     except Exception as e:
-        _console().print(f"[yellow]Patch resync skipped: {e}[/yellow]")
+        _error().print(f"[yellow]Patch resync skipped: {e}[/yellow]")
 
 
 def _resolve_container_config(config, name: str) -> ContainerConfig:
@@ -517,7 +519,7 @@ def _resolve_container_config(config, name: str) -> ContainerConfig:
     if name in config.containers:
         return config.containers[name]
     known = ", ".join(sorted(config.containers.keys())) or "(none)"
-    _console().print(
+    _error().print(
         f"[red]Unknown container name: {name!r}[/red]\n"
         f"[dim]Known containers in fcw.yaml: {known}[/dim]"
     )
@@ -529,7 +531,7 @@ def _resolve_extract_stage(container_cfg: ContainerConfig, requested: Optional[s
     stages = container_cfg.get_local_stages()
     if requested:
         if requested not in stages and requested != container_cfg.get_remote_stage():
-            _console().print(
+            _error().print(
                 f"[yellow]Warning: stage {requested!r} not in configured stages "
                 f"{stages + [container_cfg.get_remote_stage()]}[/yellow]"
             )
@@ -574,12 +576,12 @@ def _build_one_stage(
         cmd.extend(["--build-arg", arg])
     cmd.append(context)
 
-    _console().print(f"[dim]Running: {' '.join(cmd)}[/dim]")
+    _error().print(f"[dim]Running: {' '.join(cmd)}[/dim]")
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        _console().print(f"[red]Build failed: {tag}[/red]")
+        _error().print(f"[red]Build failed: {tag}[/red]")
         raise typer.Exit(1)
-    _console().print(f"[green]Built image: {tag}[/green]")
+    _error().print(f"[green]Built image: {tag}[/green]")
 
 
 @app.command("build")
@@ -639,11 +641,11 @@ def build_image(
         resolved_tag = first_container.tag
 
     if not resolved_file:
-        _console().print("[red]No Dockerfile specified. Use --file or configure in fcw.yaml.[/red]")
+        _error().print("[red]No Dockerfile specified. Use --file or configure in fcw.yaml.[/red]")
         raise typer.Exit(1)
 
     runtime = _detect_container_runtime()
-    _console().print(f"[dim]Using container runtime: {runtime}[/dim]")
+    _error().print(f"[dim]Using container runtime: {runtime}[/dim]")
 
     # Resolve platform: CLI/config > auto-detect from remote
     if not resolved_platform:
@@ -653,7 +655,7 @@ def build_image(
             detected = _detect_remote_platform(client, system)
             if detected:
                 resolved_platform = detected
-                _console().print(f"[dim]Detected remote platform: {resolved_platform}[/dim]")
+                _error().print(f"[dim]Detected remote platform: {resolved_platform}[/dim]")
         except Exception:
             pass
 
@@ -686,7 +688,7 @@ def build_image(
         local_stages = cont_config.get_local_stages()
         for s in local_stages:
             stage_tag = cont_config.stage_tag(s)
-            _console().print(f"[bold]Building stage '{s}' → {stage_tag}[/bold]")
+            _error().print(f"[bold]Building stage '{s}' → {stage_tag}[/bold]")
             _build_one_stage(
                 runtime,
                 dockerfile=resolved_file,
@@ -719,12 +721,12 @@ def _save_image(runtime: str, tags: list[str], path: str) -> None:
     if runtime == "podman" and len(tags) > 1:
         cmd.append("--multi-image-archive")
     cmd += ["-o", path, *tags]
-    _console().print(f"[dim]Saving image to {path}...[/dim]")
+    _error().print(f"[dim]Saving image to {path}...[/dim]")
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        _console().print("[red]Failed to save image[/red]")
+        _error().print("[red]Failed to save image[/red]")
         raise typer.Exit(1)
-    _console().print(f"[green]Saved image to {path}[/green]")
+    _error().print(f"[green]Saved image to {path}[/green]")
 
 
 def _push_one_image(
@@ -744,7 +746,7 @@ def _push_one_image(
     remote_filename = image_tag.replace(":", "+").replace("/", "+") + ".tar"
     tar_path = os.path.join(tempfile.gettempdir(), remote_filename)
 
-    _console().print(f"[dim]Exporting {image_tag}...[/dim]")
+    _error().print(f"[dim]Exporting {image_tag}...[/dim]")
 
     save_cmd = [runtime, "save", "-o", tar_path]
     if platform:
@@ -754,7 +756,7 @@ def _push_one_image(
         if "--platform" in help_output:
             save_cmd.extend(["--platform", platform])
         else:
-            _console().print(
+            _error().print(
                 f"[yellow]Warning: {runtime} save does not support --platform. "
                 "Ignoring platform argument.[/yellow]"
             )
@@ -762,7 +764,7 @@ def _push_one_image(
 
     result = subprocess.run(save_cmd)
     if result.returncode != 0:
-        _console().print(f"[red]Failed to export image: {image_tag}[/red]")
+        _error().print(f"[red]Failed to export image: {image_tag}[/red]")
         raise typer.Exit(1)
 
     try:
@@ -778,7 +780,7 @@ def _push_one_image(
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
-                console=_console(),
+                console=_error(),
             ) as progress:
                 progress.add_task(
                     f"Uploading {remote_filename} to {remote_dir}...", total=None
@@ -793,7 +795,7 @@ def _push_one_image(
                 )
 
         asyncio.run(do_upload())
-        _console().print(f"[green]Uploaded {remote_filename} to {remote_dir}[/green]")
+        _error().print(f"[green]Uploaded {remote_filename} to {remote_dir}[/green]")
     finally:
         if os.path.exists(tar_path):
             os.unlink(tar_path)
@@ -840,7 +842,7 @@ def push_image(
         if stage:
             # Push one specific stage
             stage_tag = cont_config.stage_tag(stage)
-            _console().print(f"[bold]Pushing stage '{stage}' → {stage_tag}[/bold]")
+            _error().print(f"[bold]Pushing stage '{stage}' → {stage_tag}[/bold]")
             _push_one_image(
                 stage_tag,
                 config=config,
@@ -854,7 +856,7 @@ def push_image(
             local_stages = cont_config.get_local_stages()
             for s in local_stages:
                 stage_tag = cont_config.stage_tag(s)
-                _console().print(f"[bold]Pushing stage '{s}' → {stage_tag}[/bold]")
+                _error().print(f"[bold]Pushing stage '{s}' → {stage_tag}[/bold]")
                 _push_one_image(
                     stage_tag,
                     config=config,
@@ -891,7 +893,7 @@ def push_image(
         tar_path = os.path.join(tempfile.gettempdir(), remote_filename)
         cleanup_tar = True
 
-        _console().print(f"[dim]Exporting {image}...[/dim]")
+        _error().print(f"[dim]Exporting {image}...[/dim]")
 
         save_cmd = [runtime, "save", "-o", tar_path]
         if platform:
@@ -901,7 +903,7 @@ def push_image(
             if "--platform" in help_output:
                 save_cmd.extend(["--platform", platform])
             else:
-                _console().print(
+                _error().print(
                     f"[yellow]Warning: {runtime} save does not support --platform. "
                     "Ignoring platform argument.[/yellow]"
                 )
@@ -909,7 +911,7 @@ def push_image(
 
         result = subprocess.run(save_cmd)
         if result.returncode != 0:
-            _console().print("[red]Failed to export image[/red]")
+            _error().print("[red]Failed to export image[/red]")
             raise typer.Exit(1)
 
     try:  # FIXME: is this the same do_upload function as the one in _push_one_image?
@@ -926,7 +928,7 @@ def push_image(
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
-                console=_console(),
+                console=_error(),
             ) as progress:
                 progress.add_task(f"Uploading to {remote_path}...", total=None)
                 await client.upload(
@@ -939,7 +941,7 @@ def push_image(
                 )
 
         asyncio.run(do_upload())
-        _console().print(f"[green]Uploaded to {remote_path}[/green]")
+        _error().print(f"[green]Uploaded to {remote_path}[/green]")
 
     finally:
         if cleanup_tar and os.path.exists(tar_path):
@@ -1039,8 +1041,8 @@ exit 0
 
         job_id = extract_job_id(result)
         print(job_id)
-        _console().print(f"[green]Submitted import job: {job_id}[/green]")
-        _console().print(f"[dim]Output will be: {output_path}[/dim]")
+        _error().print(f"[green]Submitted import job: {job_id}[/green]")
+        _error().print(f"[dim]Output will be: {output_path}[/dim]")
 
     finally:
         os.unlink(script_path)
@@ -1166,10 +1168,10 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
     else:
         # Legacy: image is a raw tag
         if not dockerfile:
-            _console().print("[red]--file/-f is required when not using a config name.[/red]")
+            _error().print("[red]--file/-f is required when not using a config name.[/red]")
             raise typer.Exit(1)
         if not tag:
-            _console().print("[red]--tag/-t is required when not using a config name.[/red]")
+            _error().print("[red]--tag/-t is required when not using a config name.[/red]")
             raise typer.Exit(1)
         resolved_dockerfile = dockerfile
         resolved_tag = tag
@@ -1187,7 +1189,7 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
         )
 
     if not os.path.isfile(resolved_dockerfile):
-        _console().print(f"[red]Dockerfile not found: {resolved_dockerfile}[/red]")
+        _error().print(f"[red]Dockerfile not found: {resolved_dockerfile}[/red]")
         raise typer.Exit(1)
 
     staging_dir = _isolated_staging_dir(
@@ -1200,7 +1202,7 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
         )
 
     # Step 1: Upload Dockerfile
-    _console().print("[bold]Step 1: Uploading Dockerfile...[/bold]")
+    _error().print("[bold]Step 1: Uploading Dockerfile...[/bold]")
 
     async def do_upload():
         async_client = get_async_client()
@@ -1222,7 +1224,7 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
     asyncio.run(do_upload())
 
     # Step 2: Build job script
-    _console().print("[bold]Step 2: Submitting build job...[/bold]")
+    _error().print("[bold]Step 2: Submitting build job...[/bold]")
 
     # Generate image loading and build-arg blocks
     load_block, image_build_args = _generate_load_and_resolve_block(
@@ -1294,14 +1296,14 @@ ls -lh {q_output_path}
 
         job_id = extract_job_id(result)
         print(job_id)
-        _console().print(f"[green]Submitted build job: {job_id}[/green]")
+        _error().print(f"[green]Submitted build job: {job_id}[/green]")
 
         if wait:
-            _console().print("[dim]Waiting for build to complete...[/dim]")
+            _error().print("[dim]Waiting for build to complete...[/dim]")
             _wait_and_check(client, system, job_id, "Build job")
-            _console().print(f"[green]Build complete: {resolved_tag}[/green]")
+            _error().print(f"[green]Build complete: {resolved_tag}[/green]")
             if enroot:
-                _console().print(f"[green]Enroot image: {output_path}[/green]")
+                _error().print(f"[green]Enroot image: {output_path}[/green]")
     finally:
         os.unlink(script_path)
 
@@ -1347,11 +1349,11 @@ def deploy_image(
         final_tag = tag
         images_dir = config.resolve_path("ce-images", remote=True)
     else:
-        _console().print("[red]Specify container name from config or --tag[/red]")
+        _error().print("[red]Specify container name from config or --tag[/red]")
         raise typer.Exit(1)
 
     if not dockerfile or not os.path.isfile(dockerfile):
-        _console().print(f"[red]Dockerfile not found: {dockerfile}[/red]")
+        _error().print(f"[red]Dockerfile not found: {dockerfile}[/red]")
         raise typer.Exit(1)
 
     # Determine local stages and remote stage (from config, else defaults).
@@ -1373,7 +1375,7 @@ def deploy_image(
         detected = _detect_remote_platform(client, system)
         if detected:
             platform = detected
-            _console().print(f"[dim]Detected remote platform: {platform}[/dim]")
+            _error().print(f"[dim]Detected remote platform: {platform}[/dim]")
 
     # Merge config-level build_args with CLI --build-arg flags
     all_build_args = _merge_build_args(
@@ -1391,7 +1393,7 @@ def deploy_image(
         else:
             stage_tag = f"{final_tag}:{stage_name}"
 
-        _console().print(
+        _error().print(
             f"[bold]Step 1.{i}: Building '{stage_name}' stage locally ({stage_tag})...[/bold]"
         )
         _build_one_stage(
@@ -1407,7 +1409,7 @@ def deploy_image(
 
     # Step 2: Export and push all local stage images
     for i, (stage_name, stage_tag) in enumerate(stage_tags, 1):
-        _console().print(
+        _error().print(
             f"[bold]Step 2.{i}: Uploading '{stage_name}' image ({stage_tag})...[/bold]"
         )
         _push_one_image(
@@ -1419,7 +1421,7 @@ def deploy_image(
         )
 
     # Step 3: Upload Dockerfile and submit remote build job
-    _console().print(
+    _error().print(
         f"[bold]Step 3: Building '{remote_stage}' stage on cluster ({final_tag})...[/bold]"
     )
 
@@ -1515,14 +1517,14 @@ exit 0
 
         job_id = extract_job_id(result)
         print(job_id)
-        _console().print(f"[green]Submitted deploy job: {job_id}[/green]")
+        _error().print(f"[green]Submitted deploy job: {job_id}[/green]")
 
         if wait:
-            _console().print("[dim]Waiting for deploy to complete...[/dim]")
+            _error().print("[dim]Waiting for deploy to complete...[/dim]")
             _wait_and_check(client, system, job_id, "Deploy job")
-            _console().print(f"[green]Deployed: {sqsh_path}[/green]")
+            _error().print(f"[green]Deployed: {sqsh_path}[/green]")
         else:
-            _console().print(f"[dim]Expected output: {sqsh_path}[/dim]")
+            _error().print(f"[dim]Expected output: {sqsh_path}[/dim]")
 
     finally:
         os.unlink(script_path)
@@ -1645,15 +1647,15 @@ exit 0
         )
 
         job_id = extract_job_id(result)
-        _console().print(f"[green]Submitted extract job: {job_id}[/green]")
+        _error().print(f"[green]Submitted extract job: {job_id}[/green]")
 
         if wait:
-            _console().print("[dim]Waiting for extraction...[/dim]")
+            _error().print("[dim]Waiting for extraction...[/dim]")
             _wait_and_check(client, system, job_id, "Extract job")
-            _console().print("[green]Extraction complete[/green]")
+            _error().print("[green]Extraction complete[/green]")
 
             # Download the archive
-            _console().print(f"[dim]Downloading {remote_archive}...[/dim]")
+            _error().print(f"[dim]Downloading {remote_archive}...[/dim]")
             local_archive = os.path.join(local_dest, archive_name)
             os.makedirs(local_dest, exist_ok=True)
 
@@ -1670,7 +1672,7 @@ exit 0
             asyncio.run(do_download())
 
             # Extract locally
-            _console().print(f"[dim]Extracting to {local_dest}...[/dim]")
+            _error().print(f"[dim]Extracting to {local_dest}...[/dim]")
             subprocess.run(["tar", "xzf", local_archive, "-C", local_dest], check=True)
             os.unlink(local_archive)
 
@@ -1681,13 +1683,13 @@ exit 0
                 source_image=stage_image,
             )
 
-            _console().print(f"[green]Extracted to {local_dest}[/green]")
-            _console().print(f"[dim]Sidecar: {_sidecar_path(local_dest)}[/dim]")
+            _error().print(f"[green]Extracted to {local_dest}[/green]")
+            _error().print(f"[dim]Sidecar: {_sidecar_path(local_dest)}[/dim]")
         else:
             print(job_id)
-            _console().print("[dim]After job completes, download with:[/dim]")
-            _console().print(f"  fcw data download {remote_archive} {local_dest}")
-            _console().print(
+            _error().print("[dim]After job completes, download with:[/dim]")
+            _error().print(f"  fcw data download {remote_archive} {local_dest}")
+            _error().print(
                 "[yellow]Note: sidecar is only written after local extraction; "
                 "run `fcw container extract` with --wait to produce it.[/yellow]"
             )
@@ -1748,7 +1750,7 @@ def patch_container(
 
     container_cfg = _resolve_container_config(config, container_name)
     if not container_cfg.toml:
-        _console().print(
+        _error().print(
             f"[red]Container {container_name!r} has no `toml:` set in fcw.yaml[/red]\n"
             "[dim]`patch` requires a TOML file to add bind-mount entries to.[/dim]"
         )
@@ -1756,7 +1758,7 @@ def patch_container(
 
     toml_path = Path(container_cfg.toml)
     if not toml_path.exists():
-        _console().print(f"[red]TOML file not found: {toml_path}[/red]")
+        _error().print(f"[red]TOML file not found: {toml_path}[/red]")
         raise typer.Exit(1)
 
     # Resolve each (local_path, container_path) pair up-front; fail fast before uploading.
@@ -1765,7 +1767,7 @@ def patch_container(
         local_path, explicit_target = _parse_patch_arg(arg)
         local_path = os.path.abspath(local_path)
         if not os.path.isdir(local_path):
-            _console().print(f"[red]Not a directory: {local_path}[/red]")
+            _error().print(f"[red]Not a directory: {local_path}[/red]")
             raise typer.Exit(1)
 
         if explicit_target:
@@ -1773,7 +1775,7 @@ def patch_container(
         else:
             meta = _read_sidecar(local_path)
             if not meta or "container_path" not in meta:
-                _console().print(
+                _error().print(
                     f"[red]No sidecar at {_sidecar_path(local_path)} and no explicit mount "
                     f"target for {local_path!r}.[/red]\n"
                     "[dim]Use '<local>:<container-path>' to override, or run "
@@ -1793,7 +1795,7 @@ def patch_container(
         for local_path, _ in resolved:
             patch_name = os.path.basename(local_path.rstrip("/"))
             remote_patch_dir = config.resolve_path(f".patches/{patch_name}", remote=True)
-            _console().print(f"[dim]Uploading {local_path} -> {remote_patch_dir}...[/dim]")
+            _error().print(f"[dim]Uploading {local_path} -> {remote_patch_dir}...[/dim]")
             await _upload_directory(async_client, system, account, local_path, remote_patch_dir)
             # Also mirror the sidecar to remote so `rebuild` can group patches by stage.
             local_sidecar = _sidecar_path(local_path)
@@ -1817,7 +1819,7 @@ def patch_container(
         _update_toml_bind_mount(toml_path, bind_mount, container_path)
         patch_name = os.path.basename(remote_patch_dir.rstrip("/"))
         _record_patch_in_index(container_name, patch_name, local_path)
-        _console().print(f"[green]+ mount {remote_patch_dir} -> {container_path}[/green]")
+        _error().print(f"[green]+ mount {remote_patch_dir} -> {container_path}[/green]")
 
     # Upload the updated TOML to remote.
     remote_toml = config.resolve_path(str(toml_path), remote=True)
@@ -1841,8 +1843,8 @@ def patch_container(
         )
 
     asyncio.run(do_upload_toml())
-    _console().print(f"[green]Updated {toml_path} (local + remote)[/green]")
-    _console().print(f"[dim]Run with: srun --environment {remote_toml} ...[/dim]")
+    _error().print(f"[green]Updated {toml_path} (local + remote)[/green]")
+    _error().print(f"[dim]Run with: srun --environment {remote_toml} ...[/dim]")
 
 
 # -----------------------------------------------------------------------------
@@ -1932,12 +1934,12 @@ def rebuild_container(
 
     # 1. Look up container config
     if name not in config.containers:
-        _console().print(f"[red]Unknown container: {name}[/red]")
+        _error().print(f"[red]Unknown container: {name}[/red]")
         raise typer.Exit(1)
     cont = config.containers[name]
 
     if not cont.file:
-        _console().print(f"[red]Container '{name}' has no Dockerfile configured[/red]")
+        _error().print(f"[red]Container '{name}' has no Dockerfile configured[/red]")
         raise typer.Exit(1)
 
     mode_b = bool(dump)
@@ -1945,7 +1947,7 @@ def rebuild_container(
     if toml_path is not None and not toml_path.exists():
         # TOML referenced in config but missing on disk — only fatal in Mode A.
         if not mode_b:
-            _console().print(f"[red]TOML file not found: {cont.toml}[/red]")
+            _error().print(f"[red]TOML file not found: {cont.toml}[/red]")
             raise typer.Exit(1)
         toml_path = None
 
@@ -1961,19 +1963,19 @@ def rebuild_container(
                 local_path, explicit_target = _parse_patch_arg(arg)
                 local_path = os.path.abspath(local_path)
                 if not os.path.isdir(local_path):
-                    _console().print(f"[red]Not a directory: {local_path}[/red]")
+                    _error().print(f"[red]Not a directory: {local_path}[/red]")
                     raise typer.Exit(1)
                 meta = _read_sidecar(local_path)
                 target = explicit_target or (meta.get("container_path") if meta else None)
                 if not target:
-                    _console().print(
+                    _error().print(
                         f"[red]No sidecar and no explicit target for {local_path!r}. "
                         "Use '<local>:<container-path>'.[/red]"
                     )
                     raise typer.Exit(1)
                 patch_name = os.path.basename(local_path.rstrip("/"))
                 remote_patch_dir = config.resolve_path(f".patches/{patch_name}", remote=True)
-                _console().print(f"[dim]Uploading {local_path} -> {remote_patch_dir}...[/dim]")
+                _error().print(f"[dim]Uploading {local_path} -> {remote_patch_dir}...[/dim]")
                 await _upload_directory(
                     async_client, system, account, local_path, remote_patch_dir
                 )
@@ -1984,12 +1986,12 @@ def rebuild_container(
     else:
         # Mode A: read patches from the container's TOML.
         if toml_path is None:
-            _console().print(f"[red]Container '{name}' has no TOML file configured[/red]")
+            _error().print(f"[red]Container '{name}' has no TOML file configured[/red]")
             raise typer.Exit(1)
         _resync_container_patches(config, name, system, account)
         patch_mounts = _parse_patch_mounts(toml_path.read_text())
         if not patch_mounts:
-            _console().print(
+            _error().print(
                 "[yellow]No .patches/ mounts found in TOML — nothing to rebuild[/yellow]"
             )
             raise typer.Exit(0)
@@ -2008,11 +2010,11 @@ def rebuild_container(
             else:
                 stages_for_patches.append(None)
 
-    _console().print(
+    _error().print(
         f"[bold]Resolved {len(patch_mounts)} patch mount(s) to bake:[/bold]"
     )
     for host_path, container_path in patch_mounts:
-        _console().print(f"  {host_path} → {container_path}")
+        _error().print(f"  {host_path} → {container_path}")
 
     local_stages = cont.get_local_stages()
     remote_stage = cont.get_remote_stage()
@@ -2021,7 +2023,7 @@ def rebuild_container(
     for (host_path, container_path), stage in zip(patch_mounts, stages_for_patches):
         if stage is None:
             if not default_stage:
-                _console().print(
+                _error().print(
                     f"[red]No remote sidecar for {host_path} and no --default-stage given.[/red]\n"
                     "[dim]Either re-run `fcw container patch` with a dump produced by "
                     "`extract` (which writes a sidecar), or pass --default-stage.[/dim]"
@@ -2029,7 +2031,7 @@ def rebuild_container(
                 raise typer.Exit(1)
             stage = default_stage
         if stage not in local_stages:
-            _console().print(
+            _error().print(
                 f"[red]Patch stage {stage!r} is not a local stage of container {name!r} "
                 f"({local_stages}).[/red]\n"
                 "[dim]Only local stages can be patched on the remote (they get loaded from "
@@ -2038,11 +2040,11 @@ def rebuild_container(
             raise typer.Exit(1)
         patches_by_stage.setdefault(stage, []).append((host_path, container_path))
 
-    _console().print(f"[bold]Patches grouped across {len(patches_by_stage)} stage(s):[/bold]")
+    _error().print(f"[bold]Patches grouped across {len(patches_by_stage)} stage(s):[/bold]")
     for stage, entries in patches_by_stage.items():
-        _console().print(f"  [cyan]{stage}[/cyan]:")
+        _error().print(f"  [cyan]{stage}[/cyan]:")
         for h, c in entries:
-            _console().print(f"    {h} -> {c}")
+            _error().print(f"    {h} -> {c}")
 
     # 4. Resolve paths
     images_dir = config.resolve_container_images_dir(cont)
@@ -2141,18 +2143,18 @@ ls -lh {q_output_path}
     # 6. Dry run: print and return (no remote operations)
     if dry_run:
         new_name = _derive_container_name(name, cont.tag, tag)
-        _console().print("[bold]Generated SLURM script:[/bold]")
-        _console().print(script)
-        _console().print(f"\n[dim]Would create container entry '{new_name}' in fcw.yaml[/dim]")
+        _error().print("[bold]Generated SLURM script:[/bold]")
+        _error().print(script)
+        _error().print(f"\n[dim]Would create container entry '{new_name}' in fcw.yaml[/dim]")
         if toml_path is not None:
             new_toml_path = _derive_rebuilt_toml_path(toml_path, cont.tag, tag)
-            _console().print(f"[dim]Would create TOML: {new_toml_path}[/dim]")
+            _error().print(f"[dim]Would create TOML: {new_toml_path}[/dim]")
         else:
-            _console().print("[dim]No TOML derivation (Mode B without source TOML).[/dim]")
+            _error().print("[dim]No TOML derivation (Mode B without source TOML).[/dim]")
         return
 
     # 7. Upload Dockerfile to staging dir
-    _console().print(f"[bold]Uploading Dockerfile to {staging_dir}...[/bold]")
+    _error().print(f"[bold]Uploading Dockerfile to {staging_dir}...[/bold]")
 
     async def do_upload() -> None:
         async_client = get_async_client()
@@ -2162,7 +2164,7 @@ ls -lh {q_output_path}
             )
         except Exception:
             pass  # May already exist
-        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=_console()) as p:
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=_error()) as p:
             p.add_task("Uploading Dockerfile...", total=None)
             await async_client.upload(
                 system_name=system,
@@ -2174,7 +2176,7 @@ ls -lh {q_output_path}
             )
 
     asyncio.run(do_upload())
-    _console().print("[green]Uploaded Dockerfile[/green]")
+    _error().print("[green]Uploaded Dockerfile[/green]")
 
     # 8. Submit job
     client = get_client()
@@ -2193,15 +2195,15 @@ ls -lh {q_output_path}
 
         job_id = extract_job_id(result)
         print(job_id)
-        _console().print(f"[green]Submitted rebuild job: {job_id}[/green]")
+        _error().print(f"[green]Submitted rebuild job: {job_id}[/green]")
 
         # 9. Post-rebuild flow (only if --wait)
         if wait:
-            _console().print("[dim]Waiting for rebuild to complete...[/dim]")
+            _error().print("[dim]Waiting for rebuild to complete...[/dim]")
             _wait_and_check(client, system, job_id, "Rebuild job")
-            _console().print(f"[green]Rebuild complete: {tag}[/green]")
+            _error().print(f"[green]Rebuild complete: {tag}[/green]")
             if enroot:
-                _console().print(f"[green]Enroot image: {output_path}[/green]")
+                _error().print(f"[green]Enroot image: {output_path}[/green]")
 
             # Create new TOML (without patch mounts, image retargeted) when
             # there's one to derive from.
@@ -2211,7 +2213,6 @@ ls -lh {q_output_path}
                 file=cont.file,
                 tag=tag,
                 remote_path=cont.remote_path,
-                stage=cont.stage,
                 toml=None,
             )
             if toml_path is not None:
@@ -2223,16 +2224,16 @@ ls -lh {q_output_path}
                 )
                 new_toml_str = str(new_toml_path)
                 new_cont.toml = new_toml_str
-                _console().print(f"[green]Created TOML: {new_toml_path}[/green]")
+                _error().print(f"[green]Created TOML: {new_toml_path}[/green]")
             if config._config_path is None:
-                _console().print("[yellow]Warning: no config file path — skipping config update[/yellow]")
+                _error().print("[yellow]Warning: no config file path — skipping config update[/yellow]")
             else:
                 add_container_to_config(config._config_path, new_name, new_cont)
-                _console().print(f"[green]Added container '{new_name}' to fcw.yaml[/green]")
+                _error().print(f"[green]Added container '{new_name}' to fcw.yaml[/green]")
 
             # Cleanup remote .patches/ dirs
             if cleanup:
-                _console().print("[dim]Cleaning up remote .patches/ directories...[/dim]")
+                _error().print("[dim]Cleaning up remote .patches/ directories...[/dim]")
 
                 async def do_cleanup() -> None:
                     async_client = get_async_client()
@@ -2245,17 +2246,17 @@ ls -lh {q_output_path}
                                 blocking=True,
                             )
                         except Exception as e:
-                            _console().print(
+                            _error().print(
                                 f"[yellow]Warning: could not remove {host_path}: {e}[/yellow]"
                             )
 
                 asyncio.run(do_cleanup())
-                _console().print("[green]Remote patches cleaned up[/green]")
+                _error().print("[green]Remote patches cleaned up[/green]")
 
-            _console().print(
+            _error().print(
                 "\n[bold]To use the rebuilt container, update your job config:[/bold]"
             )
-            _console().print(f"  container: {new_name}")
+            _error().print(f"  container: {new_name}")
     finally:
         os.unlink(script_path)
 
@@ -2312,7 +2313,7 @@ def gc_staging(
                     f"age {(datetime.now() - ts).days}d" if ts else "age unknown"
                 )
                 if not header_printed:
-                    _console().print(f"[bold].fcw/{base}/[/bold]")
+                    _error().print(f"[bold].fcw/{base}/[/bold]")
                     header_printed = True
                 any_candidate = True
                 if force:
@@ -2321,17 +2322,17 @@ def gc_staging(
                             system_name=system, path=path, account=account,
                             blocking=True,
                         )
-                        _console().print(f"  [red]removed[/red] {name} ({age_str})")
+                        _error().print(f"  [red]removed[/red] {name} ({age_str})")
                     except Exception as e:
-                        _console().print(
+                        _error().print(
                             f"  [yellow]could not remove[/yellow] {name}: {e}"
                         )
                 else:
-                    _console().print(f"  {name} ({age_str})")
+                    _error().print(f"  {name} ({age_str})")
         if not any_candidate:
-            _console().print("[dim]No staging dirs matched.[/dim]")
+            _error().print("[dim]No staging dirs matched.[/dim]")
         elif not force:
-            _console().print(
+            _error().print(
                 "\n[dim]Dry-run. Re-run with --force to delete.[/dim]"
             )
 
@@ -2364,14 +2365,14 @@ def list_images(
                         recursive=False,
                     )
 
-                    _console().print(f"[bold]Remote images in {images_path}:[/bold]")
+                    _output().print(f"[bold]Remote images in {images_path}:[/bold]")
                     for entry in entries:
                         name = entry.get("name") if isinstance(entry, dict) else getattr(entry, "name", None)
                         size = entry.get("size") if isinstance(entry, dict) else getattr(entry, "size", 0)
                         if name and name.endswith(".sqsh"):
-                            _console().print(f"  {name}  ({size / 1024 / 1024:.1f} MB)")
+                            _output().print(f"  {name}  ({size / 1024 / 1024:.1f} MB)")
                 except Exception as e:
-                    _console().print(f"[yellow]Could not list remote images in {images_path}: {e}[/yellow]")
+                    _error().print(f"[yellow]Could not list remote images in {images_path}: {e}[/yellow]")
 
         asyncio.run(do_list())
     else:

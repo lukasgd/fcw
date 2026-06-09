@@ -3,7 +3,9 @@
 from fcw.core import (
     SLURM_FAILED_STATES,
     format_sbatch_lines,
+    get_error_console,
     get_global_sbatch_options,
+    get_output_console,
 )
 
 
@@ -51,3 +53,23 @@ class TestFormatSbatchLines:
         result = format_sbatch_lines({"reservation": "test", "partition": "gpu"})
         assert "#SBATCH --reservation=test\n" in result
         assert "#SBATCH --partition=gpu\n" in result
+
+
+class TestConsoles:
+    """Diagnostics go to stderr; primary command output goes to stdout."""
+
+    def test_console_is_stderr(self):
+        assert get_error_console().stderr is True
+
+    def test_output_console_is_stdout(self):
+        assert get_output_console().stderr is False
+
+    def test_streams_are_separated(self, capsys):
+        # Rich resolves the stream at print time, so capsys captures correctly.
+        get_output_console().print("PRIMARY_OUT")
+        get_error_console().print("DIAG_ERR")
+        captured = capsys.readouterr()
+        assert "PRIMARY_OUT" in captured.out
+        assert "PRIMARY_OUT" not in captured.err
+        assert "DIAG_ERR" in captured.err
+        assert "DIAG_ERR" not in captured.out

@@ -117,7 +117,7 @@ def assert_job_run(runner, timed_step, command, *, step_name="job-run",
     if remote_script:
         cmd.append("--remote-script")
     if container:
-        cmd.extend(["-c", container])
+        cmd.extend(["--container", container])
     cmd.extend(["--", command])
     return invoke(runner, cmd, step_name, timed_step)
 

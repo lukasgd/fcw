@@ -17,10 +17,11 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 import firecrest
 
-from fcw.core import load_config, DirectoryType, get_async_client, get_system, get_account, resolve_context, get_console
+from fcw.core import load_config, DirectoryType, get_async_client, get_system, get_account, resolve_context, get_error_console, get_output_console
 
 app = typer.Typer(no_args_is_help=True)
-_console = get_console
+_error = get_error_console
+_output = get_output_console
 
 # Sync state directory
 SYNC_STATE_DIR = ".fcw/sync"
@@ -28,7 +29,7 @@ SYNC_STATE_DIR = ".fcw/sync"
 
 def _spinner(message: str):
     """Create a progress spinner with a message."""
-    p = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=_console())
+    p = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=_error())
     p.add_task(message, total=None)
     return p
 
@@ -390,7 +391,7 @@ def upload(
         rel_path = os.path.relpath(path, config.workdir.local)
         if not config.can_upload(rel_path) and not force:
             dir_type = config.get_directory_type(rel_path)
-            _console().print(
+            _error().print(
                 f"[red]Error:[/red] '{rel_path}' is declared as '{dir_type.value}' (download-only).\n"
                 "Use --force to override or change type in fcw.yaml."
             )
@@ -411,9 +412,9 @@ def upload(
                             follow_symlinks,
                         )
                     if count > 0:
-                        _console().print(f"[green]Uploaded {count} files to {remote_path}[/green]")
+                        _error().print(f"[green]Uploaded {count} files to {remote_path}[/green]")
                     else:
-                        _console().print(f"[dim]No changes in {local_path}[/dim]")
+                        _error().print(f"[dim]No changes in {local_path}[/dim]")
                 elif os.path.isdir(local_path):
                     # Directory upload via tar
                     with _spinner(f"Uploading {local_path}..."):
@@ -421,7 +422,7 @@ def upload(
                             client, system, account, local_path, remote_path,
                             follow_symlinks,
                         )
-                    _console().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
+                    _error().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
                 else:
                     # Direct file upload — ensure the remote parent dir exists first
                     try:
@@ -441,12 +442,12 @@ def upload(
                             account=account,
                             blocking=True,
                         )
-                    _console().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
+                    _error().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
             
             if not watch:
                 break
             
-            _console().print(f"[dim]Waiting {interval}s...[/dim]")
+            _error().print(f"[dim]Waiting {interval}s...[/dim]")
             await asyncio.sleep(interval)
     
     asyncio.run(do_upload())
@@ -468,7 +469,7 @@ def download(
     for path in paths:
         if not config.can_download(path) and not force:
             dir_type = config.get_directory_type(path)
-            _console().print(
+            _error().print(
                 f"[red]Error:[/red] '{path}' is declared as '{dir_type.value}' (upload-only).\n"
                 "Use --force to override or change type in fcw.yaml."
             )
@@ -488,9 +489,9 @@ def download(
                             client, system, account, remote_path, local_path
                         )
                     if count > 0:
-                        _console().print(f"[green]Downloaded {count} files from {remote_path}[/green]")
+                        _error().print(f"[green]Downloaded {count} files from {remote_path}[/green]")
                     else:
-                        _console().print(f"[dim]No changes in {rel_path}[/dim]")
+                        _error().print(f"[dim]No changes in {rel_path}[/dim]")
                 else:
                     # Check if remote path is a directory
                     is_dir = False
@@ -510,7 +511,7 @@ def download(
                             await _download_directory(
                                 client, system, account, remote_path, local_path
                             )
-                        _console().print(
+                        _error().print(
                             f"[green]Downloaded {remote_path} to {local_path}[/green]"
                         )
                     else:
@@ -524,14 +525,14 @@ def download(
                                 account=account,
                                 blocking=True,
                             )
-                        _console().print(
+                        _error().print(
                             f"[green]Downloaded {remote_path} to {local_path}[/green]"
                         )
             
             if not watch:
                 break
             
-            _console().print(f"[dim]Waiting {interval}s...[/dim]")
+            _error().print(f"[dim]Waiting {interval}s...[/dim]")
             await asyncio.sleep(interval)
     
     asyncio.run(do_download())
@@ -565,9 +566,9 @@ def list_files(
             size = entry.get("size") if isinstance(entry, dict) else getattr(entry, "size", 0)
             
             if entry_type == "d":
-                _console().print(f"[blue]{name}/[/blue]")
+                _output().print(f"[blue]{name}/[/blue]")
             else:
-                _console().print(f"{name}  ({size} bytes)")
+                _output().print(f"{name}  ({size} bytes)")
     
     asyncio.run(do_list())
 
@@ -597,7 +598,7 @@ def rm(
                 account=account,
                 blocking=True,
             )
-            _console().print(f"[green]Removed {remote_path}[/green]")
+            _error().print(f"[green]Removed {remote_path}[/green]")
     
     asyncio.run(do_rm())
 
@@ -627,7 +628,7 @@ def status(
         pull_str = datetime.fromtimestamp(pull_ts).strftime("%Y-%m-%d %H:%M:%S") if pull_ts > 0 else "-"
         
         table.add_row(path, dir_config.type.value, push_str, pull_str)
-    
-    _console().print(table)
+
+    _output().print(table)
 
 # FIXME: ls has already been implemented, others from pyfirerest not, e.g. mkdir, mv, chmod, chown, cp, compress, extract, file, stat, symlink, checksum, head, tail. However, for productivity these commands should probably be implemented relative to the remote workdir, possibly even relative to the current local working directory.

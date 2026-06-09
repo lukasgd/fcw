@@ -50,7 +50,6 @@ class ContainerConfig:
     file: str
     tag: str
     remote_path: Optional[str] = None
-    stage: Optional[str] = None  # FIXME: What is the purpose of this if we have local_stages and remote_stage?
     toml: Optional[str] = None
     platform: Optional[str] = None
     build_args: Optional[Dict[str, str]] = None
@@ -325,7 +324,6 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 file=cont_data.get("file", ""),
                 tag=cont_data.get("tag", ""),
                 remote_path=cont_data.get("remote_path"),
-                stage=cont_data.get("stage"),  # FIXME: What is the purpose of this if we have local_stages and remote_stage?
                 toml=cont_data.get("toml"),
                 platform=cont_data.get("platform"),
                 build_args=cont_data.get("build_args"),
@@ -462,8 +460,6 @@ def add_container_to_config(
     snippet += f"    tag: {container.tag}\n"
     if container.remote_path is not None:
         snippet += f"    remote_path: {container.remote_path}\n"
-    if container.stage is not None:
-        snippet += f"    stage: {container.stage}\n"
     if container.toml is not None:
         snippet += f"    toml: {container.toml}\n"
     if container.platform is not None:
@@ -574,8 +570,6 @@ def add_container_to_config_roundtrip(
     entry["tag"] = container.tag
     if container.remote_path is not None:
         entry["remote_path"] = container.remote_path
-    if container.stage is not None:
-        entry["stage"] = container.stage
     if container.toml is not None:
         entry["toml"] = container.toml
     if container.platform is not None:

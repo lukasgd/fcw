@@ -44,8 +44,21 @@ SLURM_FAILED_STATES = frozenset({
 })
 
 
-def get_console() -> Console:
-    """Get a Rich console for stderr output."""
+def get_error_console() -> Console:
+    """Get a Rich console for diagnostics (errors, warnings, status) on stderr.
+
+    Keeping these off stdout leaves it clean for machine-readable output (e.g.
+    a submitted job id), so `JOB=$(fcw job submit ...)` captures only that.
+    """
+    return Console(stderr=True)
+
+
+def get_output_console() -> Console:
+    """Get a Rich console for primary command output (tables, listings) on stdout.
+
+    Used by commands whose result is meant to be piped/redirected, e.g.
+    `fcw job list`, `fcw config show`, `fcw data ls`.
+    """
     return Console()
 
 
@@ -112,7 +125,8 @@ __all__ = [
     "extract_job_id",
     "resolve_context",
     "SLURM_FAILED_STATES",
-    "get_console",
+    "get_error_console",
+    "get_output_console",
     "get_global_sbatch_options",
     "format_sbatch_lines",
 ]

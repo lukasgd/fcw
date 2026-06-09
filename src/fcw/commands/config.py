@@ -21,7 +21,8 @@ from fcw.core import (
     generate_interactive_config,
     get_async_client,
     get_client,
-    get_console,
+    get_error_console,
+    get_output_console,
     get_system,
     load_config,
     remove_container_from_config,
@@ -30,7 +31,8 @@ from fcw.core import (
 )
 
 app = typer.Typer(no_args_is_help=True)
-_console = get_console
+_error = get_error_console
+_output = get_output_console
 
 # Nested sub-typers for managing config sections
 directory_app = typer.Typer(no_args_is_help=True)
@@ -53,12 +55,12 @@ def _resolve_config_path(ctx: typer.Context) -> Path:
     if custom:
         p = Path(custom)
         if not p.exists():
-            _console().print(f"[red]Config file not found: {custom}[/red]")
+            _error().print(f"[red]Config file not found: {custom}[/red]")
             raise typer.Exit(1)
         return p
     default = Path.cwd() / "fcw.yaml"
     if not default.exists():
-        _console().print("[red]No fcw.yaml found. Run 'fcw config init' first.[/red]")
+        _error().print("[red]No fcw.yaml found. Run 'fcw config init' first.[/red]")
         raise typer.Exit(1)
     return default
 
@@ -74,8 +76,8 @@ def init(
     config_path = Path.cwd() / "fcw.yaml"
 
     if config_path.exists() and not force:
-        _console().print(f"[red]Config file already exists: {config_path}[/red]")
-        _console().print("Use --force to overwrite.")
+        _error().print(f"[red]Config file already exists: {config_path}[/red]")
+        _error().print("Use --force to overwrite.")
         raise typer.Exit(1)
 
     if non_interactive or not _is_interactive():
@@ -90,9 +92,9 @@ def init(
             generate_interactive_config(project, remote_workdir, local_workdir)
         )
 
-    _console().print(f"[green]Created config file: {config_path}[/green]")
-    _console().print("\nEdit the file to configure your project, then run:")
-    _console().print("  fcw config validate")
+    _error().print(f"[green]Created config file: {config_path}[/green]")
+    _error().print("\nEdit the file to configure your project, then run:")
+    _error().print("  fcw config validate")
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +112,9 @@ def directory_add(
     config_path = _resolve_config_path(ctx)
     try:
         add_directory_to_config(config_path, path, type)
-        _console().print(f"[green]Added directory '{path}' (type: {type.value})[/green]")
+        _error().print(f"[green]Added directory '{path}' (type: {type.value})[/green]")
     except ValueError as e:
-        _console().print(f"[red]{e}[/red]")
+        _error().print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
 
@@ -125,9 +127,9 @@ def directory_remove(
     config_path = _resolve_config_path(ctx)
     try:
         remove_directory_from_config(config_path, path)
-        _console().print(f"[green]Removed directory '{path}'[/green]")
+        _error().print(f"[green]Removed directory '{path}'[/green]")
     except ValueError as e:
-        _console().print(f"[red]{e}[/red]")
+        _error().print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
 
@@ -137,14 +139,14 @@ def directory_list(ctx: typer.Context) -> None:
     config_path = _resolve_config_path(ctx)
     config = load_config(str(config_path))
     if not config.directories:
-        _console().print("[yellow]No directories configured.[/yellow]")
+        _error().print("[yellow]No directories configured.[/yellow]")
         return
     table = Table(show_header=True)
     table.add_column("Path")
     table.add_column("Type")
     for path, dir_config in config.directories.items():
         table.add_row(path, dir_config.type.value)
-    _console().print(table)
+    _output().print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +175,9 @@ def container_add(
     )
     try:
         add_container_to_config_roundtrip(config_path, name, container)
-        _console().print(f"[green]Added container '{name}' (tag: {tag})[/green]")
+        _error().print(f"[green]Added container '{name}' (tag: {tag})[/green]")
     except ValueError as e:
-        _console().print(f"[red]{e}[/red]")
+        _error().print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
 
@@ -188,9 +190,9 @@ def container_remove(
     config_path = _resolve_config_path(ctx)
     try:
         remove_container_from_config(config_path, name)
-        _console().print(f"[green]Removed container '{name}'[/green]")
+        _error().print(f"[green]Removed container '{name}'[/green]")
     except ValueError as e:
-        _console().print(f"[red]{e}[/red]")
+        _error().print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
 
@@ -200,7 +202,7 @@ def container_list(ctx: typer.Context) -> None:
     config_path = _resolve_config_path(ctx)
     config = load_config(str(config_path))
     if not config.containers:
-        _console().print("[yellow]No containers configured.[/yellow]")
+        _error().print("[yellow]No containers configured.[/yellow]")
         return
     table = Table(show_header=True)
     table.add_column("Name")
@@ -208,7 +210,7 @@ def container_list(ctx: typer.Context) -> None:
     table.add_column("Remote Path")
     for name, cont_config in config.containers.items():
         table.add_row(name, cont_config.tag, cont_config.remote_path or "-")
-    _console().print(table)
+    _output().print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +236,7 @@ def job_add(
     if env:
         for item in env:
             if "=" not in item:
-                _console().print(f"[red]Invalid --env format: '{item}' (expected KEY=VALUE)[/red]")
+                _error().print(f"[red]Invalid --env format: '{item}' (expected KEY=VALUE)[/red]")
                 raise typer.Exit(1)
             k, v = item.split("=", 1)
             env_dict[k] = v
@@ -249,9 +251,9 @@ def job_add(
     )
     try:
         add_job_to_config(config_path, name, job)
-        _console().print(f"[green]Added job '{name}' (script: {script})[/green]")
+        _error().print(f"[green]Added job '{name}' (script: {script})[/green]")
     except ValueError as e:
-        _console().print(f"[red]{e}[/red]")
+        _error().print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
 
@@ -264,9 +266,9 @@ def job_remove(
     config_path = _resolve_config_path(ctx)
     try:
         remove_job_from_config(config_path, name)
-        _console().print(f"[green]Removed job '{name}'[/green]")
+        _error().print(f"[green]Removed job '{name}'[/green]")
     except ValueError as e:
-        _console().print(f"[red]{e}[/red]")
+        _error().print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
 
@@ -276,7 +278,7 @@ def job_list(ctx: typer.Context) -> None:
     config_path = _resolve_config_path(ctx)
     config = load_config(str(config_path))
     if not config.jobs:
-        _console().print("[yellow]No jobs configured.[/yellow]")
+        _error().print("[yellow]No jobs configured.[/yellow]")
         return
     table = Table(show_header=True)
     table.add_column("Name")
@@ -290,7 +292,7 @@ def job_list(ctx: typer.Context) -> None:
             job_config.container or "-",
             str(job_config.time) if job_config.time is not None else "-",
         )
-    _console().print(table)
+    _output().print(table)
 
 
 @app.command()
@@ -301,45 +303,45 @@ def show(
     try:
         config = load_config((ctx.obj or {}).get("config_file"))
     except FileNotFoundError:
-        _console().print("[yellow]No config file found. Using defaults.[/yellow]")
-        _console().print("Run 'fcw config init' to create a config file.")
+        _error().print("[yellow]No config file found. Using defaults.[/yellow]")
+        _error().print("Run 'fcw config init' to create a config file.")
         return
 
-    _console().print(f"[bold]Project:[/bold] {config.project}")
+    _output().print(f"[bold]Project:[/bold] {config.project}")
     if config._config_path:
-        _console().print(f"[bold]Config file:[/bold] {config._config_path}")
+        _output().print(f"[bold]Config file:[/bold] {config._config_path}")
 
-    _console().print("\n[bold]Workdir:[/bold]")
-    _console().print(f"  remote: {config.workdir.remote}")
-    _console().print(f"  local:  {config.workdir.local}")
+    _output().print("\n[bold]Workdir:[/bold]")
+    _output().print(f"  remote: {config.workdir.remote}")
+    _output().print(f"  local:  {config.workdir.local}")
 
     if config.directories:
-        _console().print("\n[bold]Directories:[/bold]")
+        _output().print("\n[bold]Directories:[/bold]")
         table = Table(show_header=True)
         table.add_column("Path")
         table.add_column("Type")
         for path, dir_config in config.directories.items():
             table.add_row(path, dir_config.type.value)
-        _console().print(table)
+        _output().print(table)
 
     if config.containers:
-        _console().print("\n[bold]Containers:[/bold]")
+        _output().print("\n[bold]Containers:[/bold]")
         table = Table(show_header=True)
         table.add_column("Name")
         table.add_column("Tag")
         table.add_column("Remote Path")
         for name, cont_config in config.containers.items():
             table.add_row(name, cont_config.tag, cont_config.remote_path or "-")
-        _console().print(table)
+        _output().print(table)
 
     if config.jobs:
-        _console().print("\n[bold]Jobs:[/bold]")
+        _output().print("\n[bold]Jobs:[/bold]")
         table = Table(show_header=True)
         table.add_column("Name")
         table.add_column("Script")
         for name, job_config in config.jobs.items():
             table.add_row(name, job_config.script)
-        _console().print(table)
+        _output().print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +349,7 @@ def show(
 # ---------------------------------------------------------------------------
 
 def _ok(msg: str) -> None:
-    _console().print(f"  [green]✓[/green] {msg}")
+    _error().print(f"  [green]✓[/green] {msg}")
 
 
 def _warn(warnings: list[str], msg: str) -> None:
@@ -372,7 +374,7 @@ def _human_time_ago(ts: float) -> str:
 
 def _validate_local(ctx: typer.Context, errors: list[str], warnings: list[str]):
     """Phase 1: local-only checks. Returns (config, system_name) or raises Exit."""
-    con = _console()
+    con = _error()
     con.print("\n[bold]── Local checks ──────────────────[/bold]")
 
     # 1. Config file
@@ -454,7 +456,7 @@ def _validate_remote(
     diff: bool = False,
 ) -> None:
     """Phase 2: remote checks (connectivity, env var cross-validation, containers, data)."""
-    con = _console()
+    con = _error()
     con.print("\n[bold]── Remote checks ─────────────────[/bold]")
 
     # Bail early if required env vars are missing
@@ -703,7 +705,7 @@ def validate(
         _validate_remote(ctx, config, errors, warnings, diff=diff)
 
     # Print summary
-    con = _console()
+    con = _error()
     if warnings:
         con.print("\n[yellow]Warnings:[/yellow]")
         for w in warnings:

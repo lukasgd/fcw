@@ -47,14 +47,16 @@ from fcw.core import (
     get_account,
     extract_job_id,
     resolve_context,
-    get_console,
+    get_error_console,
+    get_output_console,
     get_global_sbatch_options,
     SLURM_FAILED_STATES,
     FcwConfig,
 )
 
 app = typer.Typer(no_args_is_help=True)
-_console = get_console
+_error = get_error_console
+_output = get_output_console
 
 # SLURM states after which a job produces no further output (stop following).
 SLURM_TERMINAL_STATES = SLURM_FAILED_STATES | {"COMPLETED"}
@@ -204,10 +206,32 @@ def _report_final_state(client, system: str, job_id: str) -> None:
     if isinstance(state, list):
         state = ",".join(state)
     if any(fs in state for fs in SLURM_FAILED_STATES):
-        _console().print(f"[red]Job {job_id} finished with state: {state}[/red]")
-        _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
+        _error().print(f"[red]Job {job_id} finished with state: {state}[/red]")
+        _error().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
         raise typer.Exit(1)
-    _console().print(f"[green]Job {job_id} completed ({state})[/green]")
+    _error().print(f"[green]Job {job_id} completed ({state})[/green]")
+
+
+def _job_stream_paths(client, system: str, job_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Resolve (stdout_path, stderr_path) from job metadata, %j-expanded.
+
+    Returns (None, None) when no metadata is available. Lets client errors propagate.
+
+    NOTE: SLURM filename patterns (%j, %x, %N, %A_%a, ...) are only handled
+    best-effort here (%j). The FirecREST API returns these paths inconsistently /
+    unexpanded — consistent expansion should be fixed upstream in the API.
+    """
+    metadata = client.job_metadata(system_name=system, jobid=job_id)
+    if isinstance(metadata, list):
+        metadata = metadata[0] if metadata else None
+    if not metadata:
+        return None, None
+
+    def _resolve(*keys: str) -> Optional[str]:
+        val = next((metadata.get(k) for k in keys if metadata.get(k)), None)
+        return val.replace("%j", job_id) if val else None
+
+    return _resolve("standardOutput", "stdout", "StdOut"), _resolve("standardError", "stderr", "StdErr")
 
 
 # -----------------------------------------------------------------------------
@@ -400,7 +424,7 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
                 if match:
                     old_value = match.group(1)
                     if old_value != value:
-                        _console().print(
+                        _error().print(
                             f"[yellow]Overriding script #SBATCH "
                             f"--{key} ({old_value} → {value})[/yellow]"
                         )
@@ -522,8 +546,8 @@ def _build_container_toml(config: FcwConfig, container_name: str) -> str:
         typer.Exit: If the container name is unknown or the TOML file is missing.
     """
     if container_name not in config.containers:
-        _console().print(f"[red]Unknown container: {container_name}[/red]")
-        _console().print(
+        _error().print(f"[red]Unknown container: {container_name}[/red]")
+        _error().print(
             f"[dim]Available containers: {', '.join(config.containers)}[/dim]"
         )
         raise typer.Exit(1)
@@ -534,7 +558,7 @@ def _build_container_toml(config: FcwConfig, container_name: str) -> str:
     if cont.toml:
         toml_path = Path(cont.toml)
         if not toml_path.exists():
-            _console().print(f"[red]Container TOML not found: {cont.toml}[/red]")
+            _error().print(f"[red]Container TOML not found: {cont.toml}[/red]")
             raise typer.Exit(1)
         toml_content = toml_path.read_text()
         # Override the image field with the resolved absolute path
@@ -595,6 +619,81 @@ def _inject_container_toml(script_content: str, toml_content: str) -> str:
 
     lines.insert(insert_idx, block)
     return "\n".join(lines)
+
+
+def _norm_toml_path(p: str) -> str:
+    """Normalize a TOML path for comparison (strip a single leading ``./``)."""
+    return p[2:] if p.startswith("./") else p
+
+
+def _environment_tokens(script_content: str) -> List[str]:
+    """Return every ``<X>`` appearing as ``--environment <X>`` / ``--environment=<X>``.
+
+    Surrounding quotes are stripped. Used to detect srun calls that would bypass
+    the fcw-managed container environment.
+    """
+    tokens = re.findall(r"--environment(?:=|\s+)(\S+)", script_content)
+    return [t.strip("'\"") for t in tokens]
+
+
+def _rewrite_environment_path(script_content: str, bound_path: str) -> str:
+    """Point hardcoded ``--environment <bound_path>`` at the injected TOML.
+
+    Replaces ``--environment`` tokens whose value matches the bound container's
+    configured TOML path (modulo a leading ``./``) with ``${FCW_CONTAINER_TOML}``,
+    so a script can keep its natural ``--environment ./env/foo.toml`` and still run
+    under the fcw-resolved env. The injected heredoc/export lines reference the
+    ``/dev/shm`` path, not ``bound_path``, so they are untouched.
+    """
+    target = _norm_toml_path(bound_path)
+
+    def _sub(m: "re.Match[str]") -> str:
+        value = m.group(2).strip("'\"")
+        if _norm_toml_path(value) == target:
+            return f"{m.group(1)}${{FCW_CONTAINER_TOML}}"
+        return m.group(0)
+
+    return re.sub(r"(--environment(?:=|\s+))(\S+)", _sub, script_content)
+
+
+def _warn_env_bindings(script_content: str, bound_path: Optional[str], bound: bool) -> None:
+    """Warn when an ``srun --environment`` would bypass the fcw-managed env.
+
+    A token is "managed" if it references ``FCW_CONTAINER_TOML`` or matches the
+    bound container's TOML path (which gets rewritten). Anything else runs outside
+    the resolved env; a binding with no managed reference has no effect; and a
+    reference with no binding is not fcw-managed at all.
+
+    Args:
+        bound: whether any container env is bound (via flag or configured job).
+        bound_path: the bound container's configured TOML path, if any (used to
+            recognize a hardcoded path that will be rewritten). May be None even
+            when ``bound`` is True (container without a ``toml`` file).
+    """
+    tokens = _environment_tokens(script_content)
+    target = _norm_toml_path(bound_path) if bound_path else None
+
+    def _is_managed(tok: str) -> bool:
+        return "FCW_CONTAINER_TOML" in tok or (target is not None and _norm_toml_path(tok) == target)
+
+    for tok in tokens:
+        if not _is_managed(tok):
+            _error().print(
+                f"[yellow]Warning:[/yellow] srun --environment {tok} runs outside the "
+                "fcw-managed container environment (image path not resolved by fcw)."
+            )
+
+    if bound:
+        if not any(_is_managed(t) for t in tokens):
+            _error().print(
+                "[yellow]Warning:[/yellow] a container is bound but no "
+                "srun --environment references it (binding has no effect)."
+            )
+    elif tokens or "FCW_CONTAINER_TOML" in script_content:
+        _error().print(
+            "[yellow]Warning:[/yellow] the script references a container environment "
+            "but none is bound; pass --container/--environment or use a configured job."
+        )
 
 
 def _parse_sbatch_args(args: List[str]) -> tuple[dict[str, str], List[str]]:
@@ -663,10 +762,21 @@ def _parse_sbatch_args(args: List[str]) -> tuple[dict[str, str], List[str]]:
 def submit_job(
     ctx: typer.Context,
     set_vars: Optional[List[str]] = typer.Option(
-        None, "--set", "-e",
+        None, "--set",
         help="Override env var: KEY=VALUE"
     ),
+    container: Optional[str] = typer.Option(
+        None, "--container",
+        help="Container name from fcw.yaml to bind (overrides the job's configured container)"
+    ),
+    environment: Optional[str] = typer.Option(
+        None, "--environment",
+        help="Path to a TOML file to inline as the container env "
+             "(mutually exclusive with --container)"
+    ),
     wait: bool = typer.Option(False, "--wait/--no-wait", "-w", help="Wait for job completion"),
+    follow: bool = typer.Option(False, "--follow", "-f",
+                                help="Stream job output until it finishes (implies --wait)"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print job ID"),
     remote_script: bool = typer.Option(
         False, "--remote-script",
@@ -693,6 +803,12 @@ def submit_job(
         JOB1=$(fcw job submit preprocess.sh)
         fcw job submit --dependency afterok:$JOB1 -- train.sh
 
+        # Bind a container env explicitly (overrides the job's configured one)
+        fcw job submit --container app -- train.sh
+
+        # Stream output live until the job finishes (like srun)
+        fcw job submit --follow -- train.sh
+
         # Set environment variables
         fcw job submit train --set CONFIG=exp1.yaml --set EPOCHS=100
     """
@@ -709,6 +825,7 @@ def submit_job(
     _FCW_BOOL_FLAGS = {
         "--wait": "wait", "-w": "wait",
         "--no-wait": "no-wait",
+        "--follow": "follow", "-f": "follow",
         "--quiet": "quiet", "-q": "quiet",
         "--dry-run": "dry_run",
         "--remote-script": "remote_script",
@@ -723,14 +840,22 @@ def submit_job(
                 wait = True
             elif flag == "no-wait":
                 wait = False
+            elif flag == "follow":
+                follow = True
             elif flag == "quiet":
                 quiet = True
             elif flag == "dry_run":
                 dry_run = True
             elif flag == "remote_script":
                 remote_script = True
-        elif arg in ("--set", "-e") and i + 1 < len(remaining):
+        elif arg == "--set" and i + 1 < len(remaining):
             set_vars = (set_vars or []) + [remaining[i + 1]]
+            i += 1
+        elif arg == "--container" and i + 1 < len(remaining):
+            container = remaining[i + 1]
+            i += 1
+        elif arg == "--environment" and i + 1 < len(remaining):
+            environment = remaining[i + 1]
             i += 1
         else:
             filtered_remaining.append(arg)
@@ -739,11 +864,11 @@ def submit_job(
 
     # Error if first remaining arg looks like an SBATCH option (missing -- separator)
     if remaining and remaining[0].startswith("--"):
-        _console().print(
+        _error().print(
             f"[red]Error: Expected a script path or job name but got "
             f"'{remaining[0]}', which looks like an SBATCH option.[/red]"
         )
-        _console().print(
+        _error().print(
             "[dim]SBATCH options must be placed before a -- separator:\n"
             "  fcw job submit --time 12:00:00 --nodes 4 -- train.sh[/dim]"
         )
@@ -752,34 +877,44 @@ def submit_job(
     # Error if SBATCH-style options appear after the job name
     stray = [a for a in remaining[1:] if a.startswith("--")]
     if stray:
-        _console().print(
+        _error().print(
             f"[red]Error: SBATCH-style options found after the script/job name: "
             f"{', '.join(stray)}[/red]"
         )
-        _console().print(
+        _error().print(
             "[dim]Place SBATCH options before the -- separator:\n"
             f"  fcw job submit {' '.join(stray)} -- {remaining[0]}[/dim]"
         )
         raise typer.Exit(1)
 
     if not remaining:
-        _console().print("[red]Error: No script or job name provided[/red]")
-        _console().print("[dim]Usage: fcw job submit [SBATCH_OPTS]... -- <script|job_name> [--set KEY=VALUE]...[/dim]")
+        _error().print("[red]Error: No script or job name provided[/red]")
+        _error().print("[dim]Usage: fcw job submit [SBATCH_OPTS]... -- <script|job_name> [--set KEY=VALUE]...[/dim]")
         raise typer.Exit(1)
 
     job_name = remaining[0]
+
+    if container and environment:
+        _error().print(
+            "[red]Error: --container and --environment are mutually exclusive[/red]"
+        )
+        raise typer.Exit(1)
+    if environment and not Path(environment).exists():
+        _error().print(f"[red]Environment TOML not found: {environment}[/red]")
+        raise typer.Exit(1)
 
     # Parse --set overrides
     overrides = {}
     if set_vars:
         for s in set_vars:
             if "=" not in s:
-                _console().print(f"[red]Invalid --set format: {s} (expected KEY=VALUE)[/red]")
+                _error().print(f"[red]Invalid --set format: {s} (expected KEY=VALUE)[/red]")
                 raise typer.Exit(1)
             k, v = s.split("=", 1)
             overrides[k] = v
 
-    # Determine if job_name is a config job or a script path
+    # Determine if job_name is a config job or a script path. An explicit
+    # --container/--environment overrides the job's configured container.
     container_name = None
     config_sbatch: dict[str, str] = {}
     if job_name in config.jobs:
@@ -794,52 +929,56 @@ def submit_job(
         # Treat as script path
         script_path = job_name
         env_vars = overrides
+    if container:
+        container_name = container
 
     # Merge SBATCH options: CLI args > job config > global env > script directives
     sbatch_overrides = {**get_global_sbatch_options(), **config_sbatch, **sbatch_overrides}
 
     # Read and modify script
     if not os.path.exists(script_path):
-        _console().print(f"[red]Script not found: {script_path}[/red]")
+        _error().print(f"[red]Script not found: {script_path}[/red]")
         raise typer.Exit(1)
 
     script_content = Path(script_path).read_text()
     script_content = _apply_sbatch_overrides(script_content, sbatch_overrides)
 
-    # Inject container TOML before env vars (ordering matters).
-    # When submitting a raw script (not a config job), infer the container
-    # if the script references FCW_CONTAINER_TOML.
-    if not container_name and "FCW_CONTAINER_TOML" in script_content:  # FIXME: Why not requiring the user to explicitly specify the container with --container when submitting a script instead of a named job, if FCW_CONTAINER_TOML is present? One could also offer the option to override the toml by having an extra option --environment (both for named jobs and script submissions). If FCW_CONTAINER_TOML is absent, should check that --environment is not being used, otherwise inform user that container environment is not managed by fcw. Probably any srun with a --environment option that doesn't evaluate to an FCW_CONTAINER_TOML injection should be logged to the user so they don't accidentally bypass the fcw-managed container environment without realizing it.
-        # Try to find a job config that uses this script
-        for jname, jcfg in config.jobs.items():
-            if jcfg.script == script_path and jcfg.container:
-                container_name = jcfg.container
-                break
-        # Fall back to the sole container with a TOML
-        if not container_name:
-            toml_containers = [
-                name for name, c in config.containers.items() if c.toml
-            ]
-            if len(toml_containers) == 1:
-                container_name = toml_containers[0]
-    if container_name:
+    # Resolve the container env binding (explicit --environment/--container, else
+    # the named job's container). Raw scripts bind only via these — no inference.
+    toml_content = None
+    bound_path: Optional[str] = None
+    if environment:
+        toml_content = Path(environment).read_text()
+        bound_path = environment
+    elif container_name:
         from fcw.commands.container import _resync_container_patches
         _resync_container_patches(config, container_name, system, account)
         toml_content = _build_container_toml(config, container_name)
+        if container_name in config.containers:
+            bound_path = config.containers[container_name].toml
+
+    # Warn about srun --environment calls that bypass the managed env (before
+    # injection rewrites them), then inject + rewrite the hardcoded path.
+    _warn_env_bindings(script_content, bound_path, bound=toml_content is not None)
+    if toml_content is not None:
         script_content = _inject_container_toml(script_content, toml_content)
+        if bound_path:
+            script_content = _rewrite_environment_path(script_content, bound_path)
 
     script_content = _inject_env_vars(script_content, env_vars)
 
     if remote_script:
-        _console().print(
+        _error().print(
             "[yellow]Warning:[/yellow] --remote-script uploads a fixed-name remote script "
             "(.fcw/scripts/<name>.sh) and is not safe for concurrent submissions — submit "
             "serially. Scripts are not cleaned up remotely."
         )
 
     if dry_run:
-        _console().print(f"[bold]Modified script ({script_path}):[/bold]")
-        _console().print(script_content)
+        # Header is a label (stderr); the script body is the artifact (stdout),
+        # so `fcw job submit --dry-run … > script.sh` yields a clean script.
+        _error().print(f"[bold]Modified script ({script_path}):[/bold]")
+        _output().print(script_content)
         return
 
     # Submit job
@@ -886,15 +1025,32 @@ def submit_job(
 
         # Print details to stderr (unless quiet)
         if not quiet:
-            _console().print(f"[green]Submitted job {job_id}[/green]", highlight=False)
+            _error().print(f"[green]Submitted job {job_id}[/green]", highlight=False)
             if sbatch_overrides:
                 override_str = ", ".join(f"{k}={v}" for k, v in sbatch_overrides.items())
-                _console().print(f"[dim]SBATCH overrides: {override_str}[/dim]")
+                _error().print(f"[dim]SBATCH overrides: {override_str}[/dim]")
     finally:
         os.unlink(modified_script_path)
 
-    if wait:
-        _console().print(f"[dim]Waiting for job {job_id}...[/dim]")
+    if follow:
+        stdout_path = None
+        try:
+            stdout_path, _ = _job_stream_paths(client, system, job_id)
+        except Exception:
+            pass
+        if stdout_path:
+            if not quiet:
+                _error().print(f"[dim]Following job {job_id} (Ctrl-C to stop)...[/dim]")
+            _follow_streams(system, job_id, [("stdout", stdout_path, "out")],
+                            tail=False, lines=50)
+        else:
+            _error().print(
+                "[yellow]Could not resolve stdout path from metadata; "
+                "waiting for completion instead.[/yellow]"
+            )
+        _report_final_state(client, system, job_id)
+    elif wait:
+        _error().print(f"[dim]Waiting for job {job_id}...[/dim]")
         _report_final_state(client, system, job_id)
 
 
@@ -914,11 +1070,11 @@ def run_command(
     follow: bool = typer.Option(False, "--follow", "-f",
                                 help="Stream job output until it finishes (implies --wait)"),
     container: Optional[str] = typer.Option(
-        None, "--container", "-c",
+        None, "--container",
         help="Container name from fcw.yaml to run the command in (defines csrun)"
     ),
     environment: Optional[str] = typer.Option(
-        None, "--environment", "-e",
+        None, "--environment",
         help="Path to a TOML file to inline as the container env (mutually exclusive with --container)"
     ),
     dry_run: bool = typer.Option(
@@ -945,7 +1101,7 @@ def run_command(
         fcw job run --time 01:00:00 --nodes 2 -- 'nvidia-smi'
 
         # In a container (csrun = srun --environment=$FCW_CONTAINER_TOML)
-        fcw job run -c mycont -- 'csrun python analyze.py'
+        fcw job run --container mycont -- 'csrun python analyze.py'
 
         # Stream output live until the job finishes (like srun)
         fcw job run --follow -- 'python train.py'
@@ -953,21 +1109,21 @@ def run_command(
     config, system, account = resolve_context(ctx)
 
     if container and environment:
-        _console().print(
+        _error().print(
             "[red]Error: --container and --environment are mutually exclusive[/red]"
         )
         raise typer.Exit(1)
 
     if environment and not Path(environment).exists():
-        _console().print(f"[red]Environment TOML not found: {environment}[/red]")
+        _error().print(f"[red]Environment TOML not found: {environment}[/red]")
         raise typer.Exit(1)
 
     args = ctx.args
     sbatch_overrides, remaining = _parse_sbatch_args(args or [])
 
     if not remaining:
-        _console().print("[red]Error: No command provided[/red]")
-        _console().print("[dim]Usage: fcw job run [SBATCH_OPTS]... -- <command>[/dim]")
+        _error().print("[red]Error: No command provided[/red]")
+        _error().print("[dim]Usage: fcw job run [SBATCH_OPTS]... -- <command>[/dim]")
         raise typer.Exit(1)
 
     command = " ".join(remaining)
@@ -1000,14 +1156,14 @@ def run_command(
         script_content = _inject_container_toml(script_content, toml_content)
 
     if remote_script:
-        _console().print(
+        _error().print(
             "[yellow]Warning:[/yellow] --remote-script uploads a fixed-name remote script "
             "(.fcw/scripts/<name>.sh) and is not safe for concurrent submissions — submit "
             "serially. Scripts are not cleaned up remotely."
         )
 
     if dry_run:
-        _console().print(script_content)
+        _output().print(script_content)
         return
 
     client = get_client()
@@ -1047,7 +1203,7 @@ def run_command(
 
         job_id = extract_job_id(result)
         print(job_id)
-        _console().print(f"[green]Submitted job {job_id}[/green]")
+        _error().print(f"[green]Submitted job {job_id}[/green]")
     finally:
         os.unlink(script_path)
 
@@ -1059,12 +1215,12 @@ def run_command(
         # upstream in the API, not worked around in fcw.
         out = sbatch_final.get("output", "fcw-run-%j.out").replace("%j", job_id)
         stdout_path = out if os.path.isabs(out) else f"{working_dir}/{out}"
-        _console().print(f"[dim]Following job {job_id} (Ctrl-C to stop)...[/dim]")
+        _error().print(f"[dim]Following job {job_id} (Ctrl-C to stop)...[/dim]")
         _follow_streams(system, job_id, [("stdout", stdout_path, "out")],
                         tail=False, lines=50)
         _report_final_state(client, system, job_id)
     elif wait:
-        _console().print(f"[dim]Waiting for job {job_id}...[/dim]")
+        _error().print(f"[dim]Waiting for job {job_id}...[/dim]")
         _report_final_state(client, system, job_id)
 
 
@@ -1081,7 +1237,7 @@ def job_status(
     try:
         jobs = client.job_info(system_name=system, jobid=job_id)
         if not jobs:
-            _console().print(f"[yellow]No info found for job {job_id}[/yellow]")
+            _error().print(f"[yellow]No info found for job {job_id}[/yellow]")
             raise typer.Exit(1)
 
         job = jobs[0]
@@ -1092,9 +1248,9 @@ def job_status(
         for key, value in job.items():
             table.add_row(str(key), str(value))
         
-        _console().print(table)
+        _output().print(table)
     except Exception as e:
-        _console().print(f"[red]Error: {e}[/red]")
+        _error().print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1)
 
 
@@ -1119,31 +1275,13 @@ def job_logs(
 
     # Get job metadata to find output file(s)
     try:
-        metadata = client.job_metadata(system_name=system, jobid=job_id)
-        if isinstance(metadata, list):
-            metadata = metadata[0] if metadata else None
-        if not metadata:
-            _console().print(f"[red]No metadata found for job {job_id}[/red]")
-            raise typer.Exit(1)
-
-        # NOTE: SLURM filename patterns (%j, %x, %N, %A_%a, ...) are only handled
-        # best-effort here (%j). The FirecREST API returns these paths
-        # inconsistently / unexpanded — consistent expansion should be fixed
-        # upstream in the API, not worked around in fcw.
-        def _resolve(*keys: str) -> Optional[str]:
-            val = next((metadata.get(k) for k in keys if metadata.get(k)), None)
-            return val.replace("%j", job_id) if val else None
-
-        stdout_path = _resolve("standardOutput", "stdout", "StdOut")
-        stderr_path = _resolve("standardError", "stderr", "StdErr")
-    except typer.Exit:
-        raise
+        stdout_path, stderr_path = _job_stream_paths(client, system, job_id)
     except Exception as e:
-        _console().print(f"[red]Error getting job metadata: {e}[/red]")
+        _error().print(f"[red]Error getting job metadata: {e}[/red]")
         raise typer.Exit(1)
 
     if not stdout_path:
-        _console().print("[red]Could not determine stdout path from job metadata[/red]")
+        _error().print("[red]Could not determine stdout path from job metadata[/red]")
         raise typer.Exit(1)
 
     # Build the selected (label, path, suffix) streams. Collapse to a single
@@ -1155,7 +1293,7 @@ def job_logs(
         selected = [("stdout", stdout_path, "out"), ("stderr", stderr_path, "err")]
     else:
         if stream is not LogStream.stdout and combined:
-            _console().print("[dim]stdout and stderr are combined; showing the single log.[/dim]")
+            _error().print("[dim]stdout and stderr are combined; showing the single log.[/dim]")
         selected = [("stdout", stdout_path, "out")]
 
     multi = len(selected) > 1
@@ -1172,7 +1310,7 @@ def job_logs(
                     account=account,
                     blocking=True,
                 )
-                _console().print(f"[green]Downloaded {label} to {local_path}[/green]")
+                _error().print(f"[green]Downloaded {label} to {local_path}[/green]")
 
         asyncio.run(do_download())
         return
@@ -1194,7 +1332,7 @@ def job_logs(
                 ))
                 _emit(content)
             except Exception as e:
-                _console().print(f"[red]Error reading {label}: {e}[/red]")
+                _error().print(f"[red]Error reading {label}: {e}[/red]")
 
     asyncio.run(do_read())
 
@@ -1211,21 +1349,21 @@ def wait_for_jobs(
     client = get_client()
     
     for job_id in job_ids:
-        _console().print(f"[dim]Waiting for job {job_id}...[/dim]")
+        _error().print(f"[dim]Waiting for job {job_id}...[/dim]")
         try:
             job_info = client.wait_for_job(system_name=system, job_id=job_id)
             state = job_info[0]["status"]["state"]
             if isinstance(state, list):
                 state = ",".join(state)
             if any(fs in state for fs in SLURM_FAILED_STATES):
-                _console().print(f"[red]Job {job_id} finished with state: {state}[/red]")
-                _console().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
+                _error().print(f"[red]Job {job_id} finished with state: {state}[/red]")
+                _error().print(f"[dim]Hint: Run `fcw job logs {job_id}` to see output[/dim]")
                 raise typer.Exit(1)
-            _console().print(f"[green]Job {job_id} completed ({state})[/green]")
+            _error().print(f"[green]Job {job_id} completed ({state})[/green]")
         except typer.Exit:
             raise
         except Exception as e:
-            _console().print(f"[red]Job {job_id} failed: {e}[/red]")
+            _error().print(f"[red]Job {job_id} failed: {e}[/red]")
             raise typer.Exit(1)
 
 
@@ -1242,9 +1380,9 @@ def cancel_jobs(
     for job_id in job_ids:
         try:
             client.cancel_job(system_name=system, jobid=job_id)
-            _console().print(f"[green]Cancelled job {job_id}[/green]")
+            _error().print(f"[green]Cancelled job {job_id}[/green]")
         except Exception as e:
-            _console().print(f"[red]Failed to cancel {job_id}: {e}[/red]")
+            _error().print(f"[red]Failed to cancel {job_id}: {e}[/red]")
 
 
 @app.command("list")
@@ -1275,32 +1413,32 @@ def list_jobs(
         try:
             jobs = client.job_info(system_name=system, **kwargs)
         except firecrest.NotImplementedOnAPIversion as e:
-            _console().print(f"[yellow]Warning: {e} Ignoring --all-users/--account.[/yellow]")
+            _error().print(f"[yellow]Warning: {e} Ignoring --all-users/--account.[/yellow]")
             jobs = client.job_info(system_name=system)
         except Exception as e:
             # The only multi-user mechanism is allusers=True, which makes FirecREST
             # run a cluster-wide `sacct` — often very slow / 500s on busy systems.
             if not want_all:
                 raise
-            _console().print(
+            _error().print(
                 "[red]Listing all users' jobs failed.[/red] The FirecREST all-users query "
                 "runs a cluster-wide `sacct` that is often very slow and can time out on "
                 "busy systems. Retry without --all-users/--user, or narrow with --account."
             )
-            _console().print(f"[dim]Underlying error: {e}[/dim]")
+            _error().print(f"[dim]Underlying error: {e}[/dim]")
             raise typer.Exit(1)
 
         table, counts = _build_jobs_table(
             jobs, long=long, state=state, user=user, partition=partition,
         )
-        _console().print(table)
+        _output().print(table)
 
         if counts:
             total = sum(counts.values())
             parts = "  ".join(f"{s}: {n}" for s, n in sorted(counts.items()))
-            _console().print(f"[dim]Total: {total} · {parts}[/dim]", highlight=False)
+            _output().print(f"[dim]Total: {total} · {parts}[/dim]", highlight=False)
     except typer.Exit:
         raise
     except Exception as e:
-        _console().print(f"[red]Error: {e}[/red]")
+        _error().print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1)

@@ -97,14 +97,14 @@ class TestDetectRemotePlatform:
     def test_head_failure_warns(self, capsys):
         client = _StubHeadClient(exc=RuntimeError("403 forbidden"))
         assert _detect_remote_platform(client, "unknown-sys") is None
-        out = _flat(capsys.readouterr().out)
-        assert "could not auto-detect" in out
-        assert "403 forbidden" in out
+        err = _flat(capsys.readouterr().err)  # warnings go to stderr
+        assert "could not auto-detect" in err
+        assert "403 forbidden" in err
 
     def test_unrecognized_content_warns(self, capsys):
         client = _StubHeadClient(result={"content": "nothing useful here"})
         assert _detect_remote_platform(client, "unknown-sys") is None
-        assert "could not auto-detect" in _flat(capsys.readouterr().out)
+        assert "could not auto-detect" in _flat(capsys.readouterr().err)
 
 
 class TestFindContainerConfig:
