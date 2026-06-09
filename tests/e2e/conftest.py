@@ -139,6 +139,16 @@ def runner():
 
 
 @pytest.fixture
+def stage_tars_dir(request):
+    """Directory of pre-built per-stage tars for engine-less mode, or None.
+
+    Temporary: set via --stage-tars so a client without a container engine can
+    push pre-built stage tars instead of building. See helpers.assert_container_deploy.
+    """
+    return request.config.getoption("--stage-tars")
+
+
+@pytest.fixture
 def submit_job(runner, timed_step, request, fcw_config):
     """Submit a named job, auto-capped at --max-node-hours (nodes x walltime).
 

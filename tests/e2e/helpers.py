@@ -5,6 +5,7 @@ Thin wrappers around CLI invocations that handle timing and assertions.
 
 from __future__ import annotations
 
+import os
 import re
 import traceback
 from typing import TYPE_CHECKING
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from typer.testing import CliRunner
 
 from fcw.cli import app
+from fcw.core.config import load_config
 
 
 def assert_ok(result: Result, args: list[str] | None = None) -> None:
@@ -89,12 +91,57 @@ def assert_container_build_remote(runner, timed_step, name, **kwargs):
     return invoke(runner, cmd, "container-build-remote", timed_step)
 
 
-def assert_container_deploy(runner, timed_step, name, *, platform=None):
-    """Deploy a container (build + push + remote build in one step)."""
+def assert_container_deploy(runner, timed_step, name, *, platform=None, stage_tars=None):
+    """Deploy a container (build + push + remote build in one step).
+
+    When *stage_tars* is set (engine-less consume mode), the local build+push is
+    replaced by uploading pre-built per-stage tars from that directory followed by a
+    remote build — no container engine required on this machine. Temporary.
+    """
+    if stage_tars:
+        return _provision_from_stage_tars(runner, timed_step, name, stage_tars)
     cmd = ["container", "deploy", name, "--wait"]
     if platform:
         cmd.extend(["--platform", platform])
     return invoke(runner, cmd, "container-deploy", timed_step)
+
+
+def _stage_tar_name(stage_tag: str) -> str:
+    """Canonical per-stage tar filename (matches container.py:752 / :1091)."""
+    return stage_tag.replace(":", "+").replace("/", "+") + ".tar"
+
+
+def _provision_from_stage_tars(runner, timed_step, name, stage_tars):
+    """Engine-less provisioning: push pre-built per-stage tars, then build-remote.
+
+    Uses the legacy engine-free ``push <tar>`` path; the trailing slash on ``--to``
+    is required because that path uploads to ``os.path.dirname(--to)``.
+    """
+    config = load_config("fcw.yaml")
+    cont = config.containers[name]
+    images_dir = config.resolve_container_images_dir(cont)
+    for stage in cont.get_local_stages():
+        tar = os.path.join(stage_tars, _stage_tar_name(cont.stage_tag(stage)))
+        invoke(runner, ["container", "push", tar, "--to", images_dir + "/"],
+               f"container-push-tar-{stage}", timed_step)
+    return invoke(runner, ["container", "build-remote", name, "--enroot", "--wait"],
+                  "container-build-remote", timed_step)
+
+
+def save_stage_tars(runner, out_dir):
+    """Producer slice (needs an engine): build + save every container's local stages.
+
+    Writes one per-stage tar per container into *out_dir*, named per the
+    container.py:752 / :1091 contract so the engine-less consumer and build-remote
+    locate them. Temporary engine-less-e2e affordance.
+    """
+    config = load_config("fcw.yaml")
+    os.makedirs(out_dir, exist_ok=True)
+    for name, cont in config.containers.items():
+        for stage in cont.get_local_stages():
+            out = os.path.join(out_dir, _stage_tar_name(cont.stage_tag(stage)))
+            invoke(runner, ["container", "build", name, "--stage", stage, "--save", out],
+                   f"prepare-{name}-{stage}", None)
 
 
 def assert_job_submit(runner, timed_step, job_name, *, step_name=None,

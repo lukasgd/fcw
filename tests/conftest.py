@@ -84,10 +84,20 @@ def pytest_addoption(parser):
     parser.addoption("--max-node-hours", type=float, default=None,
                      help="Cap each e2e job at this many node-hours (nodes x walltime) "
                           "via SBATCH overrides; unset = use the job's configured walltime")
+    # TODO(temporary): remove with the engine-less e2e affordance. Lets a client
+    # without a container engine run the suite by consuming pre-built stage tars.
+    parser.addoption("--stage-tars", default=None,
+                     help="[temporary] Directory of pre-built per-stage image tars; the "
+                          "container phase runs engine-free, pushing these instead of building")
+    parser.addoption("--prepare-stage-tars", default=None,
+                     help="[temporary] Producer slice: build each container's local stages "
+                          "and save them as per-stage tars into this directory (needs an engine)")
 
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "example(name): select which example project this test targets")
+    config.addinivalue_line("markers", "needs_engine: requires a local container engine (skipped under --stage-tars)")
+    config.addinivalue_line("markers", "engineless_only: only runs in engine-less consume mode (requires --stage-tars)")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -107,3 +117,15 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(pytest.mark.skip(
                     reason=f"example '{example_name}' not selected (--example {selected_example})"
                 ))
+
+    # Engine-less consume mode (temporary): with --stage-tars the client has no
+    # container engine, so skip engine-only tests; without it, skip the consume-only
+    # provisioning tests that replace them.
+    stage_tars = config.getoption("--stage-tars")
+    skip_engine = pytest.mark.skip(reason="engine-less mode (--stage-tars): engine-only test skipped")
+    skip_engineless = pytest.mark.skip(reason="needs --stage-tars (engine-less consume mode)")
+    for item in items:
+        if stage_tars and "needs_engine" in item.keywords:
+            item.add_marker(skip_engine)
+        if not stage_tars and "engineless_only" in item.keywords:
+            item.add_marker(skip_engineless)

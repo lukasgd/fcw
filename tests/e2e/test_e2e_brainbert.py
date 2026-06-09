@@ -40,9 +40,13 @@ class TestBrainBERTContainerDeploy:
         assert_ok(result)
         assert "BrainBERT" in result.output
 
-    def test_container_deploy(self, runner, timed_step, remote_platform):
-        """Deploy ngc-brainbert container."""
-        assert_container_deploy(runner, timed_step, "ngc-brainbert", platform=remote_platform)
+    def test_container_deploy(self, runner, timed_step, remote_platform, stage_tars_dir):
+        """Deploy ngc-brainbert container.
+
+        With --stage-tars (engine-less), pushes pre-built stage tars + build-remote.
+        """
+        assert_container_deploy(runner, timed_step, "ngc-brainbert",
+                                platform=remote_platform, stage_tars=stage_tars_dir)
 
     def test_verify_sqsh(self, runner):
         """Verify squashfs image exists on remote."""

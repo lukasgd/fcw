@@ -44,6 +44,42 @@ FCW_BASIC_RUN_ID=<hex-id> pytest tests/ --run-e2e -v
 
 The run ID is printed at the start of each run. If tests fail, the output includes a ready-to-copy re-run command.
 
+### Running without a container engine (temporary)
+
+A client with **no podman/docker** can still run the full suite by consuming pre-built
+stage tars produced on a machine that *does* have an engine. With `--stage-tars`, the
+engine-only tests (local `build`/`push`/`list`) are skipped and the sqsh is produced by an
+engine-free push-tar + `build-remote`. Temporary affordance (`--stage-tars` /
+`--prepare-stage-tars`); see the `TODO(temporary)` markers.
+
+> **Use an absolute path** for `--prepare-stage-tars` / `--stage-tars` (e.g. `$PWD/...`). A
+> relative path resolves under pytest's temporary working directory — the suite chdir's
+> into a temp copy of the example — so the tars would not land where you ran pytest.
+
+**Phase 1 — Prepare** (engine box; `FIRECREST_SCRATCH` set to any value — the build is
+local and makes no cluster calls). Examples pin `linux/arm64`, so an x86 host builds under
+QEMU; BrainBERT is a submodule (`git submodule update --init examples/BrainBERT` first):
+
+```bash
+pytest tests/e2e/test_e2e_prepare.py --run-e2e --example basic     --prepare-stage-tars "$PWD/tars-basic"
+pytest tests/e2e/test_e2e_prepare.py --run-e2e --example node-burn --prepare-stage-tars "$PWD/tars-node-burn"
+pytest tests/e2e/test_e2e_prepare.py --run-e2e --example BrainBERT --prepare-stage-tars "$PWD/tars-BrainBERT"
+```
+
+**Phase 2 — Transfer** the tar dirs to the engine-less client:
+
+```bash
+scp -r ./tars-basic ./tars-node-burn ./tars-BrainBERT <client>:/path/to/fcw/
+```
+
+**Phase 3 — Consume** (engine-less client; full FirecREST env, no podman/docker):
+
+```bash
+pytest tests/e2e --run-e2e --example basic     --stage-tars "$PWD/tars-basic"     -v
+pytest tests/e2e --run-e2e --example node-burn --stage-tars "$PWD/tars-node-burn" -v
+pytest tests/e2e --run-e2e --example BrainBERT --stage-tars "$PWD/tars-BrainBERT" -v
+```
+
 ## Test Inventory (36 tests)
 
 ### 1. Config Validation (2 tests)

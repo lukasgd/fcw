@@ -47,9 +47,13 @@ class TestConfigValidation:
 # ---------------------------------------------------------------------------
 
 class TestContainerDeploy:
-    def test_container_deploy(self, runner, timed_step, remote_platform):
-        """Deploy node-burn container (multi-stage build + push + remote build)."""
-        assert_container_deploy(runner, timed_step, "node-burn", platform=remote_platform)
+    def test_container_deploy(self, runner, timed_step, remote_platform, stage_tars_dir):
+        """Deploy node-burn container (multi-stage build + push + remote build).
+
+        With --stage-tars (engine-less), pushes pre-built stage tars + build-remote.
+        """
+        assert_container_deploy(runner, timed_step, "node-burn",
+                                platform=remote_platform, stage_tars=stage_tars_dir)
 
     def test_verify_sqsh(self, runner):
         """Verify squashfs image exists on remote."""
@@ -60,12 +64,14 @@ class TestContainerDeploy:
 # 3. Container build/push/build-remote sequence (decomposed deploy)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.needs_engine
 class TestContainerBuildSequence:
     """The decomposed build -> push -> build-remote path, config-driven.
 
     Complements TestContainerDeploy (the all-in-one path): the `build --save`
     step exercises the multi-stage `_save_image` archive on a real engine, which
-    `deploy` does not reach.
+    `deploy` does not reach. Engine-only, so skipped under --stage-tars (the
+    sqsh is produced by TestContainerDeploy's engine-less branch there).
     """
 
     def test_build_save(self, runner, timed_step, remote_platform, fcw_config, tmp_path):

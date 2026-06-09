@@ -77,8 +77,13 @@ class TestRemoteSetup:
 # 3. Container Build (multi-stage) + Deploy (single-stage)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.needs_engine
 class TestContainerBuildDeploy:
-    """Multi-stage container workflow: build locally, push, build-remote."""
+    """Multi-stage container workflow: build locally, push, build-remote.
+
+    Engine-only (low-level build/push/list-local), so skipped under --stage-tars;
+    TestContainerProvisionEngineless provisions the `app` sqsh there instead.
+    """
 
     def test_container_build_local(self, runner, timed_step, remote_platform):  # TODO: uses low-level CLI - should probably have a test that uses container config as well and make sure it builds local_stage
         """Build download stage locally."""
@@ -133,12 +138,32 @@ class TestContainerBuildDeploy:
         assert_ok(result)
 
 
+@pytest.mark.engineless_only
+class TestContainerProvisionEngineless:
+    """Engine-less consume mode (--stage-tars): provision the `app` container that
+    all jobs use, from pre-built stage tars — replaces the skipped
+    TestContainerBuildDeploy. Runs only under --stage-tars.
+    """
+
+    def test_provision_app(self, runner, timed_step, stage_tars_dir):
+        """Push app's pre-built stage tars + build-remote → app sqsh (no engine)."""
+        assert_container_deploy(runner, timed_step, "app", stage_tars=stage_tars_dir)
+
+    def test_verify_sqsh(self, runner):
+        """Verify app squashfs exists on remote."""
+        assert_sqsh_exists(runner, "ce-images", "ubuntu-fcw-basic+24.04.sqsh")
+
+
 class TestContainerDeploy:
     """Single-command deploy workflow: build + push + import in one step."""
 
-    def test_container_deploy(self, runner, timed_step, remote_platform):
-        """Deploy aux container (build+push+import)."""
-        assert_container_deploy(runner, timed_step, "aux", platform=remote_platform)
+    def test_container_deploy(self, runner, timed_step, remote_platform, stage_tars_dir):
+        """Deploy aux container (build+push+import).
+
+        With --stage-tars (engine-less), pushes pre-built stage tars + build-remote.
+        """
+        assert_container_deploy(runner, timed_step, "aux",
+                                platform=remote_platform, stage_tars=stage_tars_dir)
 
     def test_verify_deploy(self, runner):
         """Verify deployed sqsh exists on remote."""
