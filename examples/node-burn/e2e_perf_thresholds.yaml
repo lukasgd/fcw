@@ -1,0 +1,9 @@
+# Performance thresholds for node-burn e2e tests (seconds).
+
+default:
+  container-deploy: 1200
+  job-node-burn: 1800
+
+lys:
+  container-deploy: 900
+  job-node-burn: 1200
