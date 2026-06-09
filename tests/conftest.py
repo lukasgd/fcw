@@ -40,7 +40,7 @@ SAMPLE_CONFIG_YAML = textwrap.dedent("""\
       preprocess:
         script: slurm/preprocess.sh
         container: app
-        env:
+        env_paths:
           DATA_IN: data/raw
           DATA_OUT: data/processed
       train:
@@ -48,9 +48,11 @@ SAMPLE_CONFIG_YAML = textwrap.dedent("""\
         container: app
         time: "12:00:00"
         nodes: 1
-        env:
+        env_paths:
           DATA_DIR: data/processed
           OUTPUT_DIR: outputs
+        env:
+          EPOCHS: "10"
 """)
 
 

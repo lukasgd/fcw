@@ -34,7 +34,7 @@ jobs:  # Job definitions with environment
   preprocess:
     script: slurm/preprocess.sh
     container: app
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       DATA_IN: data/raw
       DATA_OUT: data/processed
 
@@ -43,7 +43,7 @@ jobs:  # Job definitions with environment
     container: app
     time: "00:30:00"
     nodes: 1
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       DATA_DIR: data/processed
       OUTPUT_DIR: outputs
       CONFIG_DIR: config
@@ -51,5 +51,5 @@ jobs:  # Job definitions with environment
   evaluate:
     script: slurm/evaluate.sh
     container: app
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       MODEL_DIR: outputs

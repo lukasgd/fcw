@@ -84,13 +84,16 @@ containers:  # using multistage Dockerfiles (download and build-offline by defau
 
 jobs:  # Job definitions
        # at submit time, fcw inlines the TOML and resolves the image path automatically.
-       # Env vars with relative paths are expanded to ${workdir.remote}/<path> and
-       # injected as shell defaults (export VAR="${VAR:-value}"), so pre-set env vars
-       # take precedence.
+       # env_paths: path-valued vars — relative values are expanded to
+       #   ${workdir.remote}/<path>.
+       # env: literal vars — passed through untouched.
+       # Both are injected as shell defaults (export VAR="${VAR:-value}"), so pre-set
+       # env vars take precedence. A CLI --set override of a declared env_paths key
+       # is resolved against ${workdir.remote}; any other --set value is literal.
   preprocess:
     script: slurm/preprocess.sh
     container: app-prep  # references a container from the containers section
-    env:
+    env_paths:
       DATA_IN: data/raw
       DATA_OUT: data/processed
 
@@ -99,15 +102,17 @@ jobs:  # Job definitions
     container: app-main
     time: "12:00:00"
     nodes: 2
-    env:
+    env_paths:
       DATA_DIR: data/processed
       CONFIG_DIR: configs
       OUTPUT_DIR: outputs
+    env:
+      EPOCHS: "100"  # literal, not a path
 
   evaluate:
     script: slurm/evaluate.sh
     container: app-main
-    env:
+    env_paths:
       MODEL_DIR: outputs
 ```
 

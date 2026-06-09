@@ -49,6 +49,7 @@ class ContainerConfig:
     """Configuration for a container image."""
     file: str
     tag: str
+    context: Optional[str] = None
     remote_path: Optional[str] = None
     toml: Optional[str] = None
     platform: Optional[str] = None
@@ -77,7 +78,10 @@ class JobConfig:
 
     Attributes:
         script: Path to the SLURM script file.
-        env: Environment variables to inject (name -> value).
+        env: Literal environment variables to inject (name -> value), passed
+            through untouched.
+        env_paths: Path-valued environment variables (name -> path); relative
+            values are resolved against ``workdir.remote`` at submit time.
         time: SBATCH time limit (applied as override, CLI takes precedence).
         nodes: SBATCH node count (applied as override, CLI takes precedence).
         gpus_per_node: SBATCH GPUs per node (applied as override, CLI takes precedence).
@@ -93,6 +97,7 @@ class JobConfig:
     script: str
     container: Optional[str] = None
     env: dict[str, str] = field(default_factory=dict)
+    env_paths: dict[str, str] = field(default_factory=dict)
     time: Optional[str] = None
     nodes: Optional[int] = None
     gpus_per_node: Optional[int] = None
@@ -100,7 +105,9 @@ class JobConfig:
     sbatch: dict[str, Any] = field(default_factory=dict)
 
     # Fields that are not SBATCH options
-    _NON_SBATCH_FIELDS: ClassVar[frozenset[str]] = frozenset({"script", "container", "env"})
+    _NON_SBATCH_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"script", "container", "env", "env_paths"}
+    )
 
     def sbatch_options(self) -> dict[str, str]:
         """Return SBATCH options as a dict suitable for overrides.
@@ -323,6 +330,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
             config.containers[name] = ContainerConfig(
                 file=cont_data.get("file", ""),
                 tag=cont_data.get("tag", ""),
+                context=cont_data.get("context"),
                 remote_path=cont_data.get("remote_path"),
                 toml=cont_data.get("toml"),
                 platform=cont_data.get("platform"),
@@ -338,6 +346,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 script=job_data.get("script", ""),
                 container=job_data.get("container"),
                 env=job_data.get("env", {}),
+                env_paths=job_data.get("env_paths", {}),
                 time=job_data.get("time"),
                 nodes=job_data.get("nodes"),
                 gpus_per_node=job_data.get("gpus_per_node"),
@@ -386,7 +395,7 @@ jobs:
   preprocess:
     script: slurm/preprocess.sh
     container: app
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       DATA_IN: data/raw
       DATA_OUT: data/processed
 
@@ -395,7 +404,7 @@ jobs:
     container: app
     time: "12:00:00"
     nodes: 1
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       DATA_DIR: data/processed
       OUTPUT_DIR: data/outputs
       CONFIG_DIR: config
@@ -403,7 +412,7 @@ jobs:
   evaluate:
     script: slurm/evaluate.sh
     container: app
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       MODEL_DIR: data/outputs
 '''
 
@@ -458,6 +467,8 @@ def add_container_to_config(
     snippet = f"  {name}:\n"
     snippet += f"    file: {container.file}\n"
     snippet += f"    tag: {container.tag}\n"
+    if container.context is not None:
+        snippet += f"    context: {container.context}\n"
     if container.remote_path is not None:
         snippet += f"    remote_path: {container.remote_path}\n"
     if container.toml is not None:
@@ -568,6 +579,8 @@ def add_container_to_config_roundtrip(
     entry = CommentedMap()
     entry["file"] = container.file
     entry["tag"] = container.tag
+    if container.context is not None:
+        entry["context"] = container.context
     if container.remote_path is not None:
         entry["remote_path"] = container.remote_path
     if container.toml is not None:
@@ -632,6 +645,8 @@ def add_job_to_config(config_path: Path, name: str, job: JobConfig) -> None:
         entry["sbatch"] = dict(job.sbatch)
     if job.env:
         entry["env"] = dict(job.env)
+    if job.env_paths:
+        entry["env_paths"] = dict(job.env_paths)
     jobs[name] = entry
     _save_yaml_roundtrip(config_path, ryaml, data)
 
@@ -692,7 +707,7 @@ jobs:
   preprocess:
     script: slurm/preprocess.sh
     container: app
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       DATA_IN: data/raw
       DATA_OUT: data/processed
 
@@ -701,7 +716,7 @@ jobs:
     container: app
     time: "12:00:00"
     nodes: 1
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       DATA_DIR: data/processed
       OUTPUT_DIR: data/outputs
       CONFIG_DIR: config
@@ -709,6 +724,6 @@ jobs:
   evaluate:
     script: slurm/evaluate.sh
     container: app
-    env:
+    env_paths:  # path-valued env vars, resolved against workdir.remote
       MODEL_DIR: data/outputs
 '''

@@ -16,6 +16,7 @@ from fcw.commands.job import (
     _inject_env_vars,
     _job_stream_paths,
     _parse_sbatch_args,
+    _remote_script_name,
     _report_final_state,
     _resolve_job_env,
     _rewrite_environment_path,
@@ -571,25 +572,53 @@ class TestSbatchOverridesCLI:
 
 
 class TestResolveJobEnv:
-    def test_expands_relative_paths(self, sample_config):
+    def test_env_paths_expanded(self, sample_config):
         job_config = sample_config.jobs["preprocess"]
         env = _resolve_job_env(sample_config, job_config, {})
         assert env["DATA_IN"] == "/scratch/user/test-project/data/raw"
         assert env["DATA_OUT"] == "/scratch/user/test-project/data/processed"
 
-    def test_overrides_applied(self, sample_config):
+    def test_env_literals_passed_through(self, sample_config):
+        # Literal env vars must NOT be prepended with the remote workdir.
         job_config = sample_config.jobs["train"]
-        # Relative override values are resolved against remote workdir
-        env = _resolve_job_env(sample_config, job_config, {"EXTRA": "mydir"})
-        assert env["EXTRA"] == "/scratch/user/test-project/mydir"
-        # Absolute override values are preserved as-is
-        env = _resolve_job_env(sample_config, job_config, {"EXTRA": "/abs/path"})
-        assert env["EXTRA"] == "/abs/path"
+        env = _resolve_job_env(sample_config, job_config, {})
+        assert env["EPOCHS"] == "10"
+        # ...while env_paths on the same job are still resolved.
+        assert env["DATA_DIR"] == "/scratch/user/test-project/data/processed"
 
-    def test_override_replaces_config(self, sample_config):
-        job_config = sample_config.jobs["preprocess"]
+    def test_override_of_env_path_key_resolves(self, sample_config):
+        # Overriding a declared env_paths key keeps path semantics.
+        job_config = sample_config.jobs["train"]  # env_paths: DATA_DIR, OUTPUT_DIR
+        env = _resolve_job_env(sample_config, job_config, {"OUTPUT_DIR": "exp/run2"})
+        assert env["OUTPUT_DIR"] == "/scratch/user/test-project/exp/run2"
+
+    def test_override_of_literal_or_new_key_stays_literal(self, sample_config):
+        job_config = sample_config.jobs["train"]  # env: EPOCHS
+        env = _resolve_job_env(
+            sample_config, job_config, {"EPOCHS": "200", "NEWVAR": "rel/path"}
+        )
+        assert env["EPOCHS"] == "200"
+        assert env["NEWVAR"] == "rel/path"
+
+    def test_override_of_env_path_key_absolute_preserved(self, sample_config):
+        job_config = sample_config.jobs["preprocess"]  # env_paths: DATA_IN
         env = _resolve_job_env(sample_config, job_config, {"DATA_IN": "/custom/path"})
         assert env["DATA_IN"] == "/custom/path"
+
+
+class TestRemoteScriptName:
+    def test_config_job_uses_job_name(self):
+        assert _remote_script_name("preprocess", "slurm/preprocess.sh", True) == "preprocess.sh"
+
+    def test_raw_absolute_path_uses_basename(self):
+        # Regression: an absolute path must not be appended to .fcw/scripts/ verbatim
+        # (which produced .fcw/scripts//tmp/.../submit_follow.sh.sh -> 404).
+        assert _remote_script_name(
+            "/tmp/x/submit_follow.sh", "/tmp/x/submit_follow.sh", False
+        ) == "submit_follow.sh"
+
+    def test_raw_relative_sh_no_double_suffix(self):
+        assert _remote_script_name("train.sh", "train.sh", False) == "train.sh"
 
 
 class TestInjectContainerToml:

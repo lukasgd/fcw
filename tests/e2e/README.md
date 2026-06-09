@@ -67,8 +67,8 @@ Tests the advanced workflow: build download stage locally, push tar to cluster, 
 
 | Test | Command | Verifies |
 |------|---------|----------|
-| `test_container_build_local` | `fcw container build --stage download -t ubuntu-fcw-basic:24.04-download -f env/Dockerfile.app .` | Builds the `download` stage locally (has network access, copies project into image). |
-| `test_container_build_save` | `fcw container build --stage download ... --save test-image.tar .` | Builds and exports image to tar file. Confirms tar exists, then cleans up. |
+| `test_container_build_local` | `fcw container build --stage download -t ubuntu-fcw-basic:24.04-download -f env/Dockerfile.app --context .` | Builds the `download` stage locally (has network access, copies project into image). |
+| `test_container_build_save` | `fcw container build --stage download ... --save test-image.tar --context .` | Builds and exports image to tar file. Confirms tar exists, then cleans up. |
 | `test_container_push` | `fcw container push ubuntu-fcw-basic:24.04-download` | Exports image to tar, uploads to `ce-images/` on remote via FirecREST. |
 | `test_container_build_remote` | `fcw container build-remote ... --stage build-offline --enroot --wait` | SLURM job: loads pushed tar into podman, builds offline stage, enroot imports to `ce-images/ubuntu-fcw-basic+24.04.sqsh`. |
 | `test_verify_sqsh` | `fcw data ls ce-images` | Sqsh file exists on remote — multi-stage build produced the expected artifact. |

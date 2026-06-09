@@ -499,33 +499,55 @@ def _inject_env_vars(script_content: str, env_vars: dict[str, str]) -> str:
 
 def _resolve_job_env(config, job_config, overrides: dict[str, str]) -> dict[str, str]:
     """Resolve job environment variables.
-    
-    Expands relative paths against the configured remote workdir and
-    applies any CLI overrides.
-    
+
+    ``env_paths`` values are treated as paths: relative ones are resolved
+    against the configured remote workdir. ``env`` values are literals, passed
+    through untouched. CLI overrides (``--set KEY=VALUE``) win over both and are
+    type-faithful: an override of a declared ``env_paths`` key is resolved as a
+    path (unless already absolute/``$``-prefixed); every other override is
+    literal.
+
     Args:
         config: The FcwConfig object.
         job_config: The JobConfig for this job.
         overrides: CLI-provided overrides (--set KEY=VALUE).
-    
+
     Returns:
         Dict of resolved environment variables.
     """
+    def _resolve_path_value(value: str) -> str:
+        if not value.startswith("/") and not value.startswith("$"):
+            return config.resolve_path(value, remote=True)
+        return value
+
     env = {}
-    
+
+    # Path-valued env vars: resolve relative paths against the remote workdir.
+    for key, value in job_config.env_paths.items():
+        env[key] = _resolve_path_value(value)
+
+    # Literal env vars: passed through untouched.
     for key, value in job_config.env.items():
-        # Expand relative paths
-        if not value.startswith("/") and not value.startswith("$"):  # FIXME: probably we don't need all environment variables to be resolved as remote paths
-            value = config.resolve_path(value, remote=True)
-        env[key] = value
-    
-    # Apply overrides (resolve relative paths the same way as config values)
-    for key, value in overrides.items():
-        if not value.startswith("/") and not value.startswith("$"):  #FIXME: probably we don't need all environment variables to be resolved as remote paths
-            value = config.resolve_path(value, remote=True)
         env[key] = value
 
+    # CLI overrides win; an override of a declared path key stays a path.
+    for key, value in overrides.items():
+        env[key] = _resolve_path_value(value) if key in job_config.env_paths else value
+
     return env
+
+
+def _remote_script_name(job_name: str, script_path: str, is_config_job: bool) -> str:
+    """Remote filename for a ``--remote-script`` upload.
+
+    Config jobs keep the stable, human-readable ``<job_name>.sh``. A raw script
+    path uses the script's basename, so an absolute/relative path isn't appended
+    to ``.fcw/scripts/`` verbatim (which produced a nested, double-``.sh`` path
+    and a 404).
+    """
+    if is_config_job:
+        return f"{job_name}.sh"
+    return os.path.basename(script_path)
 
 
 def _build_container_toml(config: FcwConfig, container_name: str) -> str:
@@ -995,7 +1017,7 @@ def submit_job(
         # SPANK plugin properly, causing srun --environment to segfault)
         if remote_script:
             remote_scripts_dir = f"{working_dir}/.fcw/scripts"
-            remote_filename = f"{job_name}.sh"
+            remote_filename = _remote_script_name(job_name, script_path, job_name in config.jobs)
             client.mkdir(system_name=system, path=remote_scripts_dir, create_parents=True)
             client.upload(
                 system_name=system,

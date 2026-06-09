@@ -55,7 +55,8 @@ class TestLoadConfig:
         assert sample_config.directories["data/processed"].type == DirectoryType.OUT
 
     def test_job_env_parsed(self, sample_config):
-        assert sample_config.jobs["preprocess"].env["DATA_IN"] == "data/raw"
+        assert sample_config.jobs["preprocess"].env_paths["DATA_IN"] == "data/raw"
+        assert sample_config.jobs["train"].env["EPOCHS"] == "10"
         assert sample_config.jobs["train"].time == "12:00:00"
         assert sample_config.jobs["train"].nodes == 1
 
@@ -400,6 +401,7 @@ class TestAddContainerToConfig:
             ContainerConfig(
                 file="./Dockerfile",
                 tag="my-app:v2",
+                context="src/app",
                 remote_path="./ce-images/",
                 toml="./env/container-v2.toml",
             ),
@@ -407,6 +409,7 @@ class TestAddContainerToConfig:
         config = load_config(str(config_path))
         assert "app-v2" in config.containers
         assert config.containers["app-v2"].tag == "my-app:v2"
+        assert config.containers["app-v2"].context == "src/app"
         assert config.containers["app-v2"].toml == "./env/container-v2.toml"
         # Original entries still intact
         assert "app" in config.containers
@@ -586,11 +589,15 @@ class TestAddContainerRoundtrip:
         add_container_to_config_roundtrip(
             config_path,
             "app-v2",
-            ContainerConfig(file="./Dockerfile", tag="my-app:v2", remote_path="./ce-images/"),
+            ContainerConfig(
+                file="./Dockerfile", tag="my-app:v2", context="src/app",
+                remote_path="./ce-images/",
+            ),
         )
         config = load_config(str(config_path))
         assert "app-v2" in config.containers
         assert config.containers["app-v2"].tag == "my-app:v2"
+        assert config.containers["app-v2"].context == "src/app"
         assert "app" in config.containers
 
     def test_duplicate_raises(self, tmp_path, sample_config_yaml):
@@ -667,13 +674,15 @@ class TestAddJobToConfig:
                 script="slurm/bench.sh",
                 time="1:00:00",
                 nodes=2,
-                env={"DATA": "data/raw"},
+                env={"EPOCHS": "10"},
+                env_paths={"DATA": "data/raw"},
             ),
         )
         config = load_config(str(config_path))
         assert config.jobs["benchmark"].time == "1:00:00"
         assert config.jobs["benchmark"].nodes == 2
-        assert config.jobs["benchmark"].env == {"DATA": "data/raw"}
+        assert config.jobs["benchmark"].env == {"EPOCHS": "10"}
+        assert config.jobs["benchmark"].env_paths == {"DATA": "data/raw"}
 
     def test_sbatch_catchall_round_trips(self, tmp_path, sample_config_yaml):
         config_path = tmp_path / "fcw.yaml"

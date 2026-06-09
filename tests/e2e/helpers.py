@@ -70,7 +70,7 @@ def assert_container_build(runner, timed_step, name, *, stage=None, platform=Non
         cmd.extend(["--save", save])
     cmd.append(name)
     if context:
-        cmd.append(context)
+        cmd.extend(["--context", context])
     return invoke(runner, cmd, f"container-build-{name}", timed_step)
 
 

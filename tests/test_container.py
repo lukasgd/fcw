@@ -794,3 +794,36 @@ class TestSaveImage:
             mock_run.return_value = subprocess.CompletedProcess([], 1)
             with pytest.raises(typer.Exit):
                 _save_image("docker", ["a:1"], "out.tar")
+
+
+class TestBuildImageArgs:
+    """build_image positional is name-only; errors before any remote/runtime use."""
+
+    def _write_config(self, tmp_path):
+        (tmp_path / "fcw.yaml").write_text(
+            "project: t\n"
+            "workdir:\n  remote: /r\n  local: .\n"
+            "containers:\n"
+            "  app:\n    file: ./Dockerfile\n    tag: app:latest\n"
+        )
+
+    def test_unknown_name_errors(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+
+        self._write_config(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(app, ["container", "build", "nope"])
+        assert result.exit_code == 1
+        assert "Unknown container: nope" in result.output
+
+    def test_no_tag_no_name_errors(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+
+        self._write_config(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        # Ad-hoc build with --file but no --tag and no config name.
+        result = CliRunner().invoke(app, ["container", "build", "--file", "Dockerfile"])
+        assert result.exit_code == 1
+        assert "No tag specified" in result.output

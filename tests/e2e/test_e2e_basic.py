@@ -88,7 +88,7 @@ class TestContainerBuildDeploy:
         ]
         if remote_platform:
             cmd.extend(["--platform", remote_platform])
-        cmd.append(".")
+        cmd.extend(["--context", "."])
         invoke(runner, cmd, "container-build-local", timed_step)
 
     def test_container_build_save(self, runner, remote_platform):
@@ -101,7 +101,7 @@ class TestContainerBuildDeploy:
         ]
         if remote_platform:
             cmd.extend(["--platform", remote_platform])
-        cmd.append(".")
+        cmd.extend(["--context", "."])
         result = runner.invoke(app, cmd)
         assert_ok(result)
         assert os.path.exists("test-image.tar")

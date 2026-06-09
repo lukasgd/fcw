@@ -587,7 +587,7 @@ def _build_one_stage(
 @app.command("build")
 def build_image(
     ctx: typer.Context,
-    name_or_context: str = typer.Argument(".", help="Container name from config, or build context directory"), # FIXME: this should be just the name, not build context dir (no overlap between these two). It should be optional and default to None. Requires adapting the code below.
+    name: Optional[str] = typer.Argument(None, help="Container name from config"),
     file: Optional[str] = typer.Option(None, "--file", "-f", help="Dockerfile path"),
     tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Image tag"),
     stage: Optional[str] = typer.Option(None, "--stage", help="Build specific stage (or all local_stages if omitted)"),
@@ -598,15 +598,17 @@ def build_image(
 ):
     """Build a container image locally.
 
-    When NAME_OR_CONTEXT matches a container name from fcw.yaml, all build
-    parameters (Dockerfile, tag, platform, build_args) are resolved from
-    config.  CLI flags override config values.
+    When NAME matches a container in fcw.yaml, all build parameters
+    (Dockerfile, tag, platform, build_args, context) are resolved from config.
+    CLI flags override config values.  An unknown NAME is an error.
+
+    The build context comes from --context, then the container's configured
+    ``context``, then ``.``.
 
     Without --stage, builds all local_stages defined in config (default
     is just the download stage).  With --stage, builds only that stage.
 
-    When NAME_OR_CONTEXT is a directory, it is used as the build context
-    (backward-compatible).
+    Without a config NAME, --tag and --file are required.
 
     Examples::
 
@@ -616,29 +618,33 @@ def build_image(
         # Build only the download stage
         fcw container build ngc-brainbert --stage download
 
-        # Legacy: build context directory with explicit flags
-        fcw container build . -f Dockerfile -t my-app:latest --stage download
+        # Ad-hoc build with explicit flags
+        fcw container build -f Dockerfile -t my-app:latest --stage download --context .
     """
     config = load_config((ctx.obj or {}).get("config_file"))
 
-    # Resolve whether name_or_context is a config name or a directory
-    cont_config = config.containers.get(name_or_context) if config.containers else None  # FIXME: throw error if argument was not none, but not found in containers
+    # A positional name, if given, must match a configured container.
+    cont_config = None
+    if name is not None:
+        cont_config = config.containers.get(name) if config.containers else None
+        if cont_config is None:
+            _error().print(f"[red]Unknown container: {name}[/red]")
+            raise typer.Exit(1)
+
     if cont_config:
         resolved_file = file or cont_config.file
         resolved_tag = tag or cont_config.tag
         resolved_platform = platform or cont_config.platform
-        build_context = context or "."  # FIXME: this should default to cont_config.context, i.e. build context needs to be part of the config.
+        build_context = context or cont_config.context or "."
     else:
-        # Treat as build context directory (backward-compatible)
-        build_context = context or name_or_context  # FIXME: should be just context, not name_or_context
         resolved_file = file
         resolved_tag = tag
         resolved_platform = platform
+        build_context = context or "."
 
-    # If no tag yet, try first container from config  # FIXME: rather than just using the first containers tag, throw an error that tag is required.
-    if not resolved_tag and config.containers:
-        first_container = next(iter(config.containers.values()))
-        resolved_tag = first_container.tag
+    if not resolved_tag:
+        _error().print("[red]No tag specified. Use --tag or a container name from fcw.yaml.[/red]")
+        raise typer.Exit(1)
 
     if not resolved_file:
         _error().print("[red]No Dockerfile specified. Use --file or configure in fcw.yaml.[/red]")
@@ -1318,6 +1324,7 @@ def deploy_image(
         None, "--platform", help="Target platform (e.g., linux/amd64)"
     ),
     build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Build-time variables (KEY=VALUE)"),
+    context: Optional[str] = typer.Option(None, "--context", help="Build context directory (default: container's configured context, else '.')"),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for remote build"),
 ):
     """Build, push, and deploy a container using the standard multistage pipeline.
@@ -1355,6 +1362,8 @@ def deploy_image(
     if not dockerfile or not os.path.isfile(dockerfile):
         _error().print(f"[red]Dockerfile not found: {dockerfile}[/red]")
         raise typer.Exit(1)
+
+    build_context = context or (cont_config.context if cont_config else None) or "."
 
     # Determine local stages and remote stage (from config, else defaults).
     # deploy intentionally uses the configured stages; if build/build-remote
@@ -1403,7 +1412,7 @@ def deploy_image(
             stage=stage_name,
             platform=platform,
             build_args=all_build_args,
-            context=".",  # FIXME: this should default to cont_config.context, i.e. build context needs to be part of the config. And it should also be possible to override the build context from the CLI, e.g. with a --context flag.
+            context=build_context,
         )
         stage_tags.append((stage_name, stage_tag))
 
