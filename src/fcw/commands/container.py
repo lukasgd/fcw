@@ -504,6 +504,7 @@ def _resync_container_patches(config: Any, container_name: str, system: str, acc
                         filename=sidecar.name,
                         account=account,
                         blocking=True,
+                        transfer_method="s3",
                     )
                 except Exception:
                     pass
@@ -798,6 +799,7 @@ def _push_one_image(
                     filename=remote_filename,
                     account=account,
                     blocking=True,
+                    transfer_method="s3",
                 )
 
         asyncio.run(do_upload())
@@ -944,6 +946,7 @@ def push_image(
                     filename=remote_filename,
                     account=account,
                     blocking=True,
+                    transfer_method="s3",
                 )
 
         asyncio.run(do_upload())
@@ -1225,6 +1228,7 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
             filename="Dockerfile",
             account=account,
             blocking=True,
+            transfer_method="s3",
         )
 
     asyncio.run(do_upload())
@@ -1453,6 +1457,7 @@ def deploy_image(
             filename="Dockerfile",
             account=account,
             blocking=True,
+            transfer_method="s3",
         )
 
     asyncio.run(do_upload_dockerfile())
@@ -1676,6 +1681,7 @@ exit 0
                     target_path=local_archive,
                     account=account,
                     blocking=True,
+                    transfer_method="s3",
                 )
 
             asyncio.run(do_download())
@@ -1817,6 +1823,7 @@ def patch_container(
                     filename=local_sidecar.name,
                     account=account,
                     blocking=True,
+                    transfer_method="s3",
                 )
             remote_dirs.append(remote_patch_dir)
         return remote_dirs
@@ -1849,6 +1856,7 @@ def patch_container(
             filename=os.path.basename(remote_toml),
             account=account,
             blocking=True,
+            transfer_method="s3",
         )
 
     asyncio.run(do_upload_toml())
@@ -2182,6 +2190,7 @@ ls -lh {q_output_path}
                 filename="Dockerfile",
                 account=account,
                 blocking=True,
+                transfer_method="s3",
             )
 
     asyncio.run(do_upload())

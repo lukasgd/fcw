@@ -710,8 +710,8 @@ class TestBuildContainerToml:
         assert "writable = true" in result
 
     def test_unknown_container_exits(self, config_without_toml):
-        from click.exceptions import Exit
-        with pytest.raises(Exit):
+        import typer
+        with pytest.raises(typer.Exit):
             _build_container_toml(config_without_toml, "nonexistent")
 
 

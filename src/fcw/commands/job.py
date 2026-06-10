@@ -1025,6 +1025,7 @@ def submit_job(
                 directory=remote_scripts_dir,
                 filename=remote_filename,
                 account=account,
+                transfer_method="s3",
             )
             result = client.submit(
                 system_name=system,
@@ -1208,6 +1209,7 @@ def run_command(
                 directory=remote_scripts_dir,
                 filename=remote_filename,
                 account=account,
+                transfer_method="s3",
             )
             result = client.submit(
                 system_name=system,
@@ -1331,6 +1333,7 @@ def job_logs(
                     target_path=local_path,
                     account=account,
                     blocking=True,
+                    transfer_method="s3",
                 )
                 _error().print(f"[green]Downloaded {label} to {local_path}[/green]")
 

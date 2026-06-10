@@ -489,6 +489,7 @@ class FirecrestFS(pyfuse3.Operations):
                             target_path=tmp_path,
                             account=self.account,
                             blocking=True,
+                            transfer_method="s3",
                         )
 
                     os.truncate(tmp_path, attr.st_size)
@@ -502,6 +503,7 @@ class FirecrestFS(pyfuse3.Operations):
                         filename=filename,
                         account=self.account,
                         blocking=True,
+                        transfer_method="s3",
                     )
                 except Exception as e:
                     logger.error(f"Remote truncate failed: {e}")
@@ -745,6 +747,7 @@ class FirecrestFS(pyfuse3.Operations):
                     target_path=buf_name,
                     account=self.account,
                     blocking=True,
+                    transfer_method="s3",
                 )
 
                 # Reopen buffer for read+write (download replaced the file)
@@ -785,6 +788,7 @@ class FirecrestFS(pyfuse3.Operations):
                             target_path=buf_name,
                             account=self.account,
                             blocking=True,
+                            transfer_method="s3",
                         )
 
                         state.buffer = open(buf_name, "rb+")
@@ -827,6 +831,7 @@ class FirecrestFS(pyfuse3.Operations):
                 filename=filename,
                 account=self.account,
                 blocking=True,
+                transfer_method="s3",
             )
 
             # Re-stat to populate cache with new mtime so editors

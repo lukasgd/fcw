@@ -9,6 +9,7 @@ Requires: --run-e2e flag or FCW_E2E=1 environment variable.
 Runs with: --example basic (default).
 """
 
+import glob
 import os
 import re
 
@@ -17,6 +18,7 @@ from helpers import (
     assert_container_deploy,
     assert_data_download,
     assert_data_upload,
+    assert_file_contains_tokens,
     assert_ok,
     assert_remote_ls_contains,
     assert_remote_ls_not_contains,
@@ -368,9 +370,28 @@ class TestJobSubmission:
         """Submit and wait for preprocess job."""
         submit_job("preprocess")
 
-    def test_verify_preprocess(self, runner):
-        """Verify preprocess output exists."""
+    def test_verify_preprocess(self, runner, timed_step):
+        """Verify preprocess output exists and preserved every input file's content.
+
+        preprocess.sh concatenates data/raw/* into preprocessed_files.txt. Each raw
+        file carries a unique FCW-DATA-<hex> marker on its first line; assert all
+        markers survived upload -> cat -> output (order-independent), proving the
+        pipeline preserved content rather than just producing a file of the right name.
+        """
         assert_remote_ls_contains(runner, "data/processed", "preprocessed_files.txt")
+
+        raw_files = sorted(glob.glob(os.path.join("data", "raw", "*.txt")))
+        tokens = []
+        for path in raw_files:
+            with open(path) as f:
+                tokens.append(f.readline().strip())
+
+        assert_data_download(runner, timed_step, "data/processed")
+        assert_file_contains_tokens(
+            os.path.join("data", "processed", "preprocessed_files.txt"),
+            tokens,
+            expected_marker_count=len(tokens),
+        )
 
     def test_submit_train(self, submit_job):
         """Submit and wait for train job."""

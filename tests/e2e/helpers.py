@@ -206,6 +206,24 @@ def assert_remote_ls_not_contains(runner, path, expected):
     assert result.exit_code != 0 or expected not in result.output
 
 
+def assert_file_contains_tokens(local_path, tokens, expected_marker_count=None):
+    """Assert a downloaded file contains every token, with order independence.
+
+    Optionally assert the number of FCW-DATA marker lines equals
+    *expected_marker_count* (one per source file that was concatenated).
+    """
+    with open(local_path) as f:
+        content = f.read()
+    for tok in tokens:
+        assert tok in content, f"Expected token '{tok}' in {local_path}, got:\n{content}"
+    if expected_marker_count is not None:
+        markers = [ln for ln in content.splitlines() if ln.startswith("FCW-DATA-")]
+        assert len(markers) == expected_marker_count, (
+            f"Expected {expected_marker_count} FCW-DATA markers in {local_path}, "
+            f"found {len(markers)}"
+        )
+
+
 def assert_sqsh_exists(runner, ce_images_path, sqsh_name):
     """Verify a .sqsh file exists on remote."""
     args = ["data", "ls", ce_images_path]

@@ -183,6 +183,7 @@ async def _upload_directory(
             filename=".fcw_upload.tar.gz",
             account=account,
             blocking=True,
+            transfer_method="s3",
         )
 
         await client.extract(
@@ -237,6 +238,7 @@ async def _download_directory(
             target_path=local_archive,
             account=account,
             blocking=True,
+            transfer_method="s3",
         )
 
         _extract_dir_archive(local_archive, local_dir)
@@ -283,6 +285,7 @@ async def _upload_incremental(
             filename=".fcw_sync_upload.tar.gz",
             account=account,
             blocking=True,
+            transfer_method="s3",
         )
 
         # Extract on remote
@@ -356,6 +359,7 @@ async def _download_incremental(
             target_path=local_archive,
             account=account,
             blocking=True,
+            transfer_method="s3",
         )
         
         # Extract locally
@@ -441,6 +445,7 @@ def upload(
                             filename=os.path.basename(remote_path),
                             account=account,
                             blocking=True,
+                            transfer_method="s3",
                         )
                     _error().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
             
@@ -524,6 +529,7 @@ def download(
                                 target_path=local_path,
                                 account=account,
                                 blocking=True,
+                                transfer_method="s3",
                             )
                         _error().print(
                             f"[green]Downloaded {remote_path} to {local_path}[/green]"
