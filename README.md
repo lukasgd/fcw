@@ -1,12 +1,12 @@
-# fcw - FirecREST Container Workflows
+# FirecREST Container Workflows
 
-A command-line tool for orchestrating HPC workflows via [FirecREST](https://github.com/eth-cscs/pyfirecrest).
+A command-line tool for orchestrating HPC container workflows via [FirecREST](https://docs.cscs.ch/access/firecrest/) built on [PyFirecREST](https://github.com/eth-cscs/pyfirecrest).
 
 ## Features
 
 - **Container deployment**: Build, deploy, and iterate on container images (mirror bind-mounted patches and rebuild images when stable)
-- **Data transfer**: Directory mirroring with continuous upload/download using direction enforcement (`in`/`out`/`both`)
-- **Job management**: Submit jobs from TOML with SBATCH overrides via `--` separator
+- **Data transfer**: Directory mirroring with continuous upload/download using direction enforcement
+- **Job management**: Declarative definition of SLURM jobs and flexible CLI for submission 
 - **FUSE mount**: Mount remote storage as local filesystem over FirecREST (optional)
 
 ## Installation
@@ -73,13 +73,13 @@ containers:  # using multistage Dockerfiles (download and build-offline by defau
     file: ./env/Dockerfile.main
     tag: my-fcw-app-main:26.03
     remote_path: ce-images/
-    toml: ./env/container.toml  # optional, user-editable enroot environment
+    toml: ./env/app-main-26.03.toml  # optional, user-editable enroot environment
     platform: linux/arm64  # optional, for cross-arch builds (auto-detect if omitted)
   app-prep:
     file: ./env/Dockerfile.prep
     tag: my-fcw-app-prep:26.01
     remote_path: ce-images/
-    toml: ./env/container.toml
+    toml: ./env/app-prep-26.01.toml
     platform: linux/arm64
 
 jobs:  # Job definitions
@@ -102,12 +102,12 @@ jobs:  # Job definitions
     container: app-main
     time: "12:00:00"
     nodes: 2
-    env_paths:
+    env_paths:  # evaluated relative to ${workdir.remote}
       DATA_DIR: data/processed
       CONFIG_DIR: configs
       OUTPUT_DIR: outputs
     env:
-      EPOCHS: "100"  # literal, not a path
+      EPOCHS: "100"  # literal (not interpreted as a path)
 
   evaluate:
     script: slurm/evaluate.sh
@@ -162,11 +162,11 @@ fcw job wait $JOB1
 
 ### Container Management
 
-#### Initial build and deploy
+#### Initial deployment
 
 The build process is distributed across machines - a download stage built on the client that collects the base image(s) and dependencies and a build-offline stage on the remote cluster to build the final image from the dependencies/base image(s).
 
-This can be run end-toend with the command `deploy`, which builds local stages, pushes them, and submits a remote build job according to config in `fcw.yaml`:
+This can be run end-to-end with the command `deploy`, which builds local stages, pushes them, and submits a remote build job according to config in `fcw.yaml`:
 ```bash
 fcw container deploy app-main --wait
 ```
@@ -183,17 +183,17 @@ For customizing the build, these commands allow overriding Dockerfile, tag, plat
 When the client and remote cluster have different CPU architectures
 (e.g., building on x86_64 for an arm64 cluster), `fcw` handles this automatically: `container build` and `container deploy` detect the remote system's architecture via FirecREST and pass `--platform` to podman/docker (set `platform: linux/arm64` in the container config in `fcw.yaml` to skip auto-detection). Furthermore, the remote build step verifies the image architecture matches the compute node.
 
-#### Iterative code development workflow
+#### Iterative code development
 
 For quick iteration without rebuilding the full container:
 
 ```bash
-# extract code from a container stage locally
+# extract code from a container build stage locally
 # (stage defaults to 'download'; override with --stage)
 fcw container extract app-main /workspace/BrainBERT ./code
 ```
 
-`extract` also writes a sidecar `./code.meta.json` recording the stage and
+`extract` also writes a sidecar `./code.meta.json` recording the build stage and
 in-container path. Later commands use this to map patches back to the stage
 they came from.
 
@@ -211,7 +211,7 @@ fcw container patch -c app-main ./code ./configs
 
 Run a test job with the patched container:
 ```bash
-fcw job submit srun --environment env/container.toml python train.py
+fcw job submit --container app-main -- slurm/test.sh
 ```
 
 Repeat edit/patch/test until stable. Then bake the accumulated patches into
@@ -233,11 +233,11 @@ fcw container rebuild app-main --tag app-main:v2 \
     --dump ./code --dump ./configs --wait
 ```
 
-Now you can re-run the same job against the rebuilt container image. The example script appended below automates this workflow.
+Now you can re-run the same job against the rebuilt container image. The example script appended below illustrates this workflow.
 
 ### FUSE Mount (experimental)
 
-Requires installation with FUSE support. Mount directory from remote with:
+This is an experimental feature and requires installation with FUSE support. Mount directory from remote with:
 ```bash
 fcw mount start outputs ./local-outputs
 ```
@@ -254,9 +254,9 @@ fcw mount stop ./local-outputs
 
 ## Example Projects
 
-- **[basic](examples/basic/)** — Minimal example demonstrating the full fcw pipeline. See the [e2e workflow](examples/basic/e2e_workflow.md).
+- **[basic](examples/basic/)** — Minimal example demonstrating a fully fcw-managed pipeline. See the [e2e workflow](examples/basic/e2e_workflow.md).
 - **[node-burn](examples/node-burn/)** — Benchmarking of GEMM operations on CPU and GPU on an HPC cluster analogous to the [CSCS ReFrame test-suite](https://github.com/eth-cscs/cscs-reframe-tests). Demonstrates multi-stage container builds with different build-time vs run-time base images.
-- **[BrainBERT](examples/BrainBERT/)** — End-to-end pre-training of a Transformer model for intra-cranial EEG data on an HPC cluster. Includes multi-stage container build, data transfer and preprocessing, distributed training, and benchmarking (I/O, communication and training throughput). See the [fcw workflow guide](examples/BrainBERT/fcw_e2e_workflow.md).
+- **[BrainBERT](examples/BrainBERT/)** — End-to-end pre-training of a Transformer model for intra-cranial EEG data. Includes multi-stage container build, data transfer and preprocessing, distributed training, and benchmarking (I/O, communication and training throughput). See the [fcw workflow guide](examples/BrainBERT/fcw_e2e_workflow.md).
 
 ## Example: Full Training Workflow
 
@@ -310,7 +310,7 @@ while true; do
     fcw container patch --container my-fcw-app ./code
 
     # Run test job
-    fcw job submit --time 00:30:00 -- slurm/test.sh
+    fcw job submit --container my-fcw-app --time 00:30:00 -- slurm/test.sh
 done
 
 # When satisfied, bake accumulated patches into a new image
@@ -341,9 +341,9 @@ e2e tests require FirecREST credentials (`FIRECREST_URL`, `FIRECREST_CLIENT_ID`,
 
 ```bash
 # Run e2e tests for a given example
-pytest tests/ --run-e2e --example basic --verbose       # default
-pytest tests/ --run-e2e --example node-burn --verbose
-pytest tests/ --run-e2e --example BrainBERT --verbose
+pytest tests/ --run-e2e --example basic -vv       # default
+pytest tests/ --run-e2e --example node-burn -vv
+pytest tests/ --run-e2e --example BrainBERT -vv
 
 # Or via env var
 FCW_E2E=1 pytest tests/ --example BrainBERT
@@ -356,6 +356,25 @@ Run a specific test class (in particular, NCCL tests without the full BrainBERT 
 ```bash
 pytest tests/e2e/test_e2e_brainbert.py::TestBrainBERTNcclTests --run-e2e --example BrainBERT
 ```
+
+#### Clients without a container engine
+
+A client with no podman/docker can still run the full e2e suite by consuming pre-built
+per-stage image tars produced on a machine that *does* have an engine. The suite splits into
+a producer slice (`--prepare-stage-tars`, builds and saves each container's local stages) and
+an engine-free consumer slice (`--stage-tars`, which skips the engine-only tests and instead
+pushes the tars and runs `build-remote`):
+
+```bash
+# On an engine-equipped box: build and save the local stage tars (absolute path required)
+pytest tests/e2e/test_e2e_prepare.py --run-e2e --example basic --prepare-stage-tars "$PWD/tars-basic"
+
+# Transfer tars-basic/ to the engine-less client, then consume them (no podman/docker needed)
+pytest tests/e2e --run-e2e --example basic --stage-tars "$PWD/tars-basic" -v
+```
+
+See [`tests/e2e/README.md`](tests/e2e/README.md) for the full three-phase (prepare →
+transfer → consume) workflow and caveats.
 
 ### Performance tests
 

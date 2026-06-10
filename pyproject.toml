@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "CSCS", email = "help@cscs.ch" }
+    { name = "CSCS", email = "support@cscs.ch" }
 ]
 keywords = ["firecrest", "hpc", "slurm", "workflow", "cli", "fcw"]
 classifiers = [
@@ -52,10 +52,9 @@ dev = [
 fcw = "fcw.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/eth-cscs/fcw"
-Documentation = "https://fcw.readthedocs.io"
-Repository = "https://github.com/eth-cscs/fcw"
-Issues = "https://github.com/eth-cscs/fcw/issues"
+Homepage = "https://github.com/lukasgd/fcw"
+Repository = "https://github.com/lukasgd/fcw"
+Issues = "https://github.com/lukasgd/fcw/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fcw"]
