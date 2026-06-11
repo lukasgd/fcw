@@ -84,6 +84,10 @@ def pytest_addoption(parser):
     parser.addoption("--max-node-hours", type=float, default=None,
                      help="Cap each e2e job at this many node-hours (nodes x walltime) "
                           "via SBATCH overrides; unset = use the job's configured walltime")
+    parser.addoption("--remote-script", action="store_true", default=False,
+                     help="Use `fcw job submit/run --remote-script` for e2e job submission "
+                          "(uploads the script before sbatch; workaround for systems where "
+                          "slurmrestd inline-script submission fails, e.g. lys)")
     # TODO(temporary): remove with the engine-less e2e affordance. Lets a client
     # without a container engine run the suite by consuming pre-built stage tars.
     parser.addoption("--stage-tars", default=None,

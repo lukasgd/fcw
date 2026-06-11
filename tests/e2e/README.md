@@ -34,6 +34,11 @@ pytest tests/ --run-e2e --example basic -v
 
 # Clean up remote workdir after a successful run
 pytest tests/ --run-e2e --cleanup-remote -v
+
+# Use the --remote-script submission path (uploads scripts before sbatch).
+# Default is inline-script submission; opt in on systems where slurmrestd
+# inline submission fails (e.g. lys).
+pytest tests/ --run-e2e --remote-script -v
 ```
 
 Each run creates a fresh remote directory `${FIRECREST_SCRATCH}/fcw-basic-<uuid>`. To reuse an existing one (e.g., to re-run after a partial failure):
@@ -140,24 +145,26 @@ Tests the code iteration workflow: extract code from container, modify locally, 
 
 ### 7. Job Submission (7 tests)
 
-All jobs use `--remote-script` (uploads script before sbatch) and `--wait` (polls until complete, checks final SLURM state).
+All jobs use `--wait` (polls until complete, checks final SLURM state). Submission is
+inline by default; pass `--remote-script` to pytest to upload scripts before sbatch
+instead (the commands below then gain `--remote-script`).
 
 | Test | Command | Verifies |
 |------|---------|----------|
-| `test_submit_preprocess` | `fcw job submit --remote-script --wait -- preprocess` | Runs inside enroot container. Cats `data/raw/*` into `data/processed/preprocessed_files.txt`. |
+| `test_submit_preprocess` | `fcw job submit --wait -- preprocess` | Runs inside enroot container. Cats `data/raw/*` into `data/processed/preprocessed_files.txt`. |
 | `test_verify_preprocess` | `fcw data ls data/processed` | `preprocessed_files.txt` exists. |
-| `test_submit_train` | `fcw job submit --remote-script --wait -- train` | Distributed: 2 nodes, 4 tasks/node. Each rank writes `train_output_<jobid>_rank<N>.txt` to `outputs/`. |
+| `test_submit_train` | `fcw job submit --wait -- train` | Distributed: 2 nodes, 4 tasks/node. Each rank writes `train_output_<jobid>_rank<N>.txt` to `outputs/`. |
 | `test_verify_train` | `fcw data ls outputs` | `train_output_` files exist. |
-| `test_submit_evaluate` | `fcw job submit --remote-script --wait -- evaluate` | Lists model dir, writes `eval_summary_<jobid>.txt` to `outputs/`. |
+| `test_submit_evaluate` | `fcw job submit --wait -- evaluate` | Lists model dir, writes `eval_summary_<jobid>.txt` to `outputs/`. |
 | `test_verify_evaluate` | `fcw data ls outputs` | `eval_summary_` exists. |
-| `test_submit_with_env_override` | `fcw job submit --remote-script --wait --set DATA_OUT=outputs -- preprocess` | Overrides `DATA_OUT` to redirect output to `outputs/`. Relative path resolved to absolute. |
+| `test_submit_with_env_override` | `fcw job submit --wait --set DATA_OUT=outputs -- preprocess` | Overrides `DATA_OUT` to redirect output to `outputs/`. Relative path resolved to absolute. |
 
 ### 8. Job Management (5 tests)
 
 | Test | Command | Verifies |
 |------|---------|----------|
 | `test_job_list` | `fcw job list` | Lists recent SLURM jobs in a table. |
-| `test_job_run_and_wait` | `fcw job run --remote-script -- echo hello` + `fcw job wait <id>` | Submits ad-hoc command, then waits for it via separate `job wait`. |
+| `test_job_run_and_wait` | `fcw job run -- echo hello` + `fcw job wait <id>` | Submits ad-hoc command, then waits for it via separate `job wait`. |
 | `test_job_status` | `fcw job status <id>` | Queries status of the completed ad-hoc job. |
 | `test_job_logs` | `fcw job logs <id>` | Retrieves stdout of the completed ad-hoc job. |
 | `test_job_cancel` | `fcw job run ... -- sleep 600` + `fcw job cancel <id>` | Submits a long-running job, then cancels it. |

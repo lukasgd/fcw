@@ -184,14 +184,14 @@ class TestContainerDeploy:
 class TestContainerIterate:
     """Code iteration workflow: extract from container, patch with bind-mount."""
 
-    def test_job_run_container(self, runner, timed_step):
+    def test_job_run_container(self, runner, timed_step, remote_script_args):
         """`fcw job run --container app -- 'csrun ...'` should inject the TOML + csrun
         shorthand and execute the command inside the container."""
         import uuid
         sentinel = uuid.uuid4().hex
         with timed_step("job-run-container"):
             result = runner.invoke(app, [
-                "job", "run", "--remote-script",
+                "job", "run", *remote_script_args,
                 "--container", "app",
                 "--", f"csrun echo RUN-SENTINEL-{sentinel}",
             ])
@@ -243,7 +243,7 @@ class TestContainerIterate:
         content = open("env/container.toml").read()
         assert ".patches/" in content
 
-    def test_auto_resync_on_run(self, runner, timed_step):  # TODO: could we have both a test with job run and one with job submit + wait, to verify auto-resync works in both cases and since they overwrite the same file a re-resync is covered as well?
+    def test_auto_resync_on_run(self, runner, timed_step, remote_script_args):  # TODO: could we have both a test with job run and one with job submit + wait, to verify auto-resync works in both cases and since they overwrite the same file a re-resync is covered as well?
         """Edit the local dump *without* re-running `patch`, then run a job.
 
         The auto-resync hook in `fcw job run` should incrementally upload
@@ -261,7 +261,7 @@ class TestContainerIterate:
 
             with timed_step("job-run-auto-resync"):
                 result = runner.invoke(app, [
-                    "job", "run", "--remote-script",
+                    "job", "run", *remote_script_args,
                     "--container", "app",
                     "--", "csrun cat /workspace/aux/fcw-resync-sentinel.txt",
                 ])
@@ -409,10 +409,10 @@ class TestJobSubmission:
         """Verify evaluate output exists."""
         assert_remote_ls_contains(runner, "outputs", "eval_summary_")
 
-    def test_submit_with_env_override(self, runner):
+    def test_submit_with_env_override(self, runner, remote_script_args):
         """Submit preprocess with --set to redirect output directory."""
         result = runner.invoke(app, [
-            "job", "submit", "--remote-script", "--wait",
+            "job", "submit", *remote_script_args, "--wait",
             "--set", "DATA_OUT=outputs",
             "--", "preprocess",
         ])
@@ -442,11 +442,11 @@ class TestJobManagement:
         # cluster-wide sacct that is slow / 500s on busy systems (handled
         # gracefully by the command, covered hermetically instead).
 
-    def test_job_run_and_wait(self, runner, shared_state, timed_step):
+    def test_job_run_and_wait(self, runner, shared_state, timed_step, remote_script_args):
         """Run ad-hoc command, then wait for it with 'job wait'."""
         with timed_step("job-run-and-wait"):
             result = runner.invoke(app, [
-                "job", "run", "--remote-script",
+                "job", "run", *remote_script_args,
                 "--", "echo hello-from-fcw-run",
             ])
             assert_ok(result)
@@ -474,10 +474,10 @@ class TestJobManagement:
         if result.exit_code != 0 and "metadata" not in result.output.lower():
             assert_ok(result)
 
-    def test_job_cancel(self, runner):
+    def test_job_cancel(self, runner, remote_script_args):
         """Submit a long-running job and cancel it."""
         result = runner.invoke(app, [
-            "job", "run", "--remote-script",
+            "job", "run", *remote_script_args,
             "--", "sleep 600",
         ])
         assert_ok(result)
@@ -496,20 +496,20 @@ class TestJobRunWaitFollow:
     """`fcw job run` blocking modes: --wait (report on completion) and --follow
     (stream output live until the job finishes)."""
 
-    def test_run_wait(self, runner, timed_step):
+    def test_run_wait(self, runner, timed_step, remote_script_args):
         """--wait blocks until completion and reports the final state."""
         with timed_step("job-run-wait"):
             result = runner.invoke(app, [
-                "job", "run", "--remote-script", "--wait", "--", "echo run-wait-ok",
+                "job", "run", *remote_script_args, "--wait", "--", "echo run-wait-ok",
             ])
         assert_ok(result)
         assert "completed" in result.output.lower()
 
-    def test_run_follow(self, runner, timed_step):
+    def test_run_follow(self, runner, timed_step, remote_script_args):
         """--follow streams the job's output live, then exits on completion."""
         with timed_step("job-run-follow"):
             result = runner.invoke(app, [
-                "job", "run", "--remote-script", "--follow",
+                "job", "run", *remote_script_args, "--follow",
                 "--", "echo run-A; sleep 1; echo run-B",
             ])
         assert_ok(result)
@@ -517,7 +517,7 @@ class TestJobRunWaitFollow:
         assert "run-B" in result.output
         assert "completed" in result.output.lower()
 
-    def test_submit_follow(self, runner, timed_step, tmp_path):
+    def test_submit_follow(self, runner, timed_step, tmp_path, remote_script_args):
         """`job submit --follow` resolves the output path from job metadata,
         streams the script's output live, then exits on completion."""
         script = tmp_path / "submit_follow.sh"
@@ -527,7 +527,7 @@ class TestJobRunWaitFollow:
         )
         with timed_step("job-submit-follow"):
             result = runner.invoke(app, [
-                "job", "submit", "--remote-script", "--follow",
+                "job", "submit", *remote_script_args, "--follow",
                 "--", str(script),
             ])
         assert_ok(result)
@@ -552,15 +552,16 @@ class TestJobLogsStreaming:
     """
 
     @pytest.fixture(scope="class")
-    def streaming_job(self):
+    def streaming_job(self, remote_script):
         """Submit one job that writes distinct stdout/stderr markers, then emits
         a few lines over ~4s. Explicit --error keeps the two streams in separate
         files (plain `fcw job run` only sets --output, combining them)."""
         from typer.testing import CliRunner
 
+        remote_script_args = ["--remote-script"] if remote_script else []
         r = CliRunner()
         result = r.invoke(app, [
-            "job", "run", "--remote-script", "--error", "fcw-run-%j.err", "--",
+            "job", "run", *remote_script_args, "--error", "fcw-run-%j.err", "--",
             "echo OUT_MARKER; echo ERR_MARKER >&2; "
             "for i in 1 2 3 4; do echo follow-line-$i; sleep 1; done",
         ])

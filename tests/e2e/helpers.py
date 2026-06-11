@@ -145,7 +145,7 @@ def save_stage_tars(runner, out_dir):
 
 
 def assert_job_submit(runner, timed_step, job_name, *, step_name=None,
-                      remote_script=True, extra_args=None):
+                      remote_script=False, extra_args=None):
     """Submit a job by config name and wait for completion."""
     cmd = ["job", "submit"]
     if remote_script:
@@ -158,7 +158,7 @@ def assert_job_submit(runner, timed_step, job_name, *, step_name=None,
 
 
 def assert_job_run(runner, timed_step, command, *, step_name="job-run",
-                   remote_script=True, container=None):
+                   remote_script=False, container=None):
     """Run an ad-hoc command via `fcw job run`."""
     cmd = ["job", "run"]
     if remote_script:

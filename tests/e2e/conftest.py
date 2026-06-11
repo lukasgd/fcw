@@ -148,8 +148,20 @@ def stage_tars_dir(request):
     return request.config.getoption("--stage-tars")
 
 
+@pytest.fixture(scope="session")
+def remote_script(request):
+    """Whether e2e job submission uses --remote-script (default: inline submission)."""
+    return request.config.getoption("--remote-script")
+
+
 @pytest.fixture
-def submit_job(runner, timed_step, request, fcw_config):
+def remote_script_args(remote_script):
+    """Splice into inline `runner.invoke` job calls: ['--remote-script'] or []."""
+    return ["--remote-script"] if remote_script else []
+
+
+@pytest.fixture
+def submit_job(runner, timed_step, request, fcw_config, remote_script):
     """Submit a named job, auto-capped at --max-node-hours (nodes x walltime).
 
     Node count comes from the job's fcw.yaml config; with no --max-node-hours flag,
@@ -160,6 +172,7 @@ def submit_job(runner, timed_step, request, fcw_config):
     budget = request.config.getoption("--max-node-hours")
 
     def _submit(job_name, **kwargs):
+        kwargs.setdefault("remote_script", remote_script)
         if budget and job_name in fcw_config.jobs:
             nodes = fcw_config.jobs[job_name].nodes or 1
             minutes = max(1, int(budget / nodes * 60))
