@@ -881,9 +881,10 @@ class TestRunContainerIntegration:
 class _ScriptedClient:
     """Async client stub for _follow_stream tests.
 
-    Each stat() call advances to the next (state, text) snapshot, simulating the
-    remote file and job state evolving over poll cycles. tail() serves byte ranges
-    of the current snapshot, mirroring the FirecREST ``tail -c +N`` semantics.
+    Each stat() call advances to the next (state, text) snapshot, simulating the remote file
+    and job state evolving over poll cycles. The follow loop reads via ranged ``view`` requests
+    (``_get_request``/``_check_response``), which serve exactly ``[offset, offset+size)`` of the
+    current snapshot, mirroring the real endpoint's byte-range semantics.
     """
 
     def __init__(self, snapshots):
@@ -891,6 +892,7 @@ class _ScriptedClient:
         self._i = -1
         self._state = snapshots[0][0]
         self._data = b""
+        self.max_view_bytes = 0  # largest single view output, to assert reads stay bounded
 
     async def job_info(self, system_name, jobid):
         return [{"status": {"state": self._state}}]
@@ -904,18 +906,18 @@ class _ScriptedClient:
 
     async def tail(self, system_name, path, num_bytes=None, num_lines=None,
                    exclude_beginning=False):
-        if exclude_beginning and num_bytes is not None:
-            text = self._data[num_bytes - 1:].decode("utf-8")  # tail -c +N
-            start = num_bytes
-        elif num_lines is not None:
-            text = "\n".join(self._data.decode("utf-8").split("\n")[-num_lines:])
-            start = 1
-        else:
-            text = self._data.decode("utf-8")
-            start = 1
-        # Mirror the real FirecREST tail payload shape (a dict, not a bare string).
-        return {"content": text, "contentType": "bytes",
-                "startPosition": start, "endPosition": -1}
+        # Only used for the tail_only initial snapshot (last N lines).
+        text = "\n".join(self._data.decode("utf-8").split("\n")[-(num_lines or 10):])
+        return {"content": text, "startPosition": 1, "endPosition": -1}
+
+    async def _get_request(self, endpoint, params=None, additional_headers=None):
+        off, size = params["offset"], params["size"]
+        chunk = self._data[off:off + size]  # view [offset, offset+size)
+        self.max_view_bytes = max(self.max_view_bytes, len(chunk))
+        return {"output": chunk.decode("utf-8")}
+
+    def _check_response(self, resp, expected, return_json=True):
+        return resp
 
 
 class TestFollowStream:
@@ -989,6 +991,24 @@ class TestFollowStream:
         await _follow_stream(client, "sys", "42", "/log.out",
                              lines=10, tail_only=False, interval=0)
         assert capsys.readouterr().out == "x\ny\nz\n"
+
+    async def test_large_backlog_drained_in_full(self, capsys, monkeypatch):
+        """A backlog larger than one read is drained in full via ranged view chunks (no skip).
+
+        ``view``'s byte-range read lets the loop walk a > chunk backlog without skipping or
+        exceeding the per-call cap. With the chunk patched to 4, a 9-byte file is read in three
+        bounded view chunks and reassembled exactly.
+        """
+        monkeypatch.setattr("fcw.commands.job.READ_CHUNK_BYTES", 4)
+        snaps = [
+            ("RUNNING", "abcdefgh\n"),      # 9 bytes, chunk 4 -> 3 ranged reads
+            ("COMPLETED", "abcdefgh\n"),
+        ]
+        client = _ScriptedClient(snaps)
+        await _follow_stream(client, "sys", "42", "/log.out",
+                             lines=10, tail_only=False, interval=0)
+        assert capsys.readouterr().out == "abcdefgh\n"   # full content, nothing skipped
+        assert client.max_view_bytes <= 4                # every read stayed under the chunk size
 
 
 class _WaitClient:
@@ -1075,9 +1095,11 @@ class TestFollowStreams:
             async def stat(self, system_name, path):
                 return {"size": 2}
 
-            async def tail(self, system_name, path, num_bytes=None,
-                           num_lines=None, exclude_beginning=False):
-                return {"content": "x\n", "startPosition": 1, "endPosition": -1}
+            async def _get_request(self, endpoint, params=None, additional_headers=None):
+                return {"output": b"x\n"[params["offset"]:params["offset"] + params["size"]].decode()}
+
+            def _check_response(self, resp, expected, return_json=True):
+                return resp
 
         monkeypatch.setattr(job_mod, "get_async_client", _OneShot)
         _follow_streams("sys", "42",

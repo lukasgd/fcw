@@ -61,6 +61,29 @@ _output = get_output_console
 # SLURM states after which a job produces no further output (stop following).
 SLURM_TERMINAL_STATES = SLURM_FAILED_STATES | {"COMPLETED"}
 
+# The follow loop reads a growing log via the `view` endpoint's byte-range parameters
+# (offset+size), which return exactly `[offset, offset+size)` at any offset — a bounded,
+# delta-only read. `view` rejects size >= 5242880 B (5 MiB) with HTTP 400, but in practice large
+# view reads also hit transient SSH-channel errors on some deployments (clariden flaked at 4 MiB,
+# was reliable at 1 MiB), so we use a small chunk; a failed read just retries next poll. The
+# ranged-view read is verified in tests/e2e/test_e2e_view_range.py.
+READ_CHUNK_BYTES = 1 * 1024 * 1024
+
+
+def _log_grace_seconds() -> float:
+    """Seconds to keep waiting for a job's output file to become visible/consistent.
+
+    Covers filesystems (e.g. VAST) where the .out file appears on the login/API
+    node noticeably later than the job's terminal SLURM state — the file is at the
+    SLURM-reported path, just not yet readable via ``tail``/``stat``. On LUSTRE the
+    file is visible immediately, so this grace is never consumed. Override with
+    FCW_LOG_GRACE (set to 0 to restore the old fail-fast behavior).
+    """
+    try:
+        return max(0.0, float(os.environ.get("FCW_LOG_GRACE", "20")))
+    except ValueError:
+        return 20.0
+
 
 class LogStream(str, Enum):
     """Which job output stream(s) `fcw job logs` operates on."""
@@ -107,6 +130,21 @@ def _emit(content: str, prefix: str = "") -> None:
         print(content, end="")
 
 
+async def _view_range(client, system: str, path: str, offset: int, size: int) -> bytes:
+    """Read exactly ``[offset, offset+size)`` of a remote file via the ``view`` endpoint.
+
+    ``view`` accepts ``offset``/``size`` (a true byte-range read) but pyfirecrest's ``view()``
+    wrapper omits them, so we call the endpoint directly. ``size`` must stay under 5 MiB.
+    TODO: drop the private-helper use once pyfirecrest's ``view()`` exposes ``offset``/``size``.
+    """
+    resp = await client._get_request(
+        endpoint=f"/filesystem/{system}/ops/view",
+        params={"path": path, "offset": offset, "size": size},
+    )
+    out = client._check_response(resp, 200)["output"]
+    return (out or "").encode("utf-8")
+
+
 async def _follow_stream(
     client,
     system: str,
@@ -120,10 +158,10 @@ async def _follow_stream(
 ) -> None:
     """Stream a remote file like `tail -f`, until the job reaches a terminal state.
 
-    Tracks an absolute byte offset and reads only the appended delta each poll via
-    ``tail(num_bytes=offset+1, exclude_beginning=True)`` (FirecREST ``tail -c +N``),
-    advancing by the bytes actually read so no content is dropped if the file grows
-    between the ``stat`` and the ``tail``.
+    Tracks an absolute byte offset and each poll drains the appended bytes via ranged ``view``
+    reads (``READ_CHUNK_BYTES`` at a time — bounded under the endpoint's per-call cap, yet
+    delta-only), advancing by the bytes actually read so nothing is dropped or skipped if the
+    file grows between the ``stat`` and the read.
     """
     async def _size() -> int:
         try:
@@ -144,31 +182,44 @@ async def _follow_stream(
     else:
         offset = 0  # first delta read prints the whole file so far
 
+    seen = False  # whether the file has ever been visible to stat
     draining_polls = 0
+    grace = _log_grace_seconds()
+    # Safety cap on post-terminal polls: how many fit in the grace window
+    # (interval may be 0 in tests, where the per-poll snapshots bound the loop).
+    max_drain_polls = max(1, int(grace / interval) + 1) if interval > 0 else max(1, int(grace) + 1)
     while True:
         terminal = await _job_is_terminal(client, system, job_id)
         size = await _size()
-        if size < 0:
+        if size >= 0:
+            seen = True
+        else:
             size = offset
         if size < offset:  # file rotated/truncated
             offset = 0
         grew = size > offset
         if grew:
-            try:
-                text = _tail_content(await client.tail(
-                    system_name=system, path=path,
-                    num_bytes=offset + 1, exclude_beginning=True,
-                ))
-                _emit(text, prefix)
-                offset += len(text.encode("utf-8"))
-            except Exception:
-                pass
+            # Drain the backlog in bounded, delta-only ranged reads. Each chunk is exactly
+            # ``[offset, offset+n)``; advancing by the bytes returned keeps the offset exact and
+            # never skips. A read error (e.g. a transient channel hiccup) breaks the inner loop
+            # and retries from the same offset on the next poll.
+            while offset < size:
+                try:
+                    chunk = await _view_range(
+                        client, system, path, offset, min(READ_CHUNK_BYTES, size - offset))
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                _emit(chunk.decode("utf-8", errors="replace"), prefix)
+                offset += len(chunk)
         if terminal:
-            # The output file can be flushed slightly after SLURM marks the job
-            # terminal; keep draining until a poll shows no new bytes (bounded so
-            # a persistent read error or endless-growth report can't hang us).
+            # Output can lag the terminal SLURM state — on VAST the file may not be
+            # visible yet (see _log_grace_seconds). Keep draining until it has
+            # appeared and shows no new bytes, or the grace window elapses (bounded
+            # so a persistent read error / endless-growth report can't hang us).
             draining_polls += 1
-            if not grew or draining_polls >= 3:
+            if (seen and not grew) or draining_polls >= max_drain_polls:
                 break
         await asyncio.sleep(interval)
 
@@ -1344,20 +1395,29 @@ def job_logs(
         _follow_streams(system, job_id, selected, tail=tail, lines=lines)
         return
 
-    # One-shot read.
+    # One-shot read. The output file can lag the job's terminal state on some
+    # filesystems (e.g. VAST), so retry a not-yet-readable file within the grace
+    # window (see _log_grace_seconds) before reporting an error.
     async def do_read():
         async_client = get_async_client()
+        interval = 2.0
+        attempts = max(1, int(_log_grace_seconds() / interval) + 1)
         for label, path, _ in selected:
             if multi:
                 print(f"==> {label} <==")
-            try:
-                content = _tail_content(await async_client.tail(
-                    system_name=system, path=path,
-                    num_lines=lines if tail else 1000,
-                ))
-                _emit(content)
-            except Exception as e:
-                _error().print(f"[red]Error reading {label}: {e}[/red]")
+            for attempt in range(attempts):
+                try:
+                    content = _tail_content(await async_client.tail(
+                        system_name=system, path=path,
+                        num_lines=lines if tail else 1000,
+                    ))
+                    _emit(content)
+                    break
+                except Exception as e:
+                    if attempt + 1 >= attempts:
+                        _error().print(f"[red]Error reading {label}: {e}[/red]")
+                    else:
+                        await asyncio.sleep(interval)
 
     asyncio.run(do_read())
 

@@ -3,6 +3,7 @@ image = ""
 
 mounts = [
     "${SCRATCH}",
+    "${HOME}",
 ]
 
 workdir = "/workspace/fcw-basic"
