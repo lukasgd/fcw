@@ -1,0 +1,17 @@
+# Runtime data and outputs (declared in fcw.yaml; mounted at job runtime, not built in)
+data/
+outputs/
+config/
+
+# fcw working state (sync markers, build staging) and pushed/saved images
+.fcw/
+ce-images/
+*.tar
+*.sqsh
+
+# Common cruft
+**/__pycache__/
+**/.ipynb_checkpoints/
+.git/
+venv/
+.venv/

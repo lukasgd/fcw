@@ -39,6 +39,15 @@ pytest tests/ --run-e2e --cleanup-remote -v
 # Default is inline-script submission; opt in on systems where slurmrestd
 # inline submission fails (e.g. lys).
 pytest tests/ --run-e2e --remote-script -v
+
+# Stop after the first few failures (the suite is dependency-chained, so a
+# single early failure tends to cascade — fail fast instead of running all).
+pytest tests/ --run-e2e --maxfail=3 -v
+
+# Put the temp example copy somewhere with more space (the suite chdir's into a
+# temp copy of the example under pytest's basetemp). On hosts where the default
+# /tmp is small or memory-backed (tmpfs), redirect it to a roomier disk.
+pytest tests/ --run-e2e --basetemp=/path/to/large/disk/pytest-tmp -v
 ```
 
 Each run creates a fresh remote directory `${FIRECREST_SCRATCH}/fcw-basic-<uuid>`. To reuse an existing one (e.g., to re-run after a partial failure):
@@ -139,7 +148,7 @@ Tests the code iteration workflow: extract code from container, modify locally, 
 | Test | Command | Verifies |
 |------|---------|----------|
 | `test_upload_data` | `fcw data upload data/raw` | Uploads test data files. Respects directory type enforcement (`data/raw` is type `in`). |
-| `test_verify_data` | `fcw data ls data/raw -R` | `test.txt` visible on remote. |
+| `test_verify_data` | `fcw data ls data/raw -R` | `test_1.txt` visible on remote. |
 | `test_upload_incremental` | `fcw data upload --incremental data/raw` | Re-upload skips unchanged files (uses `.fcw/sync/` timestamp markers). |
 | `test_data_status` | `fcw data status` | Reports sync status for all configured directories. |
 

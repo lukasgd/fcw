@@ -10,7 +10,7 @@ import pytest
 
 import firecrest
 
-from fcw.core import load_config, get_client, get_async_client, get_system, get_account
+from fcw.core import load_config, get_client, get_async_client, get_system, get_account, DirectoryType
 sys.path.insert(0, os.path.dirname(__file__))
 from perf import TimingCollector, load_thresholds, timed_step as _timed_step  # noqa: E402
 
@@ -24,11 +24,22 @@ def pytest_configure(config):
     config._perf_collector = TimingCollector()
 
 
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Track whether any test in the session has failed."""
+    """Track session failures and, on a failed test, point at the run's workdirs."""
     global _session_failed
-    if call.when == "call" and call.excinfo is not None:
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call" and report.failed:
         _session_failed = True
+        info = getattr(item.config, "_e2e_workdir_info", None)
+        if info:
+            report.sections.append((
+                "E2E workdir",
+                f"local:  {info['local']}\n"
+                f"remote: {info['remote']}\n"
+                f"re-run: {info['rerun']}",
+            ))
 
 
 @pytest.fixture(scope="session")
@@ -43,12 +54,9 @@ def example_workdir(request, tmp_path_factory):
     if not os.path.isdir(source):
         pytest.skip(f"Example '{example_name}' not found at {source}")
 
-    tmp_dir = tmp_path_factory.mktemp(f"e2e-{example_name}")
-    workdir = tmp_dir / example_name
-    shutil.copytree(source, workdir)
-
     # Set a unique run ID so ${FCW_<EXAMPLE>_RUN_ID} in fcw.yaml resolves to a fresh remote dir.
     # If already set by the user, reuse it (allows re-running against the same remote dir).
+    # Set before load_config so the config's ${FCW_<EXAMPLE>_RUN_ID} expands.
     run_id_var = f"FCW_{example_name.upper().replace('-', '_')}_RUN_ID"
     generated_id = False
     if run_id_var not in os.environ:
@@ -58,12 +66,46 @@ def example_workdir(request, tmp_path_factory):
     run_id = os.environ[run_id_var]
     print(f"\nE2E: {run_id_var}={run_id}")
 
+    # Load config from the source to learn which directories are upload-only (type: in).
+    config = load_config(os.path.join(source, "fcw.yaml"))
+    in_dirs = [n for n, dc in config.directories.items() if dc.type == DirectoryType.IN]
+
+    # type: in directories are upload-only — never written on the client — so they
+    # need no writable copy. Skip them (they can be huge, e.g. BrainBERT's
+    # braintreebank.dev ~136 GB) and symlink them in instead; uploads read them in
+    # place. symlinks=True also preserves any stray symlink in a non-input dir.
+    # Map each input dir to {parent dir -> basenames to skip} so copytree skips it at
+    # the right depth — directory keys may be nested (e.g. basic's "data/raw").
+    skip_at: dict[str, set[str]] = {}
+    for rel in in_dirs:
+        parent = os.path.abspath(os.path.join(source, os.path.dirname(rel)))
+        skip_at.setdefault(parent, set()).add(os.path.basename(rel))
+
+    def _ignore_inputs(d, names):
+        return skip_at.get(os.path.abspath(d), set()) & set(names)
+
+    tmp_dir = tmp_path_factory.mktemp(f"e2e-{example_name}")
+    workdir = tmp_dir / example_name
+    shutil.copytree(source, workdir, symlinks=True, ignore=_ignore_inputs)
+
+    for rel in in_dirs:
+        target = os.path.realpath(os.path.join(source, rel))  # resolves source-side symlinks
+        if os.path.exists(target):
+            link = workdir / rel
+            link.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(target, link)
+
     old_cwd = os.getcwd()
     os.chdir(workdir)
 
-    # Load config to show resolved remote workdir
-    config = load_config(os.path.join(str(workdir), "fcw.yaml"))
     print(f"E2E: Remote workdir: {config.workdir.remote}")
+
+    # Surface the run's workdirs under each failing test (see pytest_runtest_makereport).
+    request.config._e2e_workdir_info = {
+        "local": str(workdir),
+        "remote": config.workdir.remote,
+        "rerun": f"{run_id_var}={run_id} pytest tests/ --run-e2e -v",
+    }
 
     yield workdir
 
@@ -181,6 +223,16 @@ def submit_job(runner, timed_step, request, fcw_config, remote_script):
         return assert_job_submit(runner, timed_step, job_name, **kwargs)
 
     return _submit
+
+
+@pytest.fixture
+def build_time_args(request):
+    """`--time` args capping remote build jobs (1 node) at --max-node-hours; [] if unset."""
+    budget = request.config.getoption("--max-node-hours")
+    if not budget:
+        return []
+    minutes = max(1, int(budget * 60))
+    return ["--time", f"{minutes}:00"]
 
 
 @pytest.fixture(scope="session")

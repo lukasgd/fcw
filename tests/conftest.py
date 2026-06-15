@@ -99,6 +99,13 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    # Resolve path options to absolute while cwd is still the invocation dir, so they
+    # survive example_workdir chdir'ing into a temp dir (relative paths would break).
+    for opt in ("stage_tars", "prepare_stage_tars"):
+        val = getattr(config.option, opt)
+        if val:
+            setattr(config.option, opt, os.path.abspath(val))
+
     config.addinivalue_line("markers", "example(name): select which example project this test targets")
     config.addinivalue_line("markers", "needs_engine: requires a local container engine (skipped under --stage-tars)")
     config.addinivalue_line("markers", "engineless_only: only runs in engine-less consume mode (requires --stage-tars)")

@@ -79,7 +79,7 @@ fcw data upload data/raw
 ```bash
 fcw data ls data/raw -R
 ```
-Should show `test.txt` and `test_1.txt` through `test_6.txt` on the remote side.
+Should show `test_1.txt` through `test_6.txt` on the remote side.
 
 ## Step 4: Submit Jobs
 

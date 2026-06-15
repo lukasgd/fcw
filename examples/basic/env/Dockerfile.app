@@ -16,4 +16,4 @@ COPY --from=download-copy /workspace/fcw-basic /workspace/fcw-basic
 
 WORKDIR /workspace/fcw-basic
 
-RUN cat data/raw/test.txt
+RUN cat code/test.py

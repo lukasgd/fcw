@@ -5,7 +5,7 @@ FROM ${BASE_IMAGE} AS download
 
 WORKDIR /workspace/aux
 
-COPY data/raw/test.txt /workspace/aux/test.txt
+COPY code/test.py /workspace/aux/test.py
 
 
 FROM ${DOWNLOAD_IMAGE} AS download-copy
@@ -16,4 +16,4 @@ COPY --from=download-copy /workspace/aux /workspace/aux
 
 WORKDIR /workspace/aux
 
-RUN cat test.txt
+RUN cat test.py

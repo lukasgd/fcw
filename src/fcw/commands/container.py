@@ -983,6 +983,7 @@ def import_image(
     ctx: typer.Context,
     image: str = typer.Argument(..., help="Image tag or remote tar file path"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path for squashfs"),
+    time: str = typer.Option("01:00:00", "--time", help="SLURM walltime for the import job"),
 ):
     """Import a container image with enroot on the remote cluster.
 
@@ -1004,7 +1005,7 @@ def import_image(
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-import
-#SBATCH --time=01:00:00
+#SBATCH --time={time}
 #SBATCH --nodes=1
 #SBATCH --output=fcw-container-import-%j.out
 {format_sbatch_lines(get_global_sbatch_options())}
@@ -1137,6 +1138,7 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
     build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Build-time variables (KEY=VALUE)"),
     enroot: bool = typer.Option(False, "--enroot", help="Convert final image to enroot squashfs"), # FIXME: additionally enable pushing to registry
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path for enroot squashfs"),
+    time: str = typer.Option("01:00:00", "--time", help="SLURM walltime for the build job"),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for job completion"),
 ):
     """Build a container image on the remote cluster via a SLURM job.
@@ -1251,7 +1253,7 @@ def build_remote(  # FIXME: ce-images/ is used repeatedly as default remote dir 
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-build-remote
-#SBATCH --time=01:00:00
+#SBATCH --time={time}
 #SBATCH --nodes=1
 #SBATCH --output=fcw-container-build-remote-%j.out
 #SBATCH --error=fcw-container-build-remote-%j.out
@@ -1329,6 +1331,7 @@ def deploy_image(
     ),
     build_arg: Optional[List[str]] = typer.Option(None, "--build-arg", help="Build-time variables (KEY=VALUE)"),
     context: Optional[str] = typer.Option(None, "--context", help="Build context directory (default: container's configured context, else '.')"),
+    time: str = typer.Option("01:00:00", "--time", help="SLURM walltime for the remote build job"),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for remote build"),
 ):
     """Build, push, and deploy a container using the standard multistage pipeline.
@@ -1479,7 +1482,7 @@ def deploy_image(
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-deploy
-#SBATCH --time=01:00:00
+#SBATCH --time={time}
 #SBATCH --nodes=1
 #SBATCH --output=fcw-container-deploy-%j.out
 #SBATCH --error=fcw-container-deploy-%j.out
@@ -1924,6 +1927,7 @@ def rebuild_container(
     cleanup: bool = typer.Option(
         True, "--cleanup/--no-cleanup", help="Remove remote .patches/ after rebuild"
     ),
+    time: str = typer.Option("01:00:00", "--time", help="SLURM walltime for the rebuild job"),
     wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for job completion"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print SLURM script without submitting"),
 ) -> None:
@@ -2107,7 +2111,7 @@ echo "Committed patched stage '{stage}' as {patched_tag} (ID: ${var}_ID)"
 
     script = f"""#!/bin/bash -l
 #SBATCH --job-name=fcw-container-rebuild
-#SBATCH --time=01:00:00
+#SBATCH --time={time}
 #SBATCH --nodes=1
 #SBATCH --output=fcw-container-rebuild-%j.out
 #SBATCH --error=fcw-container-rebuild-%j.out

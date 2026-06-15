@@ -13,5 +13,5 @@ set -euxo pipefail
 mkdir -p ${DATA_OUT}
 
 srun -ul --environment ${FCW_CONTAINER_TOML} bash -c "
-    cat ${DATA_IN}/* > ${DATA_OUT}/preprocessed_files.txt
+    cat ${DATA_IN}/*.txt > ${DATA_OUT}/preprocessed_files.txt
 "

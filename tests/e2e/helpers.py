@@ -85,13 +85,14 @@ def assert_container_push(runner, timed_step, name, *, platform=None):
     return invoke(runner, cmd, "container-push", timed_step)
 
 
-def assert_container_build_remote(runner, timed_step, name, **kwargs):
+def assert_container_build_remote(runner, timed_step, name, *, extra_args=None):
     """Build a container on the remote cluster."""
-    cmd = ["container", "build-remote", name, "--enroot", "--wait"]
+    cmd = ["container", "build-remote", name, "--enroot", "--wait", *(extra_args or [])]
     return invoke(runner, cmd, "container-build-remote", timed_step)
 
 
-def assert_container_deploy(runner, timed_step, name, *, platform=None, stage_tars=None):
+def assert_container_deploy(runner, timed_step, name, *, platform=None, stage_tars=None,
+                            extra_args=None):
     """Deploy a container (build + push + remote build in one step).
 
     When *stage_tars* is set (engine-less consume mode), the local build+push is
@@ -99,8 +100,9 @@ def assert_container_deploy(runner, timed_step, name, *, platform=None, stage_ta
     remote build — no container engine required on this machine. Temporary.
     """
     if stage_tars:
-        return _provision_from_stage_tars(runner, timed_step, name, stage_tars)
-    cmd = ["container", "deploy", name, "--wait"]
+        return _provision_from_stage_tars(runner, timed_step, name, stage_tars,
+                                          extra_args=extra_args)
+    cmd = ["container", "deploy", name, "--wait", *(extra_args or [])]
     if platform:
         cmd.extend(["--platform", platform])
     return invoke(runner, cmd, "container-deploy", timed_step)
@@ -111,7 +113,7 @@ def _stage_tar_name(stage_tag: str) -> str:
     return stage_tag.replace(":", "+").replace("/", "+") + ".tar"
 
 
-def _provision_from_stage_tars(runner, timed_step, name, stage_tars):
+def _provision_from_stage_tars(runner, timed_step, name, stage_tars, *, extra_args=None):
     """Engine-less provisioning: push pre-built per-stage tars, then build-remote.
 
     Uses the legacy engine-free ``push <tar>`` path; the trailing slash on ``--to``
@@ -124,7 +126,8 @@ def _provision_from_stage_tars(runner, timed_step, name, stage_tars):
         tar = os.path.join(stage_tars, _stage_tar_name(cont.stage_tag(stage)))
         invoke(runner, ["container", "push", tar, "--to", images_dir + "/"],
                f"container-push-tar-{stage}", timed_step)
-    return invoke(runner, ["container", "build-remote", name, "--enroot", "--wait"],
+    return invoke(runner,
+                  ["container", "build-remote", name, "--enroot", "--wait", *(extra_args or [])],
                   "container-build-remote", timed_step)
 
 

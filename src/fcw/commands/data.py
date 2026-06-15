@@ -160,7 +160,11 @@ async def _upload_directory(
     follow_symlinks: bool = False,
 ) -> None:
     """Upload a local directory by tar → upload → extract on remote."""
-    local_dir = os.path.abspath(local_dir)
+    # Preserve the logical name for the remote layout (= basename(remote_dir)), but
+    # follow a symlinked directory argument to its target so we archive the real
+    # contents rather than a lone (dangling-on-remote) symlink member.
+    arcname = os.path.basename(os.path.abspath(local_dir).rstrip(os.sep))
+    local_dir = os.path.realpath(local_dir)
     extract_target = os.path.dirname(remote_dir.rstrip("/"))
 
     # Ensure the parent directory exists on remote
@@ -173,7 +177,7 @@ async def _upload_directory(
         archive_path = os.path.join(tmpdir, "fcw_upload.tar.gz")
 
         with tarfile.open(archive_path, "w:gz", dereference=follow_symlinks) as tar:
-            tar.add(local_dir, arcname=os.path.basename(local_dir.rstrip(os.sep)))
+            tar.add(local_dir, arcname=arcname)
 
         remote_archive = extract_target.rstrip("/") + "/.fcw_upload.tar.gz"
         await client.upload(
@@ -261,7 +265,9 @@ async def _upload_incremental(
 
     Returns number of files uploaded.
     """
-    local_dir = os.path.abspath(local_dir)
+    # Dereference a symlinked directory argument to its target (matches
+    # _upload_directory) so we sync the real files, not a lone symlink.
+    local_dir = os.path.realpath(local_dir)
     last_sync = _read_last_sync_timestamp(local_dir, "push")
     files = _collect_local_files_since(local_dir, last_sync, follow_symlinks)
     

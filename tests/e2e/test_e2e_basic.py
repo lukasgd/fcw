@@ -122,12 +122,12 @@ class TestContainerBuildDeploy:
         cmd.append("ubuntu-fcw-basic:24.04-download")
         invoke(runner, cmd, "container-push", timed_step)
 
-    def test_container_build_remote(self, runner, timed_step):  # TODO: uses low-level CLI - should probably have a test that uses container config as well
+    def test_container_build_remote(self, runner, timed_step, build_time_args):  # TODO: uses low-level CLI - should probably have a test that uses container config as well
         """Build offline stage on cluster + enroot import."""
         invoke(runner, [
             "container", "build-remote", "ubuntu-fcw-basic:24.04-download",
             "-f", "env/Dockerfile.app", "-t", "ubuntu-fcw-basic:24.04",
-            "--stage", "build-offline", "--enroot", "--wait",
+            "--stage", "build-offline", "--enroot", "--wait", *build_time_args,
         ], "container-build-remote", timed_step)
 
     def test_verify_sqsh(self, runner):
@@ -147,9 +147,10 @@ class TestContainerProvisionEngineless:
     TestContainerBuildDeploy. Runs only under --stage-tars.
     """
 
-    def test_provision_app(self, runner, timed_step, stage_tars_dir):
+    def test_provision_app(self, runner, timed_step, stage_tars_dir, build_time_args):
         """Push app's pre-built stage tars + build-remote → app sqsh (no engine)."""
-        assert_container_deploy(runner, timed_step, "app", stage_tars=stage_tars_dir)
+        assert_container_deploy(runner, timed_step, "app", stage_tars=stage_tars_dir,
+                                extra_args=build_time_args)
 
     def test_verify_sqsh(self, runner):
         """Verify app squashfs exists on remote."""
@@ -159,13 +160,15 @@ class TestContainerProvisionEngineless:
 class TestContainerDeploy:
     """Single-command deploy workflow: build + push + import in one step."""
 
-    def test_container_deploy(self, runner, timed_step, remote_platform, stage_tars_dir):
+    def test_container_deploy(self, runner, timed_step, remote_platform, stage_tars_dir,
+                              build_time_args):
         """Deploy aux container (build+push+import).
 
         With --stage-tars (engine-less), pushes pre-built stage tars + build-remote.
         """
         assert_container_deploy(runner, timed_step, "aux",
-                                platform=remote_platform, stage_tars=stage_tars_dir)
+                                platform=remote_platform, stage_tars=stage_tars_dir,
+                                extra_args=build_time_args)
 
     def test_verify_deploy(self, runner):
         """Verify deployed sqsh exists on remote."""
@@ -216,10 +219,10 @@ class TestContainerIterate:
             "--wait",
         ], "container-extract", timed_step)
         assert os.path.isdir("extracted-code")
-        # Contents land de-nested: /workspace/aux/test.txt -> extracted-code/test.txt,
-        # not extracted-code/aux/test.txt (the basename wrapper must be gone, so the
+        # Contents land de-nested: /workspace/aux/test.py -> extracted-code/test.py,
+        # not extracted-code/aux/test.py (the basename wrapper must be gone, so the
         # dump root maps directly onto the container path for patch/rebuild).
-        assert os.path.isfile("extracted-code/test.txt")
+        assert os.path.isfile("extracted-code/test.py")
         assert not os.path.exists("extracted-code/aux")
         sidecar = "extracted-code.meta.json"
         assert os.path.exists(sidecar)
@@ -311,12 +314,12 @@ class TestContainerRebuild:
         assert "fcw-container-rebuild" in result.output
         assert "podman" in result.output
 
-    def test_container_rebuild(self, runner, timed_step):
+    def test_container_rebuild(self, runner, timed_step, build_time_args):
         """Full rebuild: bake patches, create new TOML and config entry."""
         invoke(runner, [
             "container", "rebuild", "app",
             "--tag", "ubuntu-fcw-basic:v2",
-            "--enroot", "--wait",
+            "--enroot", "--wait", *build_time_args,
         ], "container-rebuild", timed_step)
         from fcw.core.config import load_config
         config = load_config("fcw.yaml")
@@ -349,7 +352,7 @@ class TestDataUpload:
 
     def test_verify_data(self, runner):
         """Verify data on remote."""
-        assert_remote_ls_contains(runner, "data/raw", "test.txt")
+        assert_remote_ls_contains(runner, "data/raw", "test_1.txt")
 
     def test_upload_incremental(self, runner, timed_step):
         """Re-upload with --incremental (should skip unchanged files)."""

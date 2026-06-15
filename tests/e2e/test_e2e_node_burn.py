@@ -47,13 +47,15 @@ class TestConfigValidation:
 # ---------------------------------------------------------------------------
 
 class TestContainerDeploy:
-    def test_container_deploy(self, runner, timed_step, remote_platform, stage_tars_dir):
+    def test_container_deploy(self, runner, timed_step, remote_platform, stage_tars_dir,
+                              build_time_args):
         """Deploy node-burn container (multi-stage build + push + remote build).
 
         With --stage-tars (engine-less), pushes pre-built stage tars + build-remote.
         """
         assert_container_deploy(runner, timed_step, "node-burn",
-                                platform=remote_platform, stage_tars=stage_tars_dir)
+                                platform=remote_platform, stage_tars=stage_tars_dir,
+                                extra_args=build_time_args)
 
     def test_verify_sqsh(self, runner):
         """Verify squashfs image exists on remote."""
@@ -92,9 +94,10 @@ class TestContainerBuildSequence:
         """Push all local stages to remote."""
         assert_container_push(runner, timed_step, "node-burn", platform=remote_platform)
 
-    def test_build_remote(self, runner, timed_step):
+    def test_build_remote(self, runner, timed_step, build_time_args):
         """Build offline stage on the cluster + enroot import."""
-        assert_container_build_remote(runner, timed_step, "node-burn")
+        assert_container_build_remote(runner, timed_step, "node-burn",
+                                      extra_args=build_time_args)
 
     def test_verify_sqsh(self, runner):
         """Verify squashfs image exists on remote."""
