@@ -68,14 +68,22 @@ def get_global_sbatch_options() -> dict[str, str]:
     Currently supports:
         FIRECREST_RESERVATION -> --reservation
         FIRECREST_PARTITION -> --partition
+        FIRECREST_NODELIST -> --nodelist
+        FIRECREST_EXCLUDE -> --exclude
     """
     opts: dict[str, str] = {}
     reservation = os.environ.get("FIRECREST_RESERVATION")
     partition = os.environ.get("FIRECREST_PARTITION")
+    nodelist = os.environ.get("FIRECREST_NODELIST")
+    exclude = os.environ.get("FIRECREST_EXCLUDE")
     if reservation:
         opts["reservation"] = reservation
     if partition:
         opts["partition"] = partition
+    if nodelist:
+        opts["nodelist"] = nodelist
+    if exclude:
+        opts["exclude"] = exclude
     return opts
 
 

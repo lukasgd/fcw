@@ -411,6 +411,8 @@ def _validate_local(ctx: typer.Context, errors: list[str], warnings: list[str]):
         "FIRECREST_SCRATCH",
         "FIRECREST_RESERVATION",
         "FIRECREST_PARTITION",
+        "FIRECREST_NODELIST",
+        "FIRECREST_EXCLUDE",
     ]
     for var in optional_vars:
         if os.environ.get(var):

@@ -71,6 +71,12 @@ class TestApplySbatchOverrides:
         assert "#SBATCH --time=12:00:00" in result
         assert "#SBATCH --nodes=4" in result
 
+    def test_node_selection_overrides(self):
+        """Node include/exclude render as #SBATCH directives (e.g. from FIRECREST_NODELIST/EXCLUDE)."""
+        result = _apply_sbatch_overrides(SAMPLE_SCRIPT, {"nodelist": "nid001", "exclude": "nid002"})
+        assert "#SBATCH --nodelist=nid001" in result
+        assert "#SBATCH --exclude=nid002" in result
+
     def test_flag_renders_bare(self):
         """An empty-string value is a valueless flag: `#SBATCH --exclusive` (no '=')."""
         result = _apply_sbatch_overrides(SAMPLE_SCRIPT, {"exclusive": ""})

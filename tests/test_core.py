@@ -23,22 +23,44 @@ class TestSlurmFailedStates:
 
 
 class TestGetGlobalSbatchOptions:
+    _all_vars = (
+        "FIRECREST_RESERVATION",
+        "FIRECREST_PARTITION",
+        "FIRECREST_NODELIST",
+        "FIRECREST_EXCLUDE",
+    )
+
+    def _clear(self, monkeypatch):
+        for var in self._all_vars:
+            monkeypatch.delenv(var, raising=False)
+
     def test_empty_when_no_env(self, monkeypatch):
-        monkeypatch.delenv("FIRECREST_RESERVATION", raising=False)
-        monkeypatch.delenv("FIRECREST_PARTITION", raising=False)
+        self._clear(monkeypatch)
         assert get_global_sbatch_options() == {}
 
     def test_reservation_from_env(self, monkeypatch):
-        monkeypatch.delenv("FIRECREST_PARTITION", raising=False)
+        self._clear(monkeypatch)
         monkeypatch.setenv("FIRECREST_RESERVATION", "my-reservation")
         opts = get_global_sbatch_options()
         assert opts == {"reservation": "my-reservation"}
 
     def test_partition_from_env(self, monkeypatch):
-        monkeypatch.delenv("FIRECREST_RESERVATION", raising=False)
+        self._clear(monkeypatch)
         monkeypatch.setenv("FIRECREST_PARTITION", "debug")
         opts = get_global_sbatch_options()
         assert opts == {"partition": "debug"}
+
+    def test_nodelist_from_env(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("FIRECREST_NODELIST", "nid001234")
+        opts = get_global_sbatch_options()
+        assert opts == {"nodelist": "nid001234"}
+
+    def test_exclude_from_env(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("FIRECREST_EXCLUDE", "nid00[5-9]")
+        opts = get_global_sbatch_options()
+        assert opts == {"exclude": "nid00[5-9]"}
 
 
 class TestFormatSbatchLines:
