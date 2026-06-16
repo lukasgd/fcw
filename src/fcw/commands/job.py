@@ -1283,16 +1283,20 @@ def run_command(
         os.unlink(script_path)
 
     if follow:
-        # stdout/stderr are combined into the single --output file for run jobs.
-        # NOTE: SLURM filename patterns (%j, %x, %N, %A_%a, ...) are only handled
-        # best-effort here (%j). The FirecREST API returns these paths
-        # inconsistently / unexpanded — consistent expansion should be fixed
-        # upstream in the API, not worked around in fcw.
-        out = sbatch_final.get("output", "fcw-run-%j.out").replace("%j", job_id)
-        stdout_path = out if os.path.isabs(out) else f"{working_dir}/{out}"
-        _error().print(f"[dim]Following job {job_id} (Ctrl-C to stop)...[/dim]")
-        _follow_streams(system, job_id, [("stdout", stdout_path, "out")],
-                        tail=False, lines=50)
+        stdout_path = None
+        try:
+            stdout_path, _ = _job_stream_paths(client, system, job_id)
+        except Exception:
+            pass
+        if stdout_path:
+            _error().print(f"[dim]Following job {job_id} (Ctrl-C to stop)...[/dim]")
+            _follow_streams(system, job_id, [("stdout", stdout_path, "out")],
+                            tail=False, lines=50)
+        else:
+            _error().print(
+                "[yellow]Could not resolve stdout path from metadata; "
+                "waiting for completion instead.[/yellow]"
+            )
         _report_final_state(client, system, job_id)
     elif wait:
         _error().print(f"[dim]Waiting for job {job_id}...[/dim]")
