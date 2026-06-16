@@ -50,6 +50,8 @@ pytest tests/ --run-e2e --maxfail=3 -v
 pytest tests/ --run-e2e --basetemp=/path/to/large/disk/pytest-tmp -v
 ```
 
+Pass `--deselect <nodeid>` to skip specific tests (or a whole class) while running the rest, and `--stepwise` (`--sw`) to stop at the first failing test and resume from it on the next run (combine either with `FCW_<EXAMPLE>_RUN_ID` below to reuse the same remote workdir).
+
 Each run creates a fresh remote directory `${FIRECREST_SCRATCH}/fcw-basic-<uuid>`. To reuse an existing one (e.g., to re-run after a partial failure):
 
 ```bash

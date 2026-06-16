@@ -437,7 +437,7 @@ class TestJobManagement:
         # Assert on the plainly-printed summary line, not column headers: Rich
         # truncates wide-table headers to ~80 cols under CliRunner (e.g.
         # "Partition" -> "Partiti…"), so header text is not a reliable signal.
-        assert "Total:" in result.output
+        assert "Total:" in result.output, "job list returned no jobs"
 
         result = runner.invoke(app, ["job", "list", "--long"])
         assert_ok(result)
