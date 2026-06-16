@@ -80,9 +80,9 @@ def _log_grace_seconds() -> float:
     FCW_LOG_GRACE (set to 0 to restore the old fail-fast behavior).
     """
     try:
-        return max(0.0, float(os.environ.get("FCW_LOG_GRACE", "20")))
+        return max(0.0, float(os.environ.get("FCW_LOG_GRACE", "30")))
     except ValueError:
-        return 20.0
+        return 30.0
 
 
 class LogStream(str, Enum):
