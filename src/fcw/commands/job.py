@@ -289,10 +289,6 @@ def _job_stream_paths(client, system: str, job_id: str) -> tuple[Optional[str], 
     """Resolve (stdout_path, stderr_path) from job metadata, %j-expanded.
 
     Returns (None, None) when no metadata is available. Lets client errors propagate.
-
-    NOTE: SLURM filename patterns (%j, %x, %N, %A_%a, ...) are only handled
-    best-effort here (%j). The FirecREST API returns these paths inconsistently /
-    unexpanded — consistent expansion should be fixed upstream in the API.
     """
     metadata = client.job_metadata(system_name=system, jobid=job_id)
     if isinstance(metadata, list):
@@ -300,11 +296,22 @@ def _job_stream_paths(client, system: str, job_id: str) -> tuple[Optional[str], 
     if not metadata:
         return None, None
 
-    def _resolve(*keys: str) -> Optional[str]:
-        val = next((metadata.get(k) for k in keys if metadata.get(k)), None)
-        return val.replace("%j", job_id) if val else None
+    # TODO(FirecREST): the job_metadata response returns SLURM filename patterns
+    # (%j, %x, %N, ...) unexpanded (FirecREST bug). We expand %j client-side as
+    # a temporary workaround and warn when it occurs; remove once fixed upstream.
+    def _pick(*keys: str) -> Optional[str]:
+        return next((metadata.get(k) for k in keys if metadata.get(k)), None)
 
-    return _resolve("standardOutput", "stdout", "StdOut"), _resolve("standardError", "stderr", "StdErr")
+    out = _pick("standardOutput", "stdout", "StdOut")
+    err = _pick("standardError", "stderr", "StdErr")
+    if (out and "%j" in out) or (err and "%j" in err):
+        _error().print(
+            "[yellow]Warning:[/yellow] FirecREST returned an unexpanded output path "
+            "(contains '%j'); expanding it client-side as a temporary workaround "
+            "(FirecREST bug)."
+        )
+    return (out.replace("%j", job_id) if out else None,
+            err.replace("%j", job_id) if err else None)
 
 
 # -----------------------------------------------------------------------------
@@ -1365,7 +1372,13 @@ def job_logs(
     ),
     follow: bool = typer.Option(False, "--follow", "-f",
                                 help="Follow output until the job finishes (like tail -f)"),
-    download: bool = typer.Option(False, "--download", "-d", help="Download log file"),
+    download: bool = typer.Option(
+        False, "--download", "-d",
+        help="Download log file(s), keeping the remote filename; by default "
+             "mirrors the remote path under workdir.local"),
+    dest: Optional[str] = typer.Option(
+        None, "--dest",
+        help="Directory to download log(s) into (overrides the workdir.local mirror)"),
     lines: Optional[int] = typer.Option(
         None, "--lines", "-n",
         help="Show only the last N lines (default: entire file)"),
@@ -1410,8 +1423,19 @@ def job_logs(
     if download:
         async def do_download():
             async_client = get_async_client()
-            for label, path, suffix in selected:
-                local_path = f"job-{job_id}.{suffix}"
+            for label, path, _ in selected:
+                if dest is not None:
+                    local_path = os.path.join(dest, os.path.basename(path))
+                else:
+                    # Mirror the remote path's position under workdir.remote
+                    # into the corresponding location under workdir.local.
+                    rel = os.path.relpath(path, config.workdir.remote)
+                    if rel.startswith("..") or os.path.isabs(rel):
+                        rel = os.path.basename(path)  # log lives outside workdir.remote
+                    local_path = os.path.join(config.workdir.local, rel)
+                parent = os.path.dirname(local_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 await async_client.download(
                     system_name=system,
                     source_path=path,

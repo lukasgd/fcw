@@ -1122,6 +1122,19 @@ class TestJobStreamPaths:
         assert _job_stream_paths(_MetadataClient(None), "sys", "1") == (None, None)
         assert _job_stream_paths(_MetadataClient([]), "sys", "1") == (None, None)
 
+    def test_warns_on_unexpanded_pattern(self, capsys):
+        """An unexpanded %j from the API is flagged as a FirecREST bug (once)."""
+        client = _MetadataClient({"standardOutput": "/o-%j.out"})
+        _job_stream_paths(client, "sys", "42")
+        err = capsys.readouterr().err
+        assert "FirecREST" in err and "%j" in err
+
+    def test_no_warning_when_already_expanded(self, capsys):
+        """A path the API already expanded passes through with no warning."""
+        client = _MetadataClient({"standardOutput": "/scratch/out-42.log"})
+        assert _job_stream_paths(client, "sys", "42") == ("/scratch/out-42.log", None)
+        assert capsys.readouterr().err == ""
+
 
 class TestFollowStreams:
     """Thin orchestration over _follow_stream (which is covered separately)."""
