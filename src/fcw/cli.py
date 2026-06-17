@@ -10,7 +10,7 @@ app = typer.Typer(
     name="fcw",
     help="FirecREST Container Workflows - a CLI for remote HPC job orchestration.",
     no_args_is_help=True,
-    epilog="Get started: fcw config init && fcw config validate",
+    epilog="Get started: fcw config init && fcw config validate\nTab completion: fcw --install-completion",
 )
 
 # Register command groups
@@ -19,6 +19,13 @@ app.add_typer(data.app, name="data", help="Transfer data with type enforcement")
 app.add_typer(job.app, name="job", help="Submit jobs and job chains")
 app.add_typer(container.app, name="container", help="Build and manage container images")
 app.add_typer(mount.app, name="mount", help="FUSE filesystem operations")
+
+# Promote frequently-used job verbs to the top level: `fcw submit` == `fcw job submit`.
+# The `job` group remains the canonical home for the full verb set.
+_PROMOTED_JOB_VERBS = {"submit", "run", "logs", "wait", "cancel"}
+for _cmd in job.app.registered_commands:
+    if _cmd.name in _PROMOTED_JOB_VERBS:
+        app.registered_commands.append(_cmd)
 
 
 @app.callback()

@@ -16,6 +16,7 @@ from fcw.commands.job import (
     _inject_env_vars,
     _job_stream_paths,
     _parse_sbatch_args,
+    _read_full,
     _remote_script_name,
     _report_final_state,
     _resolve_job_env,
@@ -577,6 +578,34 @@ class TestSbatchOverridesCLI:
         assert "export X=" in result.output
 
 
+class TestPromotedJobVerbs:
+    """Hot job verbs are aliased at the top level; status/list stay under `job`."""
+
+    @pytest.mark.parametrize("verb", ["submit", "run", "logs", "wait", "cancel"])
+    def test_promoted_verb_at_root(self, verb):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+
+        result = CliRunner().invoke(app, [verb, "--help"])
+        assert result.exit_code == 0, result.output
+
+    @pytest.mark.parametrize("verb", ["status", "list"])
+    def test_non_promoted_verb_not_at_root(self, verb):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+
+        # Not promoted: only reachable via `fcw job <verb>`.
+        assert CliRunner().invoke(app, [verb, "--help"]).exit_code != 0
+        assert CliRunner().invoke(app, ["job", verb, "--help"]).exit_code == 0
+
+    def test_job_group_still_works(self):
+        from typer.testing import CliRunner
+        from fcw.cli import app
+
+        result = CliRunner().invoke(app, ["job", "submit", "--help"])
+        assert result.exit_code == 0, result.output
+
+
 class TestResolveJobEnv:
     def test_env_paths_expanded(self, sample_config):
         job_config = sample_config.jobs["preprocess"]
@@ -1015,6 +1044,23 @@ class TestFollowStream:
                              lines=10, tail_only=False, interval=0)
         assert capsys.readouterr().out == "abcdefgh\n"   # full content, nothing skipped
         assert client.max_view_bytes <= 4                # every read stayed under the chunk size
+
+
+class TestReadFull:
+    """Coverage for the one-shot full-file read used by `fcw job logs`."""
+
+    async def test_reads_entire_file_in_bounded_chunks(self, capsys, monkeypatch):
+        """The whole file is emitted across several bounded ranged-view reads."""
+        monkeypatch.setattr("fcw.commands.job.READ_CHUNK_BYTES", 4)
+        client = _ScriptedClient([("COMPLETED", "abcdefgh\n")])  # 9 bytes, chunk 4
+        await _read_full(client, "sys", "/log.out")
+        assert capsys.readouterr().out == "abcdefgh\n"   # full content, nothing skipped
+        assert client.max_view_bytes <= 4                # every read stayed under the chunk size
+
+    async def test_empty_file_emits_nothing(self, capsys):
+        client = _ScriptedClient([("COMPLETED", "")])
+        await _read_full(client, "sys", "/log.out")
+        assert capsys.readouterr().out == ""
 
 
 class _WaitClient:

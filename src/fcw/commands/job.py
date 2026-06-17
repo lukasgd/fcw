@@ -145,6 +145,28 @@ async def _view_range(client, system: str, path: str, offset: int, size: int) ->
     return (out or "").encode("utf-8")
 
 
+async def _read_full(client, system: str, path: str) -> None:
+    """Emit the entire remote file via bounded, exact ranged ``view`` reads.
+
+    Mirrors the drain loop in ``_follow_stream``: walks the file in
+    ``READ_CHUNK_BYTES`` slices so each call stays under the ``view`` per-call
+    cap. ``stat`` failure (file not yet visible) propagates to the caller's
+    grace-window retry — it raises before any emit, so a retry never duplicates.
+    """
+    size = int((await client.stat(system_name=system, path=path)).get("size", 0))
+    offset = 0
+    while offset < size:
+        try:
+            chunk = await _view_range(
+                client, system, path, offset, min(READ_CHUNK_BYTES, size - offset))
+        except Exception:
+            break  # transient read error: stop (no restart/dup), like the follow loop
+        if not chunk:
+            break
+        _emit(chunk.decode("utf-8", errors="replace"))
+        offset += len(chunk)
+
+
 async def _follow_stream(
     client,
     system: str,
@@ -1341,13 +1363,21 @@ def job_logs(
         LogStream.stdout, "--stream",
         help="Which stream to operate on: stdout, stderr, or both",
     ),
-    tail: bool = typer.Option(False, "--tail", help="Show last lines only"),
     follow: bool = typer.Option(False, "--follow", "-f",
                                 help="Follow output until the job finishes (like tail -f)"),
     download: bool = typer.Option(False, "--download", "-d", help="Download log file"),
-    lines: int = typer.Option(50, "--lines", "-n", help="Number of lines for --tail"),
+    lines: Optional[int] = typer.Option(
+        None, "--lines", "-n",
+        help="Show only the last N lines (default: entire file)"),
 ):
-    """View job stdout/stderr logs."""
+    """View job stdout/stderr logs.
+
+    Examples:
+        fcw job logs ID            # entire file
+        fcw job logs ID -n 50      # last 50 lines
+        fcw job logs ID -f         # entire file, then follow
+        fcw job logs ID -f -n 50   # last 50 lines, then follow
+    """
     config, system, account = resolve_context(ctx)
 
     client = get_client()
@@ -1396,7 +1426,8 @@ def job_logs(
         return
 
     if follow:
-        _follow_streams(system, job_id, selected, tail=tail, lines=lines)
+        _follow_streams(system, job_id, selected,
+                        tail=(lines is not None), lines=lines or 0)
         return
 
     # One-shot read. The output file can lag the job's terminal state on some
@@ -1411,11 +1442,11 @@ def job_logs(
                 print(f"==> {label} <==")
             for attempt in range(attempts):
                 try:
-                    content = _tail_content(await async_client.tail(
-                        system_name=system, path=path,
-                        num_lines=lines if tail else 1000,
-                    ))
-                    _emit(content)
+                    if lines is None:
+                        await _read_full(async_client, system, path)
+                    else:
+                        _emit(_tail_content(await async_client.tail(
+                            system_name=system, path=path, num_lines=lines)))
                     break
                 except Exception as e:
                     if attempt + 1 >= attempts:

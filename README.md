@@ -18,6 +18,19 @@ pip install fcw  # add [dev] to install with testing utilities (incl. performanc
 pip install fcw[fuse]
 ```
 
+## Shell completion
+
+`fcw` ships with tab completion for commands, sub-commands, and options. Install it
+once for your shell (bash/zsh/fish/powershell), then restart the shell:
+
+```bash
+fcw --install-completion      # detects your shell and installs
+fcw --show-completion bash    # print the script instead of installing
+```
+
+After installation, `fcw <TAB>` completes command groups and `fcw job <TAB>` completes
+job verbs.
+
 ## Quick start
 
 
@@ -136,10 +149,14 @@ fcw data ls outputs -R
 Jobs are submitted using the `--` separator pattern: SBATCH options before `--`, 
 script/job name after.
 
+The hot verbs `submit`, `run`, `logs`, `wait`, and `cancel` are also available at the
+top level, so `fcw submit train.sh` is shorthand for `fcw job submit train.sh`. The
+full verb set (including `status` and `list`) lives under `fcw job`.
+
 ```bash
-# Single job submission
-fcw job submit train.sh       # explicit script path
-fcw job submit train          # use jobs.train config from fcw.yaml
+# Single job submission (top-level shorthand; `fcw job submit ...` also works)
+fcw submit train.sh           # explicit script path
+fcw submit train              # use jobs.train config from fcw.yaml
 
 # Override SBATCH options
 fcw job submit --time 12:00:00 --nodes 4 -- train.sh
