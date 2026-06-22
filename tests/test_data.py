@@ -1,17 +1,24 @@
 """Tests for sync markers, file collection, and match patterns."""
 
+import logging
 import os
 import tarfile
 import time
 
 import pytest
 
+import typer
+
 from fcw.commands.data import (
     _build_emacs_match_pattern,
     _collect_local_files_since,
     _extract_dir_archive,
     _get_sync_marker_path,
+    _parse_size,
+    _partition_by_size,
     _read_last_sync_timestamp,
+    _upload_files_chunked,
+    _upload_incremental,
     _write_last_sync_timestamp,
 )
 
@@ -146,3 +153,159 @@ class TestExtractDirArchive:
         assert (local_dir / "sub" / "x.txt").read_text() == "nested"
         # The bug: archive rooted at "outputs/" must not nest under local_dir again.
         assert not (local_dir / "outputs").exists()
+
+
+class _StubAsyncClient:
+    """Records the remote operations an upload performs, in order."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def mkdir(self, **kwargs):
+        self.calls.append("mkdir")
+
+    async def upload(self, **kwargs):
+        self.calls.append("upload")
+
+    async def extract(self, **kwargs):
+        self.calls.append("extract")
+
+    async def rm(self, **kwargs):
+        self.calls.append("rm")
+
+
+class TestDataLogging:
+    """fcw logs its orchestration/local context (counts, local tar/extract); the
+    remote ops themselves are left to pyfirecrest's own `firecrest` logger. These
+    lock the fcw-side contract without shadowing pyfirecrest."""
+
+    def test_collect_local_files_logs_count(self, tmp_path, caplog):
+        (tmp_path / "a.txt").write_text("a")
+        (tmp_path / "b.txt").write_text("b")
+        with caplog.at_level(logging.INFO, logger="fcw.data"):
+            _collect_local_files_since(str(tmp_path), 0)
+        assert any("found 2 local file(s)" in r.message for r in caplog.records)
+
+    async def test_upload_incremental_logs_local_context(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.chdir(tmp_path)
+        local_dir = tmp_path / "data"
+        local_dir.mkdir()
+        (local_dir / "f.txt").write_text("payload")
+
+        client = _StubAsyncClient()
+        with caplog.at_level(logging.INFO, logger="fcw.data"):
+            count = await _upload_incremental(
+                client, "sys", "acct", str(local_dir), "/remote/data"
+            )
+
+        assert count == 1
+        assert client.calls == ["mkdir", "upload", "extract", "rm"]
+
+        msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        joined = "\n".join(msgs)
+        # The helper logs mechanics only: the decision (count) and local-only steps.
+        # It does NOT shadow the pyfirecrest upload/extract/rm calls (firecrest's to
+        # log), nor the "uploading X -> Y" intent line (a command-level concern).
+        assert "found 1 local file(s)" in joined
+        assert "tarring 1 file(s) ..." in joined
+        assert any("archive built:" in m for m in msgs)
+        assert "uploading archive" not in joined
+        assert "extracting archive on remote" not in joined
+        assert not any(m.startswith("uploading ") and "->" in m for m in msgs)
+
+        def idx(needle):
+            return next(i for i, m in enumerate(msgs) if needle in m)
+
+        assert idx("found 1 local file(s)") < idx("tarring")
+
+
+class TestParseSize:
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("2GB", 2_000_000_000),
+            ("512MB", 512_000_000),
+            ("1KiB", 1024),
+            ("1024", 1024),
+            ("1.5GB", 1_500_000_000),
+            ("2 gb", 2_000_000_000),
+        ],
+    )
+    def test_valid(self, text, expected):
+        assert _parse_size(text) == expected
+
+    def test_invalid_unit(self):
+        with pytest.raises(typer.BadParameter):
+            _parse_size("5XB")
+
+    def test_invalid_format(self):
+        with pytest.raises(typer.BadParameter):
+            _parse_size("abc")
+
+
+class TestPartitionBySize:
+    def test_packs_small_items(self):
+        items = [("a", 30), ("b", 30), ("c", 30)]
+        assert list(_partition_by_size(items, 100)) == [(["a", "b", "c"], False)]
+
+    def test_flushes_when_exceeding(self):
+        items = [("a", 60), ("b", 60)]
+        assert list(_partition_by_size(items, 100)) == [(["a"], False), (["b"], False)]
+
+    def test_cumulative_equal_stays_together(self):
+        items = [("a", 50), ("b", 50)]
+        assert list(_partition_by_size(items, 100)) == [(["a", "b"], False)]
+
+    def test_oversized_isolated_and_order_preserved(self):
+        items = [("a", 30), ("big", 200), ("b", 30)]
+        assert list(_partition_by_size(items, 100)) == [
+            (["a"], False),
+            (["big"], True),
+            (["b"], False),
+        ]
+
+    def test_boundary_equal_is_oversized(self):
+        assert list(_partition_by_size([("a", 100)], 100)) == [(["a"], True)]
+
+
+class _RecordingClient:
+    """Records each remote op with its kwargs, in order."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def mkdir(self, **kw):
+        self.calls.append(("mkdir", kw))
+
+    async def upload(self, **kw):
+        self.calls.append(("upload", kw))
+
+    async def extract(self, **kw):
+        self.calls.append(("extract", kw))
+
+    async def rm(self, **kw):
+        self.calls.append(("rm", kw))
+
+
+class TestChunkedUpload:
+    async def test_large_file_uploaded_directly(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "a.txt").write_text("x" * 10)
+        (d / "b.txt").write_text("y" * 10)
+        (d / "big.bin").write_bytes(b"z" * 200)
+        files = [
+            (str(d / "a.txt"), "a.txt"),
+            (str(d / "b.txt"), "b.txt"),
+            (str(d / "big.bin"), "big.bin"),
+        ]
+
+        client = _RecordingClient()
+        await _upload_files_chunked(client, "sys", "acct", files, "/remote/data", 100, False)
+
+        ops = [op for op, _ in client.calls]
+        uploaded = [kw["filename"] for op, kw in client.calls if op == "upload"]
+        # The two small files go in one tar batch (one extract); the big file is
+        # streamed directly with no tar wrapper (no extra extract).
+        assert ops.count("extract") == 1
+        assert sorted(uploaded) == sorted(["big.bin", ".fcw_upload_chunk.tar.gz"])

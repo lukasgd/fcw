@@ -536,6 +536,17 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
     return "\n".join(lines)
 
 
+def _has_login_shell_shebang(script_content: str) -> bool:
+    """Return True if the script's first line is a bash shebang with -l/--login."""
+    lines = script_content.splitlines()
+    if not lines or not lines[0].startswith("#!"):
+        return False
+    tokens = lines[0].split()
+    if not any("bash" in t for t in tokens):
+        return False
+    return "-l" in tokens or "--login" in tokens
+
+
 def _inject_env_vars(script_content: str, env_vars: dict[str, str]) -> str:
     """Inject environment variable exports into SLURM script.
     
@@ -1062,6 +1073,26 @@ def submit_job(
     # Warn about srun --environment calls that bypass the managed env (before
     # injection rewrites them), then inject + rewrite the hardcoded path.
     _warn_env_bindings(script_content, bound_path, bound=toml_content is not None)
+
+    # TODO: remove the login-shell shebang requirement once the pyxis/slurmrestd
+    # inline-script segfault is fixed. Inline container jobs (srun --environment via
+    # csrun) segfault on the compute node unless the script runs under a bash login
+    # shell (`#!/bin/bash -l`).
+    if (
+        toml_content is not None
+        and not remote_script
+        and not _has_login_shell_shebang(script_content)
+    ):
+        _error().print(
+            "[red]Error: container jobs must use a bash login shell shebang "
+            "(`#!/bin/bash -l`).[/red]"
+        )
+        _error().print(
+            "[dim]Without -l, srun --environment segfaults on the compute node "
+            "(pyxis/slurmrestd bug). Use --remote-script as an alternative workaround.[/dim]"
+        )
+        raise typer.Exit(1)
+
     if toml_content is not None:
         script_content = _inject_container_toml(script_content, toml_content)
         if bound_path:

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -l
 #SBATCH --job-name node-burn
 #SBATCH --nodes 4
 #SBATCH --ntasks-per-node 4

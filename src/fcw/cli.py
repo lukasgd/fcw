@@ -5,6 +5,7 @@ from typing import Optional
 
 from fcw import __version__
 from fcw.commands import config, data, job, container, mount
+from fcw.core import configure_logging
 
 app = typer.Typer(
     name="fcw",
@@ -43,8 +44,13 @@ def main(
         None, "--config", "-c",
         help="Config file path (default: ./fcw.yaml)"
     ),
+    verbose: int = typer.Option(
+        0, "--verbose", "-v", count=True,
+        help="Increase log verbosity (-v: info, -vv: debug). FCW_LOG_LEVEL overrides."
+    ),
 ):
     """FirecREST Container Workflows - a CLI for remote HPC job orchestration."""
+    configure_logging(verbose)
     # Store global options in context for subcommands
     ctx.ensure_object(dict)
     ctx.obj["system"] = system

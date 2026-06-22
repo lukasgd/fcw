@@ -14,6 +14,7 @@ from fcw.core.client import (
     get_client,
     get_system,
 )
+from fcw.core.logging import configure_logging
 from fcw.core.config import (
     ContainerConfig,
     DirectoryConfig,
@@ -137,4 +138,5 @@ __all__ = [
     "get_output_console",
     "get_global_sbatch_options",
     "format_sbatch_lines",
+    "configure_logging",
 ]

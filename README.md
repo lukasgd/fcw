@@ -278,7 +278,7 @@ fcw mount stop ./local-outputs
 ## Example: Full Training Workflow
 
 ```bash
-#!/bin/bash
+#!/bin/bash -l
 set -e
 
 # Upload input data and experiment configs
@@ -312,7 +312,7 @@ kill $SYNC_PID
 ## Example: Code Iteration Workflow
 
 ```bash
-#!/bin/bash
+#!/bin/bash -l
 # Fast iteration on code without rebuilding full container
 
 # One-time setup: extract code (writes ./code.meta.json sidecar)

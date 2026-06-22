@@ -12,6 +12,7 @@ from fcw.commands.job import (
     _fmt_epoch,
     _follow_stream,
     _follow_streams,
+    _has_login_shell_shebang,
     _inject_container_toml,
     _inject_env_vars,
     _job_stream_paths,
@@ -37,6 +38,29 @@ set -euxo pipefail
 
 echo "hello"
 """
+
+
+class TestLoginShellShebang:
+    def test_dash_l(self):
+        assert _has_login_shell_shebang("#!/bin/bash -l\necho hi")
+
+    def test_long_login(self):
+        assert _has_login_shell_shebang("#!/bin/bash --login\necho hi")
+
+    def test_bash_without_login(self):
+        assert not _has_login_shell_shebang("#!/bin/bash\necho hi")
+
+    def test_env_bash_dash_l(self):
+        assert _has_login_shell_shebang("#!/usr/bin/env -S bash -l\necho hi")
+
+    def test_sh_not_bash(self):
+        assert not _has_login_shell_shebang("#!/bin/sh\necho hi")
+
+    def test_no_shebang(self):
+        assert not _has_login_shell_shebang("#SBATCH --time 1:00:00\necho hi")
+
+    def test_empty(self):
+        assert not _has_login_shell_shebang("")
 
 
 class TestApplySbatchOverrides:
@@ -360,7 +384,7 @@ class TestSbatchOverridesCLI:
         self._write_container_config(tmp_path)
         script = tmp_path / "train.sh"
         script.write_text(
-            "#!/bin/bash\n#SBATCH --job-name test\n"
+            "#!/bin/bash -l\n#SBATCH --job-name test\n"
             "srun --environment ${FCW_CONTAINER_TOML} echo hi\n"
         )
 
@@ -390,7 +414,7 @@ class TestSbatchOverridesCLI:
         self._write_container_config(tmp_path)
         script = tmp_path / "train.sh"
         script.write_text(
-            "#!/bin/bash\n#SBATCH --job-name test\n"
+            "#!/bin/bash -l\n#SBATCH --job-name test\n"
             "srun --environment ./env/container.toml echo hi\n"
         )
 

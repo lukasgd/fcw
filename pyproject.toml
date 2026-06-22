@@ -87,3 +87,7 @@ testpaths = ["tests"]
 markers = [
     "e2e: end-to-end tests requiring FirecREST access (use --run-e2e or FCW_E2E=1)",
 ]
+# Live-log formatting (opt-in): pass --log-cli-level=INFO to stream timestamped
+# phase logs, e.g. to see which remote op a hanging e2e upload is stuck on.
+log_cli_format = "%(asctime)s %(levelname)s %(name)s %(message)s"
+log_cli_date_format = "%H:%M:%S"

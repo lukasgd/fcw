@@ -1,7 +1,12 @@
 """Tests for core shared utilities."""
 
+import logging
+
+import pytest
+
 from fcw.core import (
     SLURM_FAILED_STATES,
+    configure_logging,
     format_sbatch_lines,
     get_error_console,
     get_global_sbatch_options,
@@ -152,3 +157,56 @@ class TestConsoles:
         assert "PRIMARY_OUT" not in captured.err
         assert "DIAG_ERR" in captured.err
         assert "DIAG_ERR" not in captured.out
+
+
+class TestConfigureLogging:
+    """One knob drives fcw + pyfirecrest in lockstep on a root handler; FCW_LOG_LEVEL
+    overrides; unrelated loggers (httpx) stay quiet; handlers don't stack."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_loggers(self):
+        """Snapshot/restore the root, `fcw`, and `firecrest` loggers so tests don't leak."""
+        names = [None, "fcw", "firecrest"]  # None -> root
+        saved = [(logging.getLogger(n), logging.getLogger(n).handlers[:], logging.getLogger(n).level)
+                 for n in names]
+        root = logging.getLogger()
+        root.handlers = [h for h in root.handlers if not getattr(h, "_fcw_handler", False)]
+        yield
+        for logger, handlers, level in saved:
+            logger.handlers = handlers
+            logger.setLevel(level)
+
+    def test_fcw_and_firecrest_track_verbosity(self):
+        for verbosity, expected in [(0, logging.WARNING), (1, logging.INFO), (2, logging.DEBUG), (3, logging.DEBUG)]:
+            configure_logging(verbosity)
+            assert logging.getLogger("fcw").level == expected
+            assert logging.getLogger("firecrest").level == expected
+
+    def test_handler_on_root_and_root_level_unchanged(self):
+        configure_logging(2)
+        root = logging.getLogger()
+        tagged = [h for h in root.handlers if getattr(h, "_fcw_handler", False)]
+        assert len(tagged) == 1
+        # Root stays quiet so unrelated third-party loggers aren't surfaced.
+        assert root.level in (logging.WARNING, logging.NOTSET)
+
+    def test_env_var_overrides_verbosity(self, monkeypatch):
+        monkeypatch.setenv("FCW_LOG_LEVEL", "debug")
+        configure_logging(0)  # would be WARNING without the override
+        assert logging.getLogger("fcw").level == logging.DEBUG
+        assert logging.getLogger("firecrest").level == logging.DEBUG
+
+    def test_firecrest_surfaced_but_httpx_quiet_at_debug(self):
+        """The integration contract: at -vv pyfirecrest's stream is enabled (so its
+        records reach the root handler) while httpx stays gated by root WARNING."""
+        configure_logging(2)  # -vv -> DEBUG
+        assert logging.getLogger("firecrest.v2._async.Client").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("httpx").isEnabledFor(logging.DEBUG)
+
+    def test_no_duplicate_handlers(self):
+        configure_logging(1)
+        configure_logging(2)
+        configure_logging(0)
+        root = logging.getLogger()
+        tagged = [h for h in root.handlers if getattr(h, "_fcw_handler", False)]
+        assert len(tagged) == 1

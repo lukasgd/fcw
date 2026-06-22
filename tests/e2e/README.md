@@ -232,3 +232,30 @@ Setup dirs (3) --> Upload env/slurm (4,5)
 3. Check SLURM job logs on remote: `fcw job logs <job_id>`
 4. List remote files: `fcw data ls <path> -R`
 5. Check job state: `fcw job status <job_id>`
+
+## Diagnosing a Hanging Test
+
+`CliRunner` buffers a command's output, so a test stuck inside a blocking
+FirecREST call (upload/extract/compress/download) shows nothing on its own. Pass
+`--log-cli-level=DEBUG` to stream the live log — fcw's logging surfaces both its
+own orchestration lines **and** pyfirecrest's `firecrest.*` stream (they share one
+handler, driven by the same verbosity):
+
+```bash
+# e.g. the BrainBERT dataset upload hanging mid-transfer
+pytest tests/ --run-e2e --example brainbert --log-cli-level=DEBUG
+```
+
+What you see, interleaved:
+- fcw (`fcw.data`): the local/decision context — `found N local file(s) …`,
+  `tarring N changed file(s) ...`, `extracting archive into … ...`.
+- pyfirecrest (`firecrest.v2._async.Client`): the remote ground truth — `Making
+  POST request to /transfer/upload`, `Blocking until (…) is transferred`, and a
+  repeating `Job <id> state is <state>. Will sleep for 3s.` heartbeat (the ~3s
+  cadence comes from the poll cap in `core/client.py`).
+
+So a stuck transfer job shows up as the heartbeat pulsing on the same `Job …
+PENDING` line, while a stalled request stops after `Making … request` with no
+heartbeat — telling you *where* the hang is. `--log-cli-level=INFO` is the quieter
+tier (fcw outline + pyfirecrest's "running as a transfer job" notices, no
+heartbeat).
