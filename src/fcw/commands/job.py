@@ -10,14 +10,14 @@ Key features:
 Usage patterns:
     # Simple submission
     fcw job submit train.sh
-    
+
     # With SBATCH overrides (options before -- override script's #SBATCH directives)
     fcw job submit --time 12:00:00 --nodes 4 -- train.sh
-    
+
     # With job dependency
     JOB1=$(fcw job submit preprocess.sh)
     fcw job submit --dependency afterok:$JOB1 -- train.sh
-    
+
     # Using config-defined job with env override
     fcw job submit train --set CONFIG=exp1.yaml
 """
@@ -32,26 +32,23 @@ from collections import Counter
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
+import firecrest
 import typer
 from rich.table import Table
 
-import firecrest
-
 from fcw.core import (
-    load_config,
-    get_async_client,
-    get_client,
-    get_system,
-    get_account,
-    extract_job_id,
-    resolve_context,
-    get_error_console,
-    get_output_console,
-    get_global_sbatch_options,
     SLURM_FAILED_STATES,
     FcwConfig,
+    extract_job_id,
+    get_async_client,
+    get_client,
+    get_error_console,
+    get_global_sbatch_options,
+    get_output_console,
+    get_system,
+    resolve_context,
 )
 
 app = typer.Typer(no_args_is_help=True)
@@ -450,20 +447,20 @@ def _build_jobs_table(jobs, *, long: bool = False, state: Optional[str] = None,
 
 def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> str:
     """Apply SBATCH option overrides to a SLURM script.
-    
+
     For each override, either replaces an existing ``#SBATCH --key`` directive
     or inserts a new one after the existing SBATCH block.
-    
+
     Args:
         script_content: Original script content.
         overrides: Dict of SBATCH options to set (key -> value).
                    Keys should NOT include the leading ``--``. An empty-string
                    value denotes a valueless flag, rendered as a bare
                    ``#SBATCH --key`` (e.g. ``{"exclusive": ""}``).
-    
+
     Returns:
         Modified script content with overrides applied.
-    
+
     Example:
         >>> script = \"\"\"#!/bin/bash
         ... #SBATCH --time=01:00:00
@@ -475,17 +472,17 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
     """
     if not overrides:
         return script_content
-    
+
     lines = script_content.split("\n")
     modified_keys = set()
     last_sbatch_idx = -1
-    
+
     # First pass: find and replace existing SBATCH directives
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("#SBATCH"):
             last_sbatch_idx = i
-            
+
             # Parse the SBATCH option from this line.
             # Handles: #SBATCH --key=value, #SBATCH --key value, and valueless
             # flags (value == "") rendered as a bare #SBATCH --key.
@@ -511,14 +508,14 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
                     lines[i] = f"#SBATCH --{key}={value}"
                     modified_keys.add(key)
                     break
-    
+
     # Second pass: insert new directives for keys not found
     new_directives = []
     for key, value in overrides.items():
         if key not in modified_keys:
             directive = f"#SBATCH --{key}" if value == "" else f"#SBATCH --{key}={value}"
             new_directives.append(directive)
-    
+
     if new_directives:
         # Insert after last #SBATCH line, or after shebang if no SBATCH found
         if last_sbatch_idx >= 0:
@@ -527,12 +524,12 @@ def _apply_sbatch_overrides(script_content: str, overrides: dict[str, str]) -> s
             insert_idx = 1
         else:
             insert_idx = 0
-        
+
         # Insert in reverse: each insert() at the same index pushes the
         # previous one down, so reversing preserves new_directives' order.
         for directive in reversed(new_directives):
             lines.insert(insert_idx, directive)
-    
+
     return "\n".join(lines)
 
 
@@ -549,15 +546,15 @@ def _has_login_shell_shebang(script_content: str) -> bool:
 
 def _inject_env_vars(script_content: str, env_vars: dict[str, str]) -> str:
     """Inject environment variable exports into SLURM script.
-    
+
     Inserts export statements after the #SBATCH block. Variables use
     shell default syntax (``${VAR:-default}``) so CLI-provided values
     take precedence.
-    
+
     Args:
         script_content: Original script content.
         env_vars: Dict of variable name -> default value.
-    
+
     Returns:
         Modified script with exports inserted.
     """
@@ -579,12 +576,12 @@ def _inject_env_vars(script_content: str, env_vars: dict[str, str]) -> str:
 
     if insert_idx < 0:
         insert_idx = last_sbatch_idx + 1 if last_sbatch_idx >= 0 else (1 if lines[0].startswith("#!") else 0)
-    
+
     # Add blank line and exports
     lines.insert(insert_idx, "")
     lines.insert(insert_idx + 1, "# Environment variables from fcw")
     lines.insert(insert_idx + 2, exports)
-    
+
     return "\n".join(lines)
 
 
@@ -811,32 +808,32 @@ def _warn_env_bindings(script_content: str, bound_path: Optional[str], bound: bo
 
 def _parse_sbatch_args(args: List[str]) -> tuple[dict[str, str], List[str]]:
     """Parse SBATCH options from argument list.
-    
+
     Separates SBATCH options (before ``--``) from remaining arguments.
-    
+
     Args:
         args: Raw argument list, potentially containing SBATCH options,
               a ``--`` separator, and remaining positional args.
-    
+
     Returns:
         Tuple of (sbatch_overrides, remaining_args).
-    
+
     Example:
         >>> _parse_sbatch_args(["--time", "12:00:00", "--nodes", "4", "--", "train.sh"])
         ({"time": "12:00:00", "nodes": "4"}, ["train.sh"])
-        
+
         >>> _parse_sbatch_args(["train.sh"])  # No SBATCH options
         ({}, ["train.sh"])
     """
     sbatch_opts = {}
     remaining = []
-    
+
     # Check if there's a -- separator
     if "--" in args:
         sep_idx = args.index("--")
         sbatch_args = args[:sep_idx]
         remaining = args[sep_idx + 1:]
-        
+
         # Parse SBATCH options (--key value or --key=value)
         i = 0
         while i < len(sbatch_args):
@@ -856,7 +853,7 @@ def _parse_sbatch_args(args: List[str]) -> tuple[dict[str, str], List[str]]:
     else:
         # No separator - all args are positional/remaining
         remaining = args
-    
+
     return sbatch_opts, remaining
 
 
@@ -1306,7 +1303,7 @@ def run_command(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(script_content)
         script_path = f.name
-    
+
     try:
         # TODO: remove --remote-script workaround when slurmrestd inline script
         # + pyxis segfault is fixed
@@ -1372,7 +1369,7 @@ def job_status(
     system = get_system((ctx.obj or {}).get("system"))
 
     client = get_client()
-    
+
     try:
         jobs = client.job_info(system_name=system, jobid=job_id)
         if not jobs:
@@ -1386,7 +1383,7 @@ def job_status(
 
         for key, value in job.items():
             table.add_row(str(key), str(value))
-        
+
         _output().print(table)
     except Exception as e:
         _error().print(f"[red]Error: {e}[/red]")
@@ -1522,7 +1519,7 @@ def wait_for_jobs(
     system = get_system((ctx.obj or {}).get("system"))
 
     client = get_client()
-    
+
     for job_id in job_ids:
         _error().print(f"[dim]Waiting for job {job_id}...[/dim]")
         try:
@@ -1551,7 +1548,7 @@ def cancel_jobs(
     system = get_system((ctx.obj or {}).get("system"))
 
     client = get_client()
-    
+
     for job_id in job_ids:
         try:
             client.cancel_job(system_name=system, jobid=job_id)

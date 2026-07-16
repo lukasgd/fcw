@@ -12,14 +12,20 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, List
 
+import firecrest
 import typer
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-import firecrest
-
-from fcw.core import load_config, DirectoryType, get_async_client, get_system, get_account, resolve_context, get_error_console, get_output_console
+from fcw.core import (
+    get_async_client,
+    get_error_console,
+    get_output_console,
+    get_system,
+    load_config,
+    resolve_context,
+)
 
 app = typer.Typer(no_args_is_help=True)
 _error = get_error_console
@@ -97,13 +103,13 @@ def _collect_local_files_since(
             # Skip sync markers and hidden files
             if name.startswith(".fcw") or name.startswith(".firecrest"):
                 continue
-            
+
             abs_path = os.path.join(root, name)
             try:
                 mtime = os.path.getmtime(abs_path)
             except FileNotFoundError:
                 continue
-            
+
             if mtime > since_ts:
                 rel_path = os.path.relpath(abs_path, local_dir)
                 files.append((abs_path, rel_path))
@@ -147,31 +153,48 @@ async def _list_remote_files(
     return files
 
 
-async def _collect_remote_files_since(
+async def _remote_is_dir(
     client: firecrest.v2.AsyncFirecrest,
     system: str,
-    remote_dir: str,
-    since_ts: float,
-) -> list[tuple[str, int]]:
-    """Collect remote files modified since timestamp as (rel_path, size)."""
-    entries = await _list_remote_files(client, system, remote_dir)
-    files = [(name, size) for name, size, mtime in entries if mtime > since_ts]
-    logger.info("found %d remote file(s) modified since %.0f under %s", len(files), since_ts, remote_dir)
-    return files
+    path: str,
+) -> bool:
+    """Return True if the remote path is a directory, from the `ls` entry type.
+
+    Replaces the old "list_files didn't throw" heuristic, which misclassified a
+    regular file as a directory (`ls <file>` succeeds) and routed single-file
+    downloads through the directory path, creating a local dir where the file
+    should be. Detection is via the parent listing's ``type`` field ("d" =
+    directory) — the signal used across fcw (`_list_remote_files`, fuse) and by
+    pyfirecrest. FirecREST's stat ``mode`` can't be used: it omits the file-type
+    bits (API bug eth-cscs/firecrest#171), which is why pyfirecrest also derives
+    the type from `ls`. A symlink ("l") is treated as a file. Raises
+    FileNotFoundError when the path is absent.
+    """
+    p = path.rstrip("/")
+    parent, base = os.path.dirname(p) or "/", os.path.basename(p)
+    entries = await client.list_files(
+        system_name=system, path=parent, show_hidden=True
+    )
+    for e in entries:
+        name = e.get("name") if isinstance(e, dict) else getattr(e, "name", None)
+        if name == base:
+            etype = e.get("type") if isinstance(e, dict) else getattr(e, "type", None)
+            return etype == "d"
+    raise FileNotFoundError(f"{path} not found on {system}")
 
 
 def _build_emacs_match_pattern(paths: list[str], source_path: str) -> str:
     """Build emacs-style regex pattern for tar's --match option."""
     root = os.path.basename(source_path.rstrip("/"))
     patterns = []
-    
+
     for p in paths:
         p = p.replace(os.sep, "/").lstrip("./")
         full = f"{root}/{p}"
         escaped = re.escape(full)
         fragment = "./" + escaped
         patterns.append(fragment)
-    
+
     if not patterns:
         return "^$"
     if len(patterns) == 1:
@@ -460,7 +483,9 @@ async def _download_incremental(
     os.makedirs(local_dir, exist_ok=True)
 
     last_sync = _read_last_sync_timestamp(local_dir, "pull")
-    files = await _collect_remote_files_since(client, system, remote_dir, last_sync)
+    entries = await _list_remote_files(client, system, remote_dir)
+    files = [(name, size) for name, size, mtime in entries if mtime > last_sync]
+    logger.info("found %d changed remote file(s) under %s", len(files), remote_dir)
 
     if not files:
         return 0
@@ -468,7 +493,11 @@ async def _download_incremental(
     await _download_files_chunked(
         client, system, account, files, remote_dir, local_dir, chunk_size
     )
-    _write_last_sync_timestamp(local_dir, "pull")
+    # Advance the marker by the newest REMOTE mtime, not local time.time(): the pull
+    # filter compares remote mtimes, so the boundary must be on the same clock —
+    # otherwise clock/timezone skew re-downloads every unchanged file next run.
+    newest = max((mtime for _, _, mtime in entries), default=last_sync)
+    _write_last_sync_timestamp(local_dir, "pull", newest)
     return len(files)
 
 
@@ -502,10 +531,10 @@ def upload(
                 "Use --force to override or change type in fcw.yaml."
             )
             raise typer.Exit(1)
-    
+
     async def do_upload():
         client = get_async_client()
-        
+
         while True:
             for local_path in paths:
                 rel_path = os.path.relpath(local_path, config.workdir.local)
@@ -551,13 +580,13 @@ def upload(
                             transfer_method="s3",
                         )
                     _error().print(f"[green]Uploaded {local_path} to {remote_path}[/green]")
-            
+
             if not watch:
                 break
-            
+
             _error().print(f"[dim]Waiting {interval}s...[/dim]")
             await asyncio.sleep(interval)
-    
+
     asyncio.run(do_upload())
 
 
@@ -587,17 +616,44 @@ def download(
                 "Use --force to override or change type in fcw.yaml."
             )
             raise typer.Exit(1)
-    
+
     async def do_download():
         client = get_async_client()
-        
+
         while True:
             for rel_path in paths:
-                remote_path = config.resolve_path(rel_path, remote=True)
-                local_path = config.resolve_path(rel_path, remote=False)
+                # Strip trailing slashes: a trailing '/' survives resolve_path and
+                # would leak into compress(source_path=...), rooting the archive
+                # differently than the match pattern -> empty extraction.
+                remote_path = config.resolve_path(rel_path, remote=True).rstrip("/") or "/"
+                local_path = config.resolve_path(rel_path, remote=False).rstrip("/") or "."
                 logger.info("downloading %s -> %s", remote_path, local_path)
 
-                if incremental:
+                try:
+                    is_dir = await _remote_is_dir(client, system, remote_path)
+                except Exception as e:
+                    _error().print(
+                        f"[red]Error:[/red] cannot access '{remote_path}' on {system}: {e}"
+                    )
+                    raise typer.Exit(1)
+
+                if not is_dir:
+                    # Single file: download directly to the file path. Incremental
+                    # sync is a directory concept; for one file we just fetch it.
+                    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+                    with _spinner(f"Downloading {rel_path}..."):
+                        await client.download(
+                            system_name=system,
+                            source_path=remote_path,
+                            target_path=local_path,
+                            account=account,
+                            blocking=True,
+                            transfer_method="s3",
+                        )
+                    _error().print(
+                        f"[green]Downloaded {remote_path} to {local_path}[/green]"
+                    )
+                elif incremental:
                     with _spinner(f"Syncing {rel_path}..."):
                         count = await _download_incremental(
                             client, system, account, remote_path, local_path, chunk_bytes
@@ -607,49 +663,21 @@ def download(
                     else:
                         _error().print(f"[dim]No changes in {rel_path}[/dim]")
                 else:
-                    # Check if remote path is a directory
-                    is_dir = False
-                    try:
-                        await client.list_files(
-                            system_name=system,
-                            path=remote_path,
-                            recursive=False,
+                    # Directory download via compress
+                    with _spinner(f"Downloading {rel_path}..."):
+                        await _download_directory(
+                            client, system, account, remote_path, local_path, chunk_bytes
                         )
-                        is_dir = True
-                    except Exception:
-                        pass
+                    _error().print(
+                        f"[green]Downloaded {remote_path} to {local_path}[/green]"
+                    )
 
-                    if is_dir:
-                        # Directory download via compress
-                        with _spinner(f"Downloading {rel_path}..."):
-                            await _download_directory(
-                                client, system, account, remote_path, local_path, chunk_bytes
-                            )
-                        _error().print(
-                            f"[green]Downloaded {remote_path} to {local_path}[/green]"
-                        )
-                    else:
-                        # Direct file download
-                        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-                        with _spinner(f"Downloading {rel_path}..."):
-                            await client.download(
-                                system_name=system,
-                                source_path=remote_path,
-                                target_path=local_path,
-                                account=account,
-                                blocking=True,
-                                transfer_method="s3",
-                            )
-                        _error().print(
-                            f"[green]Downloaded {remote_path} to {local_path}[/green]"
-                        )
-            
             if not watch:
                 break
-            
+
             _error().print(f"[dim]Waiting {interval}s...[/dim]")
             await asyncio.sleep(interval)
-    
+
     asyncio.run(do_download())
 
 
@@ -664,9 +692,9 @@ def list_files(
     system = get_system((ctx.obj or {}).get("system"))
 
     remote_path = config.resolve_path(path, remote=True)
-    
+
     client = get_async_client()
-    
+
     async def do_list():
         entries = await client.list_files(
             system_name=system,
@@ -674,17 +702,17 @@ def list_files(
             recursive=recursive,
             show_hidden=True,
         )
-        
+
         for entry in entries:
             name = entry.get("name") if isinstance(entry, dict) else getattr(entry, "name", None)
             entry_type = entry.get("type") if isinstance(entry, dict) else getattr(entry, "type", None)
             size = entry.get("size") if isinstance(entry, dict) else getattr(entry, "size", 0)
-            
+
             if entry_type == "d":
                 _output().print(f"[blue]{name}/[/blue]")
             else:
                 _output().print(f"{name}  ({size} bytes)")
-    
+
     asyncio.run(do_list())
 
 
@@ -701,9 +729,9 @@ def rm(
         paths_str = ", ".join(paths)
         if not typer.confirm(f"Remove {paths_str}?"):
             raise typer.Abort()
-    
+
     client = get_async_client()
-    
+
     async def do_rm():
         for path in paths:
             remote_path = config.resolve_path(path, remote=True)
@@ -714,7 +742,7 @@ def rm(
                 blocking=True,
             )
             _error().print(f"[green]Removed {remote_path}[/green]")
-    
+
     asyncio.run(do_rm())
 
 
@@ -726,22 +754,22 @@ def status(
     config = load_config((ctx.obj or {}).get("config_file"))
 
     from rich.table import Table
-    
+
     table = Table(title="Sync Status")
     table.add_column("Directory")
     table.add_column("Type")
     table.add_column("Last Upload")
     table.add_column("Last Download")
-    
+
     for path, dir_config in config.directories.items():
         local_path = config.resolve_path(path, remote=False)
-        
+
         push_ts = _read_last_sync_timestamp(local_path, "push")
         pull_ts = _read_last_sync_timestamp(local_path, "pull")
-        
+
         push_str = datetime.fromtimestamp(push_ts).strftime("%Y-%m-%d %H:%M:%S") if push_ts > 0 else "-"
         pull_str = datetime.fromtimestamp(pull_ts).strftime("%Y-%m-%d %H:%M:%S") if pull_ts > 0 else "-"
-        
+
         table.add_row(path, dir_config.type.value, push_str, pull_str)
 
     _output().print(table)

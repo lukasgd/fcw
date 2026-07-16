@@ -1,10 +1,11 @@
 """Main CLI application."""
 
-import typer
 from typing import Optional
 
+import typer
+
 from fcw import __version__
-from fcw.commands import config, data, job, container, mount
+from fcw.commands import config, container, data, job, mount
 from fcw.core import configure_logging
 
 app = typer.Typer(

@@ -4,11 +4,13 @@ import logging
 import os
 import tarfile
 import time
+from datetime import datetime
 
 import pytest
 
 import typer
 
+import fcw.commands.data as data
 from fcw.commands.data import (
     _build_emacs_match_pattern,
     _collect_local_files_since,
@@ -17,6 +19,7 @@ from fcw.commands.data import (
     _parse_size,
     _partition_by_size,
     _read_last_sync_timestamp,
+    _remote_is_dir,
     _upload_files_chunked,
     _upload_incremental,
     _write_last_sync_timestamp,
@@ -309,3 +312,81 @@ class TestChunkedUpload:
         # streamed directly with no tar wrapper (no extra extract).
         assert ops.count("extract") == 1
         assert sorted(uploaded) == sorted(["big.bin", ".fcw_upload_chunk.tar.gz"])
+
+
+class _LsClient:
+    """Minimal async client exposing list_files() returning fixed parent entries."""
+
+    def __init__(self, entries):
+        self._entries = entries
+        self.listed = []
+
+    async def list_files(self, *, system_name, path, **kw):
+        self.listed.append(path)
+        return self._entries
+
+
+class TestRemoteIsDir:
+    """`data download` file-vs-directory detection, from the `ls` type field.
+
+    Regression for the bug where a plain file was misclassified as a directory and
+    downloaded as a local dir. Detection uses the `ls` ``type`` field (not stat
+    mode, which omits type bits — eth-cscs/firecrest#171).
+    """
+
+    async def test_regular_file_is_not_dir(self):
+        client = _LsClient([
+            {"name": "f.out", "type": "-"},
+            {"name": "sub", "type": "d"},
+        ])
+        assert await _remote_is_dir(client, "sys", "/remote/f.out") is False
+        assert client.listed == ["/remote"]  # classified via the parent listing
+
+    async def test_directory_is_dir(self):
+        client = _LsClient([
+            {"name": "d", "type": "d"},
+            {"name": "f.out", "type": "-"},
+        ])
+        assert await _remote_is_dir(client, "sys", "/remote/d") is True
+
+    async def test_missing_path_raises(self):
+        client = _LsClient([{"name": "other", "type": "-"}])
+        with pytest.raises(FileNotFoundError):
+            await _remote_is_dir(client, "sys", "/remote/nope")
+
+
+class TestDownloadIncrementalMarker:
+    """Incremental download must skip unchanged files (regression: the pull marker
+    used local `time.time()` vs remote mtimes — two clocks — so every unchanged file
+    re-downloaded). The marker is now the newest REMOTE mtime, so a second run with
+    unchanged entries transfers nothing, regardless of the API's timezone semantics.
+    """
+
+    async def test_marker_uses_max_remote_mtime_and_skips_second_run(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        entries = [
+            {"name": "a.txt", "type": "-", "size": 10, "lastModified": "2024-01-01T00:00:00"},
+            {"name": "b.txt", "type": "-", "size": 20, "lastModified": "2024-01-02T00:00:00"},
+        ]
+        client = _LsClient(entries)
+
+        transfers = []
+
+        async def _fake_chunked(cl, system, account, files, remote_dir, local_dir, chunk_size):
+            transfers.append(list(files))
+
+        monkeypatch.setattr(data, "_download_files_chunked", _fake_chunked)
+
+        # First run: no marker yet -> both files pulled, marker = newest remote mtime.
+        n1 = await data._download_incremental(client, "sys", "acct", "/remote/outputs", "outputs")
+        assert n1 == 2
+        assert len(transfers) == 1 and len(transfers[0]) == 2
+
+        expected = datetime.fromisoformat("2024-01-02T00:00:00").timestamp()
+        marker = _read_last_sync_timestamp(os.path.abspath("outputs"), "pull")
+        assert marker == pytest.approx(expected)
+
+        # Second run, same entries: nothing changed -> no files pulled, no transfer.
+        n2 = await data._download_incremental(client, "sys", "acct", "/remote/outputs", "outputs")
+        assert n2 == 0
+        assert len(transfers) == 1

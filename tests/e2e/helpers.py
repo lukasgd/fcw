@@ -184,14 +184,24 @@ def assert_data_upload(runner, timed_step, path, *, incremental=False, follow_sy
     return invoke(runner, cmd, step, timed_step)
 
 
-def assert_data_download(runner, timed_step, path, *, incremental=False):
-    """Download a data directory."""
+def assert_data_download(runner, timed_step, path, *, incremental=False, expect_file=False):
+    """Download a data directory, or a single file when ``expect_file=True``.
+
+    With ``expect_file`` the local path (mirrored under ``workdir.local``) is asserted
+    to be a regular file, not a directory — the regression guard for single-file
+    downloads being misrouted through the directory path.
+    """
     cmd = ["data", "download"]
     if incremental:
         cmd.append("--incremental")
     cmd.append(path)
     step = f"download-{path}" if not incremental else f"download-incremental-{path}"
-    return invoke(runner, cmd, step, timed_step)
+    result = invoke(runner, cmd, step, timed_step)
+    if expect_file:
+        assert os.path.isfile(path), (
+            f"expected a file at {path} (isdir={os.path.isdir(path)})"
+        )
+    return result
 
 
 def assert_remote_ls_contains(runner, path, expected):

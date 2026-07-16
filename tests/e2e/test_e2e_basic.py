@@ -12,6 +12,7 @@ Runs with: --example basic (default).
 import glob
 import os
 import re
+import shutil
 
 import pytest
 from helpers import (
@@ -627,10 +628,43 @@ class TestDataDownload:
         assert not os.path.isdir(os.path.join("outputs", "outputs"))
 
     def test_download_incremental(self, runner, timed_step):
-        """Re-download with --incremental (should skip unchanged files)."""
+        """Re-download with --incremental; a second run must skip unchanged files."""
         assert_data_download(runner, timed_step, "outputs", incremental=True)
         # The incremental path must de-nest too (regression guard for bug #4).
         assert not os.path.isdir(os.path.join("outputs", "outputs"))
+        # Second incremental run: nothing changed remotely -> no files re-downloaded
+        # (regression: the pull marker compared remote mtimes to local time.time()).
+        args = ["data", "download", "--incremental", "outputs"]
+        result = runner.invoke(app, args)
+        assert_ok(result, args)
+        assert "No changes" in result.output
+
+    def test_download_trailing_slash(self, runner, timed_step):
+        """A trailing slash downloads the dir contents, not an empty dir.
+
+        Regression: a trailing '/' survived resolve_path into compress() and rooted
+        the archive differently than the match pattern, extracting nothing.
+        """
+        processed = os.path.join("data", "processed")
+        if os.path.isdir(processed):
+            shutil.rmtree(processed)
+        args = ["data", "download", "data/processed/"]
+        result = runner.invoke(app, args)
+        assert_ok(result, args)
+        assert os.path.isfile(os.path.join(processed, "preprocessed_files.txt"))
+
+    def test_download_single_file(self, runner, timed_step):
+        """A single remote file must download as a file, not a directory.
+
+        Regression: file-vs-dir detection used to hinge on whether `list_files`
+        threw; `ls <file>` succeeds, so a plain file was routed through the
+        directory path and `os.makedirs` created a dir at the file's local path.
+        """
+        local = os.path.join("data", "processed", "preprocessed_files.txt")
+        if os.path.exists(local):
+            os.remove(local)  # download must recreate it as a file
+        assert_data_download(runner, timed_step, local, expect_file=True)
+        assert not os.path.isdir(local)
 
 
 # ---------------------------------------------------------------------------

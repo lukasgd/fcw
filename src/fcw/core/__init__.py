@@ -14,7 +14,6 @@ from fcw.core.client import (
     get_client,
     get_system,
 )
-from fcw.core.logging import configure_logging
 from fcw.core.config import (
     ContainerConfig,
     DirectoryConfig,
@@ -33,6 +32,7 @@ from fcw.core.config import (
     remove_directory_from_config,
     remove_job_from_config,
 )
+from fcw.core.logging import configure_logging
 
 if TYPE_CHECKING:
     import typer

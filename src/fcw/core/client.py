@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Iterator
 import firecrest
 
 if TYPE_CHECKING:
-    from firecrest.v2 import Firecrest, AsyncFirecrest
+    from firecrest.v2 import AsyncFirecrest, Firecrest
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ def _get_auth() -> firecrest.ClientCredentialsAuth:
     client_id = os.environ.get("FIRECREST_CLIENT_ID")
     client_secret = os.environ.get("FIRECREST_CLIENT_SECRET")
     token_uri = os.environ.get("AUTH_TOKEN_URL")
-    
+
     if not all([client_id, client_secret, token_uri]):
         missing = []
         if not client_id:
@@ -85,7 +85,7 @@ def _get_auth() -> firecrest.ClientCredentialsAuth:
             f"Missing required environment variables: {', '.join(missing)}\n"
             "Set these variables or use 'fcw config validate' to check your setup."
         )
-    
+
     return firecrest.ClientCredentialsAuth(
         client_id, client_secret, token_uri, min_token_validity=60
     )
@@ -105,7 +105,7 @@ def _get_firecrest_url() -> str:
 @lru_cache(maxsize=1)  # process-wide singleton: all callers share one client
 def get_client() -> "Firecrest":
     """Get a synchronous FirecREST v2 client.
-    
+
     The client is cached for reuse across calls.
     """
     return firecrest.v2.Firecrest(
@@ -131,13 +131,13 @@ def get_async_client() -> "AsyncFirecrest":
 
 def get_system(system: str | None = None) -> str:
     """Get the target system name.
-    
+
     Args:
         system: Explicit system name, or None to use environment.
-    
+
     Returns:
         System name.
-    
+
     Raises:
         ValueError: If no system specified.
     """
@@ -160,13 +160,13 @@ def extract_job_id(result: dict) -> str:
 
 def get_account(account: str | None = None) -> str:
     """Get the SLURM account.
-    
+
     Args:
         account: Explicit account name, or None to use environment.
-    
+
     Returns:
         Account name.
-    
+
     Raises:
         ValueError: If no account specified.
     """

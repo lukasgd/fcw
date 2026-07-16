@@ -15,7 +15,7 @@ import yaml
 
 class DirectoryType(str, Enum):
     """Directory type for data flow enforcement.
-    
+
     Values:
         IN: Upload only (input data that flows into the cluster)
         OUT: Download only (output data that flows from the cluster)
@@ -24,7 +24,7 @@ class DirectoryType(str, Enum):
     IN = "in"
     OUT = "out"
     BOTH = "both"
-    
+
     @classmethod
     def _missing_(cls, value: str) -> "DirectoryType":
         """Support legacy/verbose names for backward compatibility."""
@@ -146,7 +146,7 @@ class FcwConfig:
     directories: dict[str, DirectoryConfig] = field(default_factory=dict)
     containers: dict[str, ContainerConfig] = field(default_factory=dict)
     jobs: dict[str, JobConfig] = field(default_factory=dict)
-    
+
     # Resolved at runtime
     _config_path: Optional[Path] = field(default=None, repr=False)
 
@@ -156,7 +156,7 @@ class FcwConfig:
             return path
         base = self.workdir.remote if remote else self.workdir.local
         return os.path.join(base, path)
-    
+
     def resolve_container_image(self, cont: ContainerConfig) -> str:
         """Resolve full remote sqsh path: remote_path dir + tag-derived filename."""
         remote_dir = cont.remote_path or "ce-images/"
@@ -172,23 +172,23 @@ class FcwConfig:
         """Get the type of a directory, defaulting to bidirectional."""
         # Normalize path for lookup
         path = path.strip("/")
-        
+
         # Check exact match first
         if path in self.directories:
             return self.directories[path].type
-        
+
         # Check if path is under a configured directory
         for dir_path, dir_config in self.directories.items():
             if path.startswith(dir_path.rstrip("/") + "/"):
                 return dir_config.type
-        
+
         return DirectoryType.BOTH
-    
+
     def can_upload(self, path: str) -> bool:
         """Check if uploading to path is allowed."""
         dir_type = self.get_directory_type(path)
         return dir_type in (DirectoryType.IN, DirectoryType.BOTH)
-    
+
     def can_download(self, path: str) -> bool:
         """Check if downloading from path is allowed."""
         dir_type = self.get_directory_type(path)
@@ -197,7 +197,7 @@ class FcwConfig:
 
 def expand_env_vars(value: str) -> str:
     """Expand environment variables in a string.
-    
+
     Supports ${VAR} and ${VAR:-default} syntax.
     """
     def replace(match: re.Match) -> str:
@@ -206,7 +206,7 @@ def expand_env_vars(value: str) -> str:
             var_name, default = var_expr.split(":-", 1)
             return os.environ.get(var_name, default)
         return os.environ.get(var_expr, match.group(0))
-    
+
     return re.sub(r'\$\{([^}]+)\}', replace, value)
 
 
@@ -255,14 +255,14 @@ def process_value(value: Any, config_data: dict[str, Any]) -> Any:
 
 def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
     """Load configuration from a YAML file.
-    
+
     Args:
         config_path: Path to config file. If None, searches for fcw.yaml
                     in current directory, then ~/.fcw.yaml.
-    
+
     Returns:
         Loaded and validated configuration.
-    
+
     Raises:
         FileNotFoundError: If no config file found.
         ValueError: If config is invalid.
@@ -279,19 +279,19 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
             if path.exists():
                 config_path = path
                 break
-    
+
     if config_path is None:
         # Return default config if no file found
         return FcwConfig()
-    
+
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    
+
     # Load raw YAML
     with open(config_path) as f:
         raw_data = yaml.safe_load(f) or {}
-    
+
     # Process values (expand env vars and refs)
     data = process_value(raw_data, raw_data)
 
@@ -306,7 +306,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
         project=data.get("project", "default"),
         _config_path=config_path,
     )
-    
+
     # Parse workdir
     if "workdir" in data:
         wd = data["workdir"]
@@ -314,7 +314,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
             remote=wd.get("remote", ""),
             local=wd.get("local", "."),
         )
-    
+
     # Parse directories
     if "directories" in data:
         for path, dir_data in data["directories"].items():
@@ -323,7 +323,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
             else:
                 dir_type = DirectoryType.BOTH
             config.directories[path] = DirectoryConfig(type=dir_type)
-    
+
     # Parse containers
     if "containers" in data:
         for name, cont_data in data["containers"].items():
@@ -338,7 +338,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 local_stages=cont_data.get("local_stages"),
                 remote_stage=cont_data.get("remote_stage"),
             )
-    
+
     # Parse jobs
     if "jobs" in data:
         for name, job_data in data["jobs"].items():
@@ -353,7 +353,7 @@ def load_config(config_path: Optional[str | Path] = None) -> FcwConfig:
                 cpus_per_task=job_data.get("cpus_per_task"),
                 sbatch=job_data.get("sbatch") or {},
             )
-    
+
     return config
 
 

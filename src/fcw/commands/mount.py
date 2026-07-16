@@ -7,12 +7,11 @@ as a local filesystem using pyfuse3.
 from __future__ import annotations
 
 import os
-import sys
 from typing import Optional
 
 import typer
 
-from fcw.core import resolve_context, get_error_console, get_output_console
+from fcw.core import get_error_console, get_output_console, resolve_context
 
 app = typer.Typer(no_args_is_help=True)
 _error = get_error_console
@@ -21,7 +20,7 @@ _output = get_output_console
 # Check if pyfuse3 is available
 FUSE_AVAILABLE = False
 try:
-    import pyfuse3
+    import pyfuse3  # noqa: F401  # availability probe; bound name intentionally unused
     FUSE_AVAILABLE = True
 except ImportError:
     pass
@@ -56,10 +55,10 @@ def mount_filesystem(
     ),
 ):
     """Mount remote FirecREST storage as local filesystem.
-    
+
     This uses FUSE (Filesystem in Userspace) to provide transparent
     access to remote files. Requires pyfuse3 and libfuse3.
-    
+
     Example:
         fcw mount start /scratch/user/project ./remote-files
         ls ./remote-files
@@ -72,14 +71,14 @@ def mount_filesystem(
     # Resolve remote path
     if not remote_path.startswith("/"):
         remote_path = config.resolve_path(remote_path, remote=True)
-    
+
     # Create mountpoint if needed
     if not os.path.exists(mountpoint):
         os.makedirs(mountpoint)
-    
+
     # Import FUSE filesystem implementation
-    from fcw.fuse.filesystem import FirecrestFS, run_filesystem
-    
+    from fcw.fuse.filesystem import run_filesystem
+
     _error().print(f"Mounting {system}:{remote_path} at {mountpoint}")
     _error().print(f"[dim]Cache TTL: {cache_ttl}s, Read-only: {read_only}[/dim]")
 
@@ -103,17 +102,17 @@ def unmount_filesystem(
     force: bool = typer.Option(False, "--force", "-f", help="Force unmount"),
 ):
     """Unmount a FUSE filesystem.
-    
+
     Example:
         fcw mount stop ./remote-files
     """
     import subprocess
-    
+
     cmd = ["fusermount", "-u"]
     if force:
         cmd.append("-z")  # Lazy unmount
     cmd.append(mountpoint)
-    
+
     result = subprocess.run(cmd)
     if result.returncode == 0:
         _error().print(f"[green]Unmounted {mountpoint}[/green]")
@@ -128,9 +127,9 @@ def unmount_filesystem(
 def list_mounts():
     """List active fcw FUSE mounts."""
     import subprocess
-    
+
     result = subprocess.run(["mount", "-t", "fuse.fcw"], capture_output=True, text=True)
-    
+
     if result.stdout.strip():
         _output().print("[bold]Active fcw mounts:[/bold]")
         for line in result.stdout.strip().split("\n"):
@@ -138,7 +137,7 @@ def list_mounts():
     else:
         # Try generic fuse mounts and filter
         result = subprocess.run(["mount", "-t", "fuse"], capture_output=True, text=True)
-        firecrest_mounts = [l for l in result.stdout.split("\n") if "firecrest" in l.lower()]
+        firecrest_mounts = [line for line in result.stdout.split("\n") if "firecrest" in line.lower()]
 
         if firecrest_mounts:
             _output().print("[bold]Active FirecREST mounts:[/bold]")

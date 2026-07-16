@@ -749,7 +749,7 @@ def _push_one_image(
 
     Exports the image to a temporary tar, uploads via FirecREST, then cleans up.
     """
-    runtime = _detect_container_runtime()  # FIXME: do the following lines do the same thing like _save_image above?  
+    runtime = _detect_container_runtime()  # FIXME: do the following lines do the same thing like _save_image above?
     remote_filename = image_tag.replace(":", "+").replace("/", "+") + ".tar"
     tar_path = os.path.join(tempfile.gettempdir(), remote_filename)
 
@@ -2400,4 +2400,4 @@ def list_images(
     else:
         # List local images
         runtime = _detect_container_runtime()
-        subprocess.run([runtime, "images"])  # FIXME: should proabably offer an option to restrict display to containers in config 
+        subprocess.run([runtime, "images"])  # FIXME: should proabably offer an option to restrict display to containers in config
