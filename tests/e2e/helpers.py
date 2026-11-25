@@ -17,6 +17,36 @@ if TYPE_CHECKING:
 from fcw.cli import app
 from fcw.core.config import load_config
 
+# Matches the "Hint: Run `fcw job logs <id>` to see output" line the CLI prints
+# when a job it waited on ends in a failed SLURM state.
+_JOB_LOGS_HINT = re.compile(r"fcw job logs (\d+)")
+# Tail of each failed job's logs to embed in the assertion message.
+FAILED_JOB_LOG_LINES = int(os.environ.get("FCW_TESTS_FAILED_JOB_LOG_LINES", "200"))
+
+
+def _failed_job_logs(output: str) -> str:
+    """Fetch logs for every job the CLI output points at via the logs hint.
+
+    Lets CI show why a SLURM job failed without anyone re-running
+    `fcw job logs` by hand against a workdir that may already be gone.
+    """
+    from typer.testing import CliRunner
+
+    sections = []
+    for job_id in dict.fromkeys(_JOB_LOGS_HINT.findall(output)):
+        args = ["job", "logs", job_id, "--stream", "both", "-n", str(FAILED_JOB_LOG_LINES)]
+        try:
+            logs = CliRunner().invoke(app, args)
+            body = logs.output or "<empty>"
+            if logs.exit_code != 0:
+                body += f"\n(fcw job logs exited with {logs.exit_code})"
+        except Exception as e:  # never mask the original failure
+            body = f"<could not fetch logs: {e!r}>"
+        sections.append(
+            f"\n--- job {job_id} logs (last {FAILED_JOB_LOG_LINES} lines) ---\n{body}"
+        )
+    return "".join(sections)
+
 
 def assert_ok(result: Result, args: list[str] | None = None) -> None:
     """Assert CLI result succeeded, with detailed diagnostics on failure."""
@@ -26,6 +56,7 @@ def assert_ok(result: Result, args: list[str] | None = None) -> None:
     msg = f"{cmd} failed (exit_code={result.exit_code})"
     if result.output:
         msg += f"\n--- output ---\n{result.output}"
+        msg += _failed_job_logs(result.output)
     if result.exception:
         tb = "".join(traceback.format_exception(
             type(result.exception), result.exception, result.exception.__traceback__,

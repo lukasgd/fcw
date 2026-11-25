@@ -60,6 +60,8 @@ FCW_BASIC_RUN_ID=<hex-id> pytest tests/ --run-e2e -v
 
 The run ID is printed at the start of each run. If tests fail, the output includes a ready-to-copy re-run command.
 
+When a test fails because a SLURM job ended in a failed state, the assertion message includes the tail of that job's stdout/stderr (last 200 lines per stream), so the cause shows up in CI without running `fcw job logs` by hand. Set `FCW_TESTS_FAILED_JOB_LOG_LINES=<n>` to change how many lines.
+
 ### Running without a container engine (temporary)
 
 A client with **no podman/docker** can still run the full suite by consuming pre-built

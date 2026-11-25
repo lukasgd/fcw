@@ -202,10 +202,8 @@ class TestContainerIterate:
         assert_ok(result)
         job_id = result.stdout.strip().split("\n")[-1].split(" ")[-1]
 
-        wait = runner.invoke(app, ["job", "wait", job_id])
-        assert_ok(wait)
-        logs = runner.invoke(app, ["job", "logs", job_id])
-        assert_ok(logs)
+        invoke(runner, ["job", "wait", job_id])
+        logs = invoke(runner, ["job", "logs", job_id])
         assert f"RUN-SENTINEL-{sentinel}" in logs.output
 
     def test_container_extract(self, runner, timed_step):
@@ -277,10 +275,8 @@ class TestContainerIterate:
 
             job_id = result.stdout.strip().split("\n")[-1].split(" ")[-1]
 
-            wait = runner.invoke(app, ["job", "wait", job_id])
-            assert_ok(wait)
-            logs = runner.invoke(app, ["job", "logs", job_id])
-            assert_ok(logs)
+            invoke(runner, ["job", "wait", job_id])
+            logs = invoke(runner, ["job", "logs", job_id])
 
             assert sentinel_value in logs.output, f"Sentinel value not found in logs: {logs.output}"
 
