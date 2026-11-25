@@ -689,13 +689,19 @@ class TestSymlinkAndNestedUpload:
             os.remove(link)
 
     def test_upload_nested_file_creates_parents(self, runner, timed_step):
-        nested = os.path.join("data", "raw", "newsub", "deep")
+        # data/raw is symlinked to the example source (see conftest), so this
+        # writes into the repo checkout: remove it afterwards.
+        top = os.path.join("data", "raw", "newsub")
+        nested = os.path.join(top, "deep")
         os.makedirs(nested, exist_ok=True)
-        with open(os.path.join(nested, "file.txt"), "w") as f:
-            f.write("x")
-        invoke(runner, ["data", "upload", os.path.join(nested, "file.txt")],
-               "upload-nested-file", timed_step)
-        assert_remote_ls_contains(runner, "data/raw/newsub/deep", "file.txt")
+        try:
+            with open(os.path.join(nested, "file.txt"), "w") as f:
+                f.write("x")
+            invoke(runner, ["data", "upload", os.path.join(nested, "file.txt")],
+                   "upload-nested-file", timed_step)
+            assert_remote_ls_contains(runner, "data/raw/newsub/deep", "file.txt")
+        finally:
+            shutil.rmtree(top, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
